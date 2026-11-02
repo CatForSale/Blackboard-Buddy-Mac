@@ -1,0 +1,9 @@
+anthropic>=2.3
+playwright>=1.50
+markdown
+python-pptx
+python-docx
+python-dotenv
+pywebview
+pyinstaller
+pillow

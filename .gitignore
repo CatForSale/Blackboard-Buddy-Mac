@@ -1,0 +1,20 @@
+# Keys and anything else private - never goes up
+.env
+.env.local
+
+# Your own work: boards, notes, the vault, backups
+data/
+Notebook/
+output/
+
+# The built app and everything PyInstaller makes
+_internal/
+build/
+dist/
+*.spec
+Blackboard Buddy.exe
+
+# Python leftovers
+__pycache__/
+*.pyc
+*.bak

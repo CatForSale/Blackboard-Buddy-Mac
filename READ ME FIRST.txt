@@ -1,0 +1,45 @@
+﻿BLACKBOARD BUDDY
+================
+
+1. Right-click this zip > Extract All. Don't run the app from inside the zip.
+2. Open the extracted folder and double-click "Blackboard Buddy.exe".
+   If Windows shows "Windows protected your PC", click More info > Run anyway.
+   (This happens because the app isn't signed by a big company. It's safe.)
+3. On first start, enter:
+   - Your name
+   - Your Blackboard address (e.g. https://blackboard.uwe.ac.uk)
+   - A Claude API key (optional, from platform.claude.com > API keys).
+     Without it you still get your deadlines, modules, files and the Notebook;
+     the briefing, plans, study notes and Ask Claude need the key.
+     The key is pay-as-you-go: a question to Ask Claude costs about $0.10 on
+     the best model, less on cheaper ones. The app shows what you've spent.
+4. A Blackboard window opens. Sign in there yourself. The app never sees your password.
+
+Online tab: one shared board for group work (notes, code, terminal output, checklists,
+pictures, drawings). Click Online, type your name, and either start a group or join
+one with the invite code someone sends you. Everyone sees changes as they happen.
+Only people with the code can see your group's board. Nothing else from the app
+(your Blackboard, notes or key) goes online.
+
+Coding on the board: press K (or the folder icon) for a code project. It opens a
+VS Code style editor with files, tabs and an Output panel. Python, JavaScript and web
+pages run right there with the Run button (Ctrl+Enter or F5); type input() answers in
+the box next to Output. Other languages: "Open in VS Code" saves the files to
+Documents\Blackboard Buddy projects and opens them in VS Code. If a teammate is
+editing a file, you can watch it update live and take over when they close it.
+
+In the editor: the Explorer buttons add files, folders, uploads from your computer,
+and links to board blocks (a note, checklist or code block becomes a file your code
+can read or import, and it updates when the block changes). Python packages like
+numpy, pandas and matplotlib load on their own and charts appear in Output. Errors
+are clickable. Console keeps your variables after a run. Ctrl+P finds a file,
+Ctrl+Shift+F searches every file, Ctrl+Shift+P lists every command, and Ask AI
+(Ctrl+I) explains errors or code using your Claude account from Settings.
+
+Updates: when there's a new version, the person who sent you this will send a
+new zip. Close the app, extract the new zip over this folder, and your
+settings and notes stay.
+
+Needs Windows 10 or 11 with Microsoft Edge (already on every Windows PC).
+Your key, data and notes are saved next to the app in this folder. Don't share
+the folder after you've used it, because it then contains your API key.
