@@ -1063,3 +1063,58 @@ box out, tidying what is in one) and `save_test.py` 18/18 (the mirror beating th
 the next open, a stale mirror *not* winning, the backups, putting one back, right-drag panning).
 All nine other suites pass. The window work is checked by scripts in the scratchpad that drive the
 real app with real mouse input: `realdrag.py`, `realdrag2.py`, `btncheck.py`, `where.py`.
+
+
+## Round 18 - dressing blocks up, the little map, finding things, and boxes that size themselves
+
+**How a block looks.** Every block carries its own look in its data, so it travels with the block
+and survives a save. `dress(b, d)` in `online.py` turns that data into CSS variables on the node
+(`--tf` font, `--tc` writing colour, `--bgc` colour behind it, `--fs2` size, `--caps`), and the
+stylesheet lays those over the usual look of each kind. `lookMenu(ids, at)` is the menu behind
+**How it looks...** (Ctrl L) in a block's own menu: bigger and smaller text, five fonts, bold,
+slanted, ALL CAPITALS for big text, left/centre/right, the colour of the writing, the colour
+behind it, the colour of a sticky, and "Back to how it started". It works on however many blocks
+are picked out at once.
+
+**More colours everywhere.** `PAL` is now 24 (a bright row, the same hues deeper, then greys),
+`STICKY` 12, and a new `PAPER` 12 of soft paper shades for what sits behind writing. The palette
+rows wrap, so they still fit the menu.
+
+**Lines remember.** A line's menu has **Use this look for new lines**, which keeps its ends, its
+shape, dashed and colour in `olLine`; `add('arrow', ...)` starts from that. There is a way back.
+
+**Far out, blocks keep their shape.** Below 45% the board gets a `far` class: each block hides its
+contents and shows its name instead, at `calc(13px / var(--k))` so the name is always about 13px on
+screen however far out you are. The name is clipped to three lines inside the block, a to-do shows
+what is still to do, code shows its first line, and a box stays an outlined box with its name at the
+top rather than turning into a blank white card. The earlier measurement is why this exists: a PIL
+sharpness probe across five zoom levels with and without a `will-change` layer hint gave identical
+numbers, so the text was not being rendered badly, it was simply too small to read - no rendering
+tweak could have helped.
+
+**The little map.** `.ol-map` is a 260x170 canvas in the bottom-left corner drawing every block and
+a frame round the part you are looking at. Click or drag it to go there. **M** puts it up and away,
+and it is remembered in `olMap`.
+
+**One search box, in the corner.** The old bar that dropped from the top is gone; `.ol-hunt` sits
+in the corner and is always there. Typing searches as you go, Enter walks the matches, Escape
+clears it, Ctrl F puts the cursor in it. It now looks inside checklists too - those lines are kept
+under `t`, and the search was reading `text`, so it had never found one.
+
+**Boxes size themselves.** `needs(shape)` is how big a box has to be to hold what is in it,
+`growToFit(shape)` lets it out to that (never pulls it in, so things put side by side stay put),
+and `regrowBoxes(ids)` runs at the end of a drag over every box that gained something. Dragging a
+block into a box grows the box round it, and the resize handle will not pull a box in smaller than
+its contents. Tidying uses the same path.
+
+**On GitHub.** The folder is a git repository now, `main`, one commit. `.gitignore` keeps `.env`,
+`data/`, `Notebook/`, `output/`, `_internal/` and the built exe on this laptop - only source goes
+up. `upload.py` commits and pushes in one go, refuses outright if a `.env` ever reaches the staged
+list, and `build_bb9.py` calls it after every build, so a build is an upload. It needs a remote:
+make the repository on GitHub, then `git remote add origin ...` once.
+
+**Testing:** a new suite, `far_test.py` 24/24 - the far-out view (names shown, contents out of the
+way, size on screen, a box still a box), the map (drawn, the frame, clicking to travel, M), the
+corner search (including checklists), and boxes sizing themselves both ways. All eight suites pass:
+`vault_test` 51, `ctx_test` 34, `lines_test` 50, `board2_test` 21, `write_test` 40, `group_test` 16,
+`save_test` 18, `far_test` 24.

@@ -26,3 +26,11 @@ for f in built.rglob("*"):
         shutil.copy2(f, t)
         n += 1
 print("copied", n, "files; app exe now", (src / "Blackboard Buddy.exe").stat().st_mtime)
+
+# and the source goes up to GitHub, if a repository has been linked
+try:
+    import upload
+    upload.main()
+except Exception as e:
+    print("upload skipped:", e)
+
