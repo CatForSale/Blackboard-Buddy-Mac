@@ -1118,3 +1118,14 @@ way, size on screen, a box still a box), the map (drawn, the frame, clicking to 
 corner search (including checklists), and boxes sizing themselves both ways. All eight suites pass:
 `vault_test` 51, `ctx_test` 34, `lines_test` 50, `board2_test` 21, `write_test` 40, `group_test` 16,
 `save_test` 18, `far_test` 24.
+
+### Round 19 (3 Nov, 00:06): pointer while busy; longer background-check options
+- **Pointer bug:** while the app was busy (sync / writing notes) `html.busy .pointer-ring` ran `animation: spin`, whose
+  `transform: rotate()` replaced the inline `transform` the pointer script uses to put the ring on the mouse, so the ring
+  jumped to the window's top-left and spun there (likely also the old "cursor goes to a corner on refresh"). The arc is now a
+  `::after` with its own `ptr-spin` animation; the ring keeps following. Test: scratchpad `busy_ptr_test.py`
+  (light + dark, idle + busy, ring and dot within 3 px of the mouse).
+- **Check Blackboard in the background** now also offers 12 hours, once a day, every 2 / 3 days, once a week
+  (`sync_hours` 12/24/48/72/168; `background_loop` already handles any number).
+- Testing note: a running app rewrites `output/dashboard.html` from its own (older) code after a sync, so browser tests
+  should use a copy of the freshly built page.

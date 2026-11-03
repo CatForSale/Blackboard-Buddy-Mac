@@ -762,10 +762,14 @@ html.cur-live.cur-away .pointer-ring,html.cur-live.cur-away .pointer-dot{display
 .pointer-dot.rz{width:4px;height:4px}
 .pointer-ring.no{width:22px;height:22px;border-style:dotted;opacity:.4}
 .pointer-dot.no{opacity:.3}
-html.busy .pointer-ring{border-color:transparent;border-top-color:var(--red);opacity:.95;
- animation:spin .9s linear infinite}
+/* the spinning arc lives on ::after: the ring's own transform is where the script puts it on the mouse,
+   and an animation on that transform would throw the ring into the top-left corner */
+html.busy .pointer-ring{border-color:transparent;opacity:.95}
+html.busy .pointer-ring::after{content:"";position:absolute;inset:-1.4px;border-radius:inherit;border:2px solid transparent;
+ border-top-color:var(--red);animation:ptr-spin .9s linear infinite}
+@keyframes ptr-spin{to{transform:rotate(360deg)}}
 html.no-anim .pointer-ring,html.no-anim .pointer-dot{transition:none}
-html.no-anim.busy .pointer-ring{animation:none;border-color:var(--red)}
+html.no-anim.busy .pointer-ring::after{animation:none;border-color:var(--red)}
 
 /* ---- where to put the window: our own Snap Layouts, since frameless loses the real one */
 .snapmenu{position:fixed;top:38px;right:12px;z-index:62;display:none;grid-template-columns:repeat(4,1fr);gap:5px;padding:8px;
@@ -2229,7 +2233,7 @@ CORNER_HTML = """
  <div class="set-pane on" data-s="general">
   <span class="label">Activity</span><div class="heat"></div>
   <label class="row">Check Blackboard in the background
-   <select class="s-sync"><option value="0">Off</option><option value="1">Every hour</option><option value="2">Every 2 hours</option><option value="6">Every 6 hours</option></select></label>
+   <select class="s-sync"><option value="0">Off</option><option value="1">Every hour</option><option value="2">Every 2 hours</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Once a day</option><option value="48">Every 2 days</option><option value="72">Every 3 days</option><option value="168">Once a week</option></select></label>
   <label class="row">New notes per sync <span><input class="s-notes" type="range" min="0" max="15" step="1"> <b class="s-notes-v"></b></span></label>
   <div class="row col"><span class="s-files-where">Study files are saved in <b class="s-files-path"></b></span>
    <span><button class="ghost s-files">Open folder</button> <button class="ghost s-files-move">Choose folder…</button></span>
