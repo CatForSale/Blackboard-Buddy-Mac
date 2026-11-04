@@ -133,8 +133,10 @@ with sync_playwright() as p:
         pg.wait_for_timeout(400)
         pg.keyboard.press("Escape")
         pg.wait_for_timeout(200)
-    pg.evaluate("""() => { const ids = [...bbOnline.S.blocks.keys()];
-        bbOnline.S.sel.clear(); ids.slice(0, 2).forEach(i => bbOnline.S.sel.add(i)); }""")
+    # through select(), the way a person picks two things out, so everything that watches the
+    # selection (the format bar among them) keeps up
+    pg.evaluate("""() => bbOnline.select([...bbOnline.S.blocks.keys()].slice(0, 2))""")
+    pg.wait_for_timeout(300)
     ids = pg.evaluate("[...bbOnline.S.blocks.keys()].slice(0,2)")
     if len(ids) >= 2:
         r2 = pg.evaluate(f"""(() => {{ const r = document.querySelector('.ol-b[data-id=\"{ids[0]}\"]')

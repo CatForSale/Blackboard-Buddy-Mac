@@ -787,6 +787,65 @@ class Api:
         notebook.init()
         main.open_path(notebook.ROOT)
 
+    def nb_saved_at(self, name):
+        """When the note's file was last written. The page holds a copy of whatever you have typed
+        in the browser's own storage, and compares the two so the newer one wins on the way back in."""
+        return notebook.saved_at(name)
+
+    def nb_backup(self, name, text, dated=False):
+        """Keeps a copy of the note on this computer, so a bad edit can be undone later.
+        With dated set, one is kept with the time on it however recently the last one was."""
+        return notebook.backup(name, text, dated=dated)
+
+    def nb_backups(self, name):
+        return notebook.backups(name)
+
+    def nb_backup_read(self, file):
+        return notebook.backup_read(file)
+
+    def nb_formats(self):
+        """What Export and Import can offer, and what each format cannot carry across."""
+        return {"out": notebook.EXPORTS, "in": notebook.IMPORTS}
+
+    def nb_export(self, name, text, fmt):
+        """Writes the note out as Word, a PDF, Markdown or plain text, through a Save dialog."""
+        pick = next((f for f in notebook.EXPORTS if f["id"] == fmt), None)
+        if not pick:
+            return {"error": "That isn't something the notebook knows how to write."}
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(name or "Note").split("/")[-1]).strip(" .")[:70] or "Note"
+        picked = window.create_file_dialog(webview.SAVE_DIALOG, directory=str(Path.home() / "Documents"),
+                                           save_filename=stem + pick["ext"],
+                                           file_types=(f"{pick['name']} (*{pick['ext']})",))
+        if not picked:
+            return {"cancelled": True}
+        target = Path(picked[0] if isinstance(picked, (list, tuple)) else picked)
+        if target.suffix.lower() != pick["ext"]:
+            target = target.with_suffix(pick["ext"])
+        try:
+            target.write_bytes(notebook.to_file(stem, text, fmt))
+        except Exception as e:
+            main.log_quiet(f"Notebook: couldn't write {target.name}: {e}")
+            return {"error": f"Couldn't write that file: {e}"}
+        return {"saved": str(target), "msg": f"Saved {target.name}"}
+
+    def nb_import(self):
+        """Brings a Word document, PDF, Markdown, text or rich text file in as a new note."""
+        kinds = ";".join("*" + f["ext"] for f in notebook.IMPORTS)
+        picked = window.create_file_dialog(webview.OPEN_DIALOG, directory=str(Path.home() / "Documents"),
+                                           file_types=(f"Documents and notes ({kinds})", "All files (*.*)"))
+        if not picked:
+            return {"cancelled": True}
+        path = Path(picked[0] if isinstance(picked, (list, tuple)) else picked)
+        try:
+            if path.stat().st_size > 40 * 1024 * 1024:
+                return {"error": "That file is over 40 MB, which is too big to bring into a note."}
+        except OSError as e:
+            return {"error": f"Couldn't open that file: {e}"}
+        got = notebook.from_file(path)
+        if got.get("error"):
+            main.log_quiet(f"Notebook: couldn't read {path.name}: {got['error']}")
+        return got
+
     def check_update(self):
         if not main.UPDATE_REPO:
             return {"error": "Updates aren't set up for this copy."}

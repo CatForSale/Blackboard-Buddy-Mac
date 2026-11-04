@@ -5099,12 +5099,21 @@ function fmtPlace(list) {
   const Rt = (x1 - rr.left) / f - R.clientLeft, B = (y1 - rr.top) / f - R.clientTop;
   if (B < 0 || T > H || Rt < 0 || L > W) { fmt.classList.remove('on'); fpopClose(); return; }
   fmt.classList.add('on');
-  const w = fmt.offsetWidth;
-  // along the top of the board, in the middle; with the message box open, in the middle of what's left of it,
-  // or along the bottom when that's too narrow, so neither covers the other
-  const chat = $('.ol-chat'), room = chat.hidden ? W : W - chat.offsetWidth - 24;
-  if (w + 16 <= room) { fmt.style.left = Math.max(8, (room - w) / 2) + 'px'; fmt.style.top = '62px'; }
-  else { fmt.style.left = Math.max(8, (W - w) / 2) + 'px'; fmt.style.top = Math.max(62, H - fmt.offsetHeight - 76) + 'px'; }
+  const w = fmt.offsetWidth, hh = fmt.offsetHeight, gap = 10;
+  // the bar lives inside the board, and the board's own furniture is already there: the strip
+  // across the top, the tool rail down the left, and the message box on the right when it's open
+  const strip = $('.ol-top'), tools = $('.ol-tools'), chat = $('.ol-chat');
+  const ceiling = strip ? strip.offsetTop + strip.offsetHeight + 8 : 8;
+  const west = tools ? tools.offsetLeft + tools.offsetWidth + 8 : 8;
+  const east = (chat && !chat.hidden ? W - chat.offsetWidth - 24 : W - 8) - w;
+  // over the middle of what is picked out, pulled back inside when that would push it off
+  fmt.style.left = Math.round(Math.min(Math.max((L + Rt) / 2 - w / 2, west), Math.max(west, east))) + 'px';
+  // just above it; underneath it when there is no room above; and when what is picked out fills
+  // the board top to bottom its header is off the screen anyway, so the bar goes along the top
+  const above = T - hh - gap, below = B + gap;
+  fmt.style.top = Math.round(above >= ceiling ? above
+                           : below + hh + 8 <= H ? below
+                           : ceiling) + 'px';
   if (fpop.classList.contains('on')) fpopPlace();
 }
 

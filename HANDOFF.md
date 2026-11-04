@@ -1773,3 +1773,156 @@ panel appearing and disappearing with it. Every other suite still passes: `out_t
 **Built**, and `online.py` re-hidden. As in Round 35 the push at the end of `build_bb9.py` is left
 out, because `upload.py` commits everything with `git add -A` and another session's `main.py` and
 `README.md` are still unfinished. Nothing committed, nothing pushed, share zip not remade.
+
+### Round 36: the format bar stops covering what you picked
+
+The floating bar of style buttons had a comment over it saying "Sit above what is picked out, or
+below it when that is off the top, and never off the board", and it did not do any of that. It
+worked out the rectangle round the selection, used it only to decide whether the selection had
+scrolled off the screen, threw it away, and then parked itself at a fixed 62 pixels down, in the
+middle of the board. So picking out anything in the top third of the board laid the bar straight
+over its header - the very thing you had just picked out and were about to restyle.
+
+`fmtPlace` now places the bar from the rectangle it already has:
+
+- **Above what is picked out**, with a 10px gap, which is where a toolbar belongs: close enough to
+  belong to the selection, out of the way of it.
+- **Underneath it instead** when there is no room above - the gap between the selection and the
+  strip across the top of the board is smaller than the bar.
+- **Centred over the selection**, not over the board, and pulled back inside when that would push
+  it off: the tool rail down the left and the message box on the right are both treated as edges,
+  so the bar never slides under either.
+- When what is picked out is **taller than the whole board**, its header is off the screen anyway,
+  so the bar goes along the top as it used to. That is the one case where the two rectangles
+  overlap, and it is the least-bad place for it.
+
+The panel that opens off a bar button (`fpopPlace`) already measured itself from the bar's own
+position and flipped above when it would fall off the bottom, so it follows the bar's new place
+with no change.
+
+**Tests:** `lines_test.py` 98 -> 107. The new checks pick out a block at the top of the board, in
+the middle, low down, at the far left and the far right, and with the message box open, and assert
+each time that the bar's rectangle does not meet the block's own - plus that it really is just
+above (within 20px) rather than away at the top of the board, that it clears the tool rail, and
+that it stops short of the message box.
+
+One existing check in `ctx_test.py` had to change with it. It picked two blocks out by reaching
+into `S.sel` and adding ids by hand, which no part of the app does: nothing that watches the
+selection was told, so the bar stayed where it had last been put and - now that it sits near things
+rather than at the top - it ended up over the block the test then right-clicked, and the block's
+menu never opened. The check now calls `select()`, the way a person picking two things out does,
+and passes. Worth remembering: a test that pokes `S.sel` directly gets a board that is only
+half told what happened.
+
+Every suite passes: `lines_test` 107, `out_test` 66, `vault_test` 51, `ctx_test` 34, `board2_test`
+21, `write_test` 40, `group_test` 16, `save_test` 18, `far_test` 17.
+
+**Not built.** The exe on disk still predates this round, because the app was open and holding it
+open, and because the session running alongside this one is doing one clean build at the end with
+both rounds in. `output/dashboard.html` is rebuilt, which is what the suites and the by-hand runs
+were driven against. `online.py` is re-hidden. Nothing committed, nothing pushed.
+
+
+## Round 37: a notebook that cannot lose your work, and knows about files
+
+The Notebook was the last part of the app without the save safety everything else got in Round 17,
+and the only writing space in it with no way of getting a note in or out as anything but a `.md`
+file. All three of this round's pieces live in `vault.py`, with the file dialogs in `app.py`.
+
+**Nothing you type is lost, in three layers.** Exactly the three the board already uses, and for
+exactly the same reason: the file on the computer is the real note, but writing it goes through the
+app, which takes a moment, and the app can be closed faster than that. `window.events.closing` is
+still no help - Round 17 explains why it deadlocks - so:
+
+- `mirror()` writes the note into the browser's own storage on **every keystroke** (`nbMirror`,
+  holding the note's name, the time, and the editor's HTML). That is instant and cannot be beaten
+  by a quick close. The file follows 600 ms later, as it always did.
+- `recover()` runs when the notebook opens. It asks `Api.nb_saved_at` when the file was last
+  written and takes the copy from storage only if it is **more than 1.5 seconds newer** - the same
+  grace the board uses, because the copy is written first and the file a moment after. A copy left
+  over from last week never wins. When it does win, the page says "Picked up the last few changes
+  from before" and writes the file at once.
+- `saveNow()` is hung off `pagehide`, `blur` and `visibilitychange`, and runs every two minutes, so
+  a lid closing on the laptop is covered too.
+- `Api.nb_backup` keeps older copies in **`Notebook/.backups`**, through `vault.backup()`:
+  `<note>-latest.md` every single save, plus dated copies no closer than five minutes apart, twenty
+  per note. The dot in the folder name keeps it out of the notes list, out of the graph and out of
+  Obsidian's way, the same as `.trash`. `backup_read()` refuses any name that would step outside
+  that folder.
+
+**A note goes out as, and comes in from, real documents.** `outline(md)` reads a note once into a
+flat list of blocks, and the Word writer and the PDF writer both work from that, so neither has a
+Markdown parser of its own to get out of step.
+
+- **Word** uses `python-docx`, which was already in `requirements.txt`. Real `Heading` styles, real
+  `w:hyperlink` links, real `w:br` line breaks and real tables, which is what makes a note survive
+  the round trip: out to `.docx` and back in gives the same headings, bold, italic, underline,
+  highlighting, strikethrough, inline code, code blocks, bullets, tick boxes, numbered lists,
+  quotes, links and tables. Only `[[note links]]` flatten to text, because Word has no idea where
+  the notebook is. The first few tries got this wrong in instructive ways: styling a heading by
+  hand rather than with the `Heading 1` style reads back as plain bold, and a `\n` inside a run
+  reads back as a space, which is why a code block arrived on one line.
+- **PDF** is written by hand, in `_Pdf`, rather than with a library. `fpdf2` would have dragged
+  `fonttools` and `defusedxml` into the build for the sake of one feature, and the whole point of
+  this app's dependency list is that PyInstaller can swallow it. So: the fourteen built-in printer
+  fonts, `WinAnsiEncoding`, the Helvetica and Helvetica-Bold width tables (without which there is
+  no way to know where a line has to break), page breaks, headings, wrapped paragraphs with bold
+  and italic mid-sentence, bullets and tick boxes, indented quotes with a rule down the side,
+  shaded code blocks, grid tables, rules, clickable link annotations and pictures (Pillow, which is
+  already there, to Flate-compressed RGB). The cost is honest and the menu says it: Western
+  European letters only. **The bug worth remembering:** the content stream has to name a font the
+  way the *page's resources* name it (`/plain`), not the printer font behind it
+  (`/Helvetica-Bold`). Get that wrong and the PDF looks fine to a person and comes out as nothing
+  but replacement characters to anything reading it back - which is how it was caught.
+- **In** from Word, PDF, Markdown, plain text and **rich text**. The RTF reader is ours, about
+  seventy lines: bold, italic, underline, headings from the biggest lettering in the line, bullets,
+  `\'xx` and `\uNNNN` characters. Two things RTF does that bite: a heading's big lettering is
+  switched off again *before* the paragraph ends, so the size at the end of the line is the body
+  size - what matters is the biggest size anything in the line was written at; and the bullet in
+  front of a list item lives in a group of its own, and a group puts back everything it found when
+  it closes, so whether the line is a bullet has to be kept outside that. PDFs come in through
+  `pypdf` - pure Python, no compiled wheel - and only ever as paragraphs, because a PDF holds words
+  and where they sit and nothing else.
+- `EXPORTS` and `IMPORTS` carry **what each format will lose, in a sentence**, and the menu shows
+  that sentence under the format's name before anything is written. After a file comes in, the
+  notebook says plainly what did not come across.
+
+**The File menu.** A `File` button next to the note's name, with what anyone would expect: New,
+Open, Import, Save now, Save a copy in your notebook, Export as a file, Go back to an earlier save,
+Rename, Duplicate, Move to a folder, Move to the trash, Print, Find and replace, Word count, Undo,
+Redo, and the notes you had open lately. Open, Export, Import, Move, Word count and the earlier
+saves all use one sheet (`.nb-sheet`), which keeps Tab inside itself while it is up.
+
+- **Go back to an earlier save** lists the copies with the time and the word count of each. Picking
+  one keeps what is in the note *right now* as a dated copy first (`nb_backup(..., dated=True)`,
+  which is the point of that argument - the ordinary five-minute spacing would have let the save
+  that follows write straight over the only copy of it).
+- **Find and replace** paints its matches with the browser's own `CSS.highlights`, so searching a
+  note cannot change what gets saved - no wrapper elements go into the writing. Replace all works
+  back to front, so the earlier matches stay where they are.
+- **Print** copies the note into a `.nb-printing` block and a `@media print` rule puts everything
+  else away, because the whole app is one page. It is cleaned up on `afterprint`, with a one-minute
+  backstop for a printer window that never says it finished.
+
+**The keys, and the one that moved.** Ctrl+N, O, S, P, E, F, H, Z, Shift+Z, Y and G. Ctrl+F now
+searches **the note you are in**, the way it does in Word; searching every note has moved to
+**Ctrl+Shift+F**, and the guide note says so. Nothing clashes: the formatting keys (Ctrl+B/I/U/K,
+Ctrl+0-3, Ctrl+Shift+7/8/9, Ctrl+Shift+H) are handled on the editor and the menu checks
+`defaultPrevented`; Ctrl+Z and Ctrl+Y are left alone when the cursor is in a box you type into; and
+the board's keys only listen while the Online tab is the one on screen.
+
+**Testing:** a new suite, `nbfile_test.py` **109/109** - the formats on their own both ways, a long
+note running on to more pages with nothing written off the paper, the copies kept on the computer
+(including that nothing outside that folder can be read), a keystroke reaching browser storage
+*before* the file is written, a newer copy winning on the way back in and a stale one not, every
+row of the File menu, find and replace, Ctrl+Shift+F and Ctrl+Shift+H still doing what they did,
+duplicate, save a copy, move to a folder, out as a file, in from a Word document, going back to an
+earlier save, printing, and undo/redo. Every other suite still passes: `vault_test` 51, `ctx_test`
+34, `lines_test` 107, `board2_test` 21, `write_test` 40, `group_test` 16, `save_test` 18,
+`far_test` 17, `study_test` 17, `out_test` 66.
+
+**Not built.** `pypdf` is added to `requirements.txt` and PyInstaller was run against a copy of the
+sources in a scratch folder to check it still packages - the app folder, the `bb9` folder and git
+were not touched, because the session working on the board owns this evening's build.
+`output/dashboard.html` is rebuilt, which is what the suites were driven against. Sources are
+re-hidden. Nothing committed, nothing pushed.

@@ -24,6 +24,8 @@ GUIDE = """# Start here
 Welcome to your **Notebook**. It works like Word: just type, and use the toolbar at the top for styles.
 Everything is saved automatically as a normal file in the Notebook folder, so it's never locked inside the app.
 
+**You cannot lose your writing here.** Every letter you type is kept straight away, the file is written a moment later, and if the app is closed or stops before that happens the missing few seconds are put back the next time you open the notebook. A copy of each note is kept every few minutes as well, so a bad edit can still be undone tomorrow: **File ▸ Go back to an earlier save**.
+
 ## Writing
 
 - **Bold**, *italic* and <u>underline</u>: select some text and click **B**, *I* or U, or press Ctrl+B, Ctrl+I or Ctrl+U.
@@ -48,6 +50,18 @@ Type **---** and press Enter for a dividing line.
   of your headings (click one to jump to it) and notes that **mention** this one, with a button to link them.
 - **Graph** shows every note as a dot and every link as a line. Click a dot to open it.
 
+## The File menu
+
+The **File** button next to the note's name has everything you would expect:
+
+- **New note**, **Open a note** and **Recent notes**.
+- **Save now**, though it saves by itself anyway, and **Save a copy in your notebook**.
+- **Export as a file** writes the note out as a **Word document**, a **PDF**, **Markdown** or **plain text**. Each one says underneath it what it will lose: a PDF cannot be edited again, plain text drops every bit of formatting, and Word loses only the links to your other notes.
+- **Import a file** brings a **Word document**, **PDF**, **Markdown**, **plain text** or **rich text** file in as a new note, and says plainly what that kind of file could not carry.
+- **Go back to an earlier save** lists the copies kept on your computer, with the time and the word count of each. Putting one back keeps what is in the note now as a copy as well, so you can change your mind.
+- **Rename**, **Duplicate this note**, **Move to a folder** and **Move to the trash**.
+- **Print**, **Find and replace** and **Word count**.
+
 ## Organising
 
 - **+ New note** has templates for lectures, assignments and group meetings.
@@ -70,14 +84,22 @@ Type **---** and press Enter for a dividing line.
 | Keys | Does |
 | --- | --- |
 | Ctrl+N | New note |
+| Ctrl+O | Open a note |
 | Ctrl+S | Save now (it also saves by itself) |
-| Ctrl+F | Search your notes |
+| Ctrl+P | Print |
+| Ctrl+E | Export as a file |
+| Ctrl+F | Find in this note |
+| Ctrl+H | Find and replace in this note |
+| Ctrl+Shift+F | Search all of your notes |
+| Ctrl+Z, Ctrl+Shift+Z | Undo, redo |
 | Ctrl+G | Graph |
 | Ctrl+K | Link a note |
 | Ctrl+B, Ctrl+I, Ctrl+U | Bold, italic, underline |
 | Ctrl+Shift+H | Highlight |
 | Ctrl+0 to Ctrl+3 | Normal text, Heading 1 to 3 |
 | Ctrl+Shift+8, 7, 9 | Bullet list, numbered list, checklist |
+
+Escape closes whatever is open: a menu, the find bar, the graph or a list you are picking from.
 
 #guide
 """
@@ -209,8 +231,13 @@ def saved_at(name):
         return 0
 
 
-def backup(name, text, every=BACKUP_GAP):
-    """Keeps a copy of a note on this computer, so a bad edit can still be undone tomorrow."""
+def backup(name, text, every=BACKUP_GAP, dated=False):
+    """Keeps a copy of a note on this computer, so a bad edit can still be undone tomorrow.
+
+    With dated set, a copy with today's time on it is kept however recently the last one was -
+    for the moment just before an older copy is put back over the note."""
+    if dated:
+        every = 0
     if not name:
         return False
     folder = ROOT / ".backups"
@@ -1120,6 +1147,15 @@ def from_pdf(path):
     everything comes back as ordinary paragraphs."""
     import pypdf
     reader = pypdf.PdfReader(str(path))
+    if reader.is_encrypted:
+        # the app doesn't carry the code-breaking library, and an empty password covers the
+        # "can't be printed" sort of lock, which is the common one
+        try:
+            ok = reader.decrypt("")
+        except Exception:
+            ok = False
+        if not ok:
+            raise ValueError("that PDF is locked with a password, so its words can't be read")
     pages = []
     for page in reader.pages:
         got = (page.extract_text() or "").replace("\r", "")
@@ -1142,29 +1178,34 @@ def from_rtf(path):
     """Rich text as Markdown. A small reader of its own: bold, italic, underline, headings, lists."""
     src = Path(path).read_bytes().decode("cp1252", "replace")
     i, n = 0, len(src)
-    stack, st = [], {"b": False, "i": False, "u": False, "skip": False, "size": 0, "level": 0, "bullet": ""}
+    stack, st = [], {"b": False, "i": False, "u": False, "skip": False, "size": 0}
+    line = {"level": 0, "bullet": ""}
     paras, bits, lost = [], [], set()
+    biggest = [0]
 
     def end_para():
         text = _md_runs(bits)
         del bits[:]
+        big, biggest[0] = biggest[0], 0
         if not text.strip():
             paras.append("")
             return
-        if st["bullet"]:
-            paras.append("    " * st["level"] + st["bullet"] + text)
-        elif st["size"] >= 32:
+        if line["bullet"]:
+            paras.append("    " * line["level"] + line["bullet"] + text)
+        elif big >= 32:
             paras.append("# " + re.sub(r"[*_`]", "", text))
-        elif st["size"] >= 26:
+        elif big >= 26:
             paras.append("## " + re.sub(r"[*_`]", "", text))
-        elif st["size"] >= 23:
+        elif big >= 23:
             paras.append("### " + re.sub(r"[*_`]", "", text))
         else:
             paras.append(text)
-        st["bullet"] = ""
+        line["bullet"] = ""
 
     def put(s):
         if not st["skip"] and s:
+            if s.strip():
+                biggest[0] = max(biggest[0], st["size"] or 22)
             bits.append({"t": s, "b": st["b"], "i": st["i"], "u": st["u"], "code": False, "href": ""})
 
     while i < n:
@@ -1198,7 +1239,8 @@ def from_rtf(path):
                 if word == "par":
                     end_para()
                 if word == "pard":
-                    st["level"], st["size"], st["bullet"] = 0, 0, ""
+                    st["size"] = 0
+                    line["level"], line["bullet"] = 0, ""
                 continue
             if word == "u" and arg:
                 put(chr(int(arg) % 65536))
@@ -1217,11 +1259,11 @@ def from_rtf(path):
                 st["size"] = int(arg)
                 continue
             if word in ("outlinelevel", "ilvl") and arg:
-                st["level"] = max(0, min(3, int(arg)))
+                line["level"] = max(0, min(3, int(arg)))
                 continue
             if word in ("pntext", "listtext"):
                 st["skip"] = True
-                st["bullet"] = "- "
+                line["bullet"] = "- "
                 continue
             if word in _RTF_UNI:
                 put(_RTF_UNI[word])
@@ -1330,6 +1372,8 @@ NB_HTML = f"""
  <div class="nb-main">
   <div class="nb-top">
    <button class="nb-ib nb-toggle-side" aria-pressed="true" title="Show or hide your notes list">{ICONS['side']}</button>
+   <span class="nb-fwrap"><button class="ghost nb-fbtn" aria-haspopup="menu" aria-expanded="false"
+     title="Everything you can do with this note">File</button><span class="nb-fmenu glass" role="menu" hidden></span></span>
    <input class="nb-title" spellcheck="false" aria-label="Note name (click to rename)" title="Click to rename">
    <button class="ghost nb-askbtn" title="Ask Claude about this note">✦ Ask Claude</button>
    <button class="ghost nb-pin" aria-pressed="false" title="Keep this note at the top of the list">Pin</button>
@@ -1373,6 +1417,16 @@ NB_HTML = f"""
    <b>Buttons on the toolbar</b><div class="nb-tpick-l"></div>
    <button class="nb-tpick-r">Show them all</button>
   </div>
+  <div class="nb-far" hidden role="search" aria-label="Find and replace in this note">
+   <input class="nb-far-q" type="search" placeholder="Find in this note" aria-label="Find in this note">
+   <input class="nb-far-r" placeholder="Replace with" aria-label="Replace with">
+   <span class="nb-far-n" role="status" aria-live="polite"></span>
+   <button class="ghost nb-far-up" title="The one before (Shift+Enter)" aria-label="Previous match">↑</button>
+   <button class="ghost nb-far-down" title="The next one (Enter)" aria-label="Next match">↓</button>
+   <button class="ghost nb-far-one" title="Change this one">Replace</button>
+   <button class="ghost nb-far-all" title="Change every one of them">Replace all</button>
+   <button class="nb-ib nb-far-x" aria-label="Close find and replace">✕</button>
+  </div>
   <div class="nb-scroll">
    <div class="nb-ed" contenteditable="true" spellcheck="true" role="textbox" aria-multiline="true" aria-label="Note text" data-ph="Start typing…"></div>
    <textarea class="nb-src" spellcheck="true" aria-label="Note as Markdown" hidden></textarea>
@@ -1392,6 +1446,7 @@ NB_HTML = f"""
    <button class="ghost nb-gclose" aria-label="Close graph">✕ Close</button></div>
   <canvas aria-label="Graph of your notes and the links between them"></canvas>
  </div>
+ <div class="nb-sheet" hidden><div class="nb-sheet-in glass" role="dialog" aria-modal="true" aria-label="Notebook"></div></div>
 </div>
 """
 
@@ -1504,6 +1559,65 @@ main:has(#notebook.on)::after{height:0}
  animation:rise .45s var(--spring) both}
 .nb-gbar{display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:14px 18px} .nb-gbar .label{margin:0} .nb-gclose{margin-left:auto}
 .nb-graph canvas{flex:1;min-height:0;width:100%;cursor:grab} .nb-graph canvas:active{cursor:grabbing}
+/* ---- the File menu over a note */
+.nb-fwrap{position:relative;flex:none}
+.nb-fmenu{position:absolute;top:calc(100% + 6px);left:0;z-index:30;display:flex;flex-direction:column;padding:6px;border-radius:16px;min-width:290px;
+ max-height:calc(100vh - 170px);overflow-y:auto;background:var(--glass-strong);box-shadow:var(--shadow);animation:rise .3s var(--spring) both}
+.nb-fmenu button{display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--text);text-align:left;padding:7px 12px;border-radius:10px;
+ cursor:pointer;font:inherit;font-size:14.5px;width:100%}
+.nb-fmenu button:hover,.nb-fmenu button:focus-visible{background:var(--inset)}
+.nb-fmenu button span.key{margin-left:auto;font:11px var(--mono);letter-spacing:.04em;color:var(--muted);flex:none}
+.nb-fmenu button.danger{color:var(--red)}
+.nb-fmenu hr{border:0;border-top:1px solid var(--line);margin:5px 8px}
+.nb-fmenu .label{margin:8px 12px 2px}
+.nb-fmenu .none{color:var(--muted);font-size:13px;padding:2px 12px;margin:0}
+.nb-fmenu button.sm{font-size:13.5px;padding:6px 12px} .nb-fmenu button.sm small{color:var(--muted);font-size:12px}
+/* ---- find and replace inside the note */
+.nb-far{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--inset)}
+.nb-far input{border:1px solid var(--line);background:var(--page);color:inherit;font:inherit;font-size:14px;padding:7px 11px;border-radius:9px;min-width:0;flex:1 1 150px}
+.nb-far .ghost{padding:6px 11px;font-size:11.5px;flex:none} .nb-far .nb-ib{width:30px;height:30px}
+.nb-far-n{font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);flex:none;min-width:84px;text-align:center}
+::highlight(nb-find){background:#ffe066;color:#000}
+::highlight(nb-find-at){background:var(--red);color:#fff}
+/* ---- the sheet that Export, Import, Open, Move and the earlier saves all use */
+.nb-sheet{position:absolute;inset:0;z-index:50;display:grid;place-items:center;padding:20px;
+ background:color-mix(in srgb,var(--bg) 70%,transparent);backdrop-filter:blur(14px);animation:rise .3s var(--spring) both}
+.nb-sheet-in{width:min(560px,100%);max-height:min(80vh,680px);display:flex;flex-direction:column;padding:18px 20px 16px;border-radius:20px;
+ background:var(--glass-strong);box-shadow:var(--shadow)}
+.nb-sheet-t{display:flex;align-items:center;gap:10px;margin-bottom:4px} .nb-sheet-t b{font-size:18px;flex:1}
+.nb-sheet-b{overflow-y:auto;min-height:0;margin:8px -6px 0;padding:0 6px}
+.nb-sheet-b p.note{margin:0 0 12px;color:var(--muted);font-size:13.5px;line-height:1.6}
+.nb-sheet-b input[type=search],.nb-sheet-b input[type=text]{width:100%;box-sizing:border-box;padding:10px 14px;border-radius:12px;border:1px solid var(--line);
+ background:var(--page);color:inherit;font:inherit;font-size:15px;margin-bottom:8px}
+.nb-pickrow{display:flex;align-items:flex-start;gap:12px;width:100%;text-align:left;border:1px solid var(--line);background:transparent;color:inherit;
+ padding:11px 13px;border-radius:14px;cursor:pointer;font:inherit;margin-bottom:7px;transition:background .2s,border-color .2s}
+.nb-pickrow:hover,.nb-pickrow:focus-visible{background:var(--inset);border-color:var(--text)}
+.nb-pickrow b{display:block;font-size:14.5px} .nb-pickrow small{display:block;color:var(--muted);font-size:12.5px;margin-top:3px;line-height:1.5}
+.nb-pickrow .ext{font:11px var(--mono);color:var(--muted);flex:none;padding-top:2px}
+.nb-sheet-row{display:flex;gap:8px;justify-content:flex-end;padding-top:12px}
+.nb-counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.nb-counts div{border:1px solid var(--line);border-radius:14px;padding:11px 13px}
+.nb-counts b{display:block;font-size:22px;font-variant-numeric:tabular-nums} .nb-counts small{color:var(--muted);font-size:12px}
+/* ---- printing: the app is all one page, so only the copy made for the printer goes on paper */
+.nb-printing{display:none}
+@media print{
+ html.nb-print,html.nb-print body{background:#fff!important;height:auto!important;overflow:visible!important}
+ html.nb-print body > *:not(.nb-printing){display:none!important}
+ html.nb-print .nb-printing{display:block!important;max-width:none;margin:0;padding:0;color:#000;background:#fff;
+  font:12pt/1.55 "Segoe UI",system-ui,sans-serif}
+ .nb-printing h1{font-size:21pt;margin:0 0 14pt} .nb-printing h2{font-size:15pt;margin:14pt 0 5pt} .nb-printing h3{font-size:13pt;margin:12pt 0 4pt}
+ .nb-printing h1,.nb-printing h2,.nb-printing h3,.nb-printing h4,.nb-printing li,.nb-printing tr,.nb-printing img{break-inside:avoid}
+ .nb-printing h1,.nb-printing h2,.nb-printing h3{break-after:avoid}
+ .nb-printing p{margin:0 0 7pt} .nb-printing ul,.nb-printing ol{padding-left:20pt;margin:4pt 0 8pt}
+ .nb-printing li:has(> input[type=checkbox]){list-style:none;margin-left:-14pt}
+ .nb-printing blockquote{margin:8pt 0;padding:0 12pt;border-left:3pt solid #999;color:#333}
+ .nb-printing pre,.nb-printing code{background:#f2f2f2;font-family:Consolas,monospace;font-size:10pt}
+ .nb-printing pre{padding:8pt;border-radius:4pt;white-space:pre-wrap}
+ .nb-printing table{border-collapse:collapse;width:100%} .nb-printing th,.nb-printing td{border:.5pt solid #777;padding:4pt 7pt;text-align:left;vertical-align:top}
+ .nb-printing th{background:#eee} .nb-printing img{max-width:100%;height:auto}
+ .nb-printing a[href]{color:#000;text-decoration:underline} .nb-printing a.wl::before{content:""}
+ .nb-printing mark{background:#ffe9a8;color:#000} .nb-printing hr{border:0;border-top:.5pt solid #999;margin:12pt 0}
+}
 @media (max-width:1150px){.nb .nb-info{display:none} .nb-toggle-info{display:none}}
 @media (max-width:900px){main:has(#notebook.on){padding-top:64px} .nb{height:max(480px,calc(100vh - 205px))}}
 @media (max-width:720px){.nb-side{position:absolute;inset:0 auto 0 0;width:min(300px,86%);z-index:9;background:var(--glass-strong);backdrop-filter:blur(24px)}
@@ -1522,6 +1636,7 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;',
 const ED = $('.nb-ed'), SRC = $('.nb-src'), TITLE = $('.nb-title'), AC = $('.nb-ac'), ACQ = $('.nb-ac-q'), ACL = $('.nb-ac-list');
 let notes = [], cur = null, saveT = 0, tracked = new Set(), filterTag = null, raw = false, lastRange = null;
 let pins = []; try { pins = JSON.parse(store('nbPins') || '[]'); } catch (_) {}
+let recent = []; try { recent = JSON.parse(store('nbRecent') || '[]'); } catch (_) {}
 
 const LINK = /(!?)\[\[([^\]|#\n]+)(#[^\]|\n]*)?(?:\|([^\]\n]*))?\]\]/g;
 const IMG = /\.(png|jpe?g|gif|webp|svg)$/i;
@@ -1705,12 +1820,14 @@ async function load(openName) {
   drawList();
   const want = openName || cur || store('nbLast');
   await open(find(want) ? find(want).name : (notes.find(n => base(n.name) === 'Start here') || notes[0] || {}).name, true);
+  if (!openName) await recover();
 }
 async function open(name, keepScroll) {
   if (!name) return;
   await flush();
   const n = find(name); if (!n) return;
   const same = cur === n.name; cur = n.name; store('nbLast', cur);
+  recent = [cur, ...recent.filter(r => r !== cur)].slice(0, 10); store('nbRecent', JSON.stringify(recent));
   TITLE.value = base(cur); TITLE.title = 'Click to rename: ' + cur;
   SRC.value = n.text;
   const top = $('.nb-scroll').scrollTop;
@@ -1720,8 +1837,19 @@ async function open(name, keepScroll) {
   drawList(); info(); words();
   $('.nb-pin').setAttribute('aria-pressed', pins.includes(cur));
 }
+// ---- Nothing you type is ever lost, in three layers - the same three the board uses.
+// The file on the computer is the real note, but writing it goes through the app, which takes a
+// moment, and the app can be closed faster than that. So every keystroke is also copied into the
+// browser's own storage straight away (which cannot be beaten by a quick close or a crash), the
+// file is written a moment later, and on the way back in the two are compared so the newer wins.
+// Older copies are kept on the computer as well, so a bad edit can still be undone tomorrow.
+function mirror() {
+  if (!cur || window.bbFrozen) return;
+  try { store('nbMirror', JSON.stringify({name: cur, at: Date.now(), raw: raw, body: raw ? SRC.value : ED.innerHTML})); } catch (_) {}
+}
 function changed() {
   if (!note()) return;
+  mirror();                                        // instant, and survives a quick close
   status('Saving…', true); words();
   clearTimeout(saveT); saveT = setTimeout(save, 600);
 }
@@ -1729,13 +1857,39 @@ async function save() {
   clearTimeout(saveT); saveT = 0;
   const n = note(), a = api(); if (!n || !a) return;
   n.text = raw ? SRC.value : toMd();
+  mirror();
   const r = await a.nb_save(n.name, n.text, null);
   if (r.error) return status(r.error);
   n.mtime = r.mtime; status('Saved'); drawList(); info();
+  if (a.nb_backup) { try { a.nb_backup(n.name, n.text); } catch (_) {} }
   if (!tracked.has(n.name)) { tracked.add(n.name); a.track('note'); }
 }
 async function flush() { if (saveT) await save(); }
+const saveNow = () => { if (saveT) save(); };
 (window.bbBeforeLeave = window.bbBeforeLeave || []).push(flush);
+// every way out of the page, and a backstop every two minutes for a laptop lid closing on it
+addEventListener('pagehide', saveNow);
+addEventListener('blur', saveNow);
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveNow(); });
+setInterval(saveNow, 120000);
+// On the way back in: the copy in browser storage only wins if it is clearly newer than the file.
+// A second and a half of grace, because the copy is written first and the file a moment after.
+async function recover() {
+  let kept = null;
+  try { kept = JSON.parse(store('nbMirror') || 'null'); } catch (_) {}
+  if (!kept || !kept.name || !kept.body) return false;
+  const n = find(kept.name); if (!n) return false;
+  let fileAt = n.mtime;
+  try { if (api().nb_saved_at) fileAt = (await api().nb_saved_at(n.name)) || n.mtime; } catch (_) {}
+  if (!(kept.at > fileAt + 1500)) return false;
+  await open(n.name);
+  if (kept.raw) await toEditor(kept.body); else { ED.innerHTML = kept.body; tidy(ED); }
+  SRC.value = toMd();
+  await save();
+  words(); info();            // the note is longer than open() found it - say so at the bottom
+  status('Picked up the last few changes from before');
+  return true;
+}
 async function rename() {
   const n = note(), a = api(), want = TITLE.value.trim();
   if (!n || !a || !want || want === base(n.name)) { TITLE.value = n ? base(n.name) : ''; return; }
@@ -1779,6 +1933,7 @@ MENU.onkeydown = e => {
   if (e.key === 'Escape') { MENU.hidden = true; $('.nb-new').focus(); }
 };
 document.addEventListener('click', e => { if (!e.target.closest('.nb-newwrap')) MENU.hidden = true;
+  if (!e.target.closest('.nb-fwrap')) fileMenu(false);
   if (!e.target.closest('.nb-tpick,[data-a=tools]')) closeTools(); if (!e.target.closest('.nb-ac,.nb-tools') && AC.classList.contains('picker')) hideAc(); });
 $('.nb-today').onclick = () => create(today(), `# ${new Date().toLocaleDateString('en-GB', {weekday: 'long', day: 'numeric', month: 'long'})}\n\n## To do\n\n- [ ] \n\n## Notes\n\n\n#daily\n`, 'Daily');
 $('.nb-folder').onclick = () => api() && api().nb_open_folder();
@@ -2023,6 +2178,325 @@ $('.nb-askbtn').onclick = async () => {
   askBtn.click();
   box.value = `About my note “${base(cur)}”:\n\n${(note() || {text: ''}).text.slice(0, 6000)}\n\nMy question: `;
   box.focus(); box.setSelectionRange(box.value.length, box.value.length); box.dispatchEvent(new Event('input'));
+};
+
+// ================= the sheet that Open, Export, Import, Move, Word count and the earlier saves use
+const SHEET = $('.nb-sheet'), SBOX = SHEET.querySelector('.nb-sheet-in');
+let sheetBack = null;
+function sheet(title, body, after) {
+  sheetBack = document.activeElement;
+  SBOX.innerHTML = `<div class="nb-sheet-t"><b>${esc(title)}</b><button class="nb-ib nb-sheet-x" aria-label="Close">\u2715</button></div><div class="nb-sheet-b">${body}</div>`;
+  SBOX.setAttribute('aria-label', title);
+  SHEET.hidden = false;
+  SBOX.querySelector('.nb-sheet-x').onclick = sheetShut;
+  if (after) after(SBOX.querySelector('.nb-sheet-b'));
+  const first = SBOX.querySelector('.nb-sheet-b input, .nb-sheet-b button') || SBOX.querySelector('.nb-sheet-x');
+  if (first) first.focus();
+}
+function sheetShut() {
+  SHEET.hidden = true; SBOX.innerHTML = '';
+  if (sheetBack && sheetBack.isConnected) sheetBack.focus(); else ED.focus();
+}
+SHEET.onclick = e => { if (e.target === SHEET) sheetShut(); };
+// Tab stays inside the sheet while it is up, so the keyboard cannot wander off behind it
+SHEET.addEventListener('keydown', e => {
+  if (e.key !== 'Tab') return;
+  const stops = [...SBOX.querySelectorAll('input, button, select, [tabindex]:not([tabindex="-1"])')].filter(x => x.offsetParent);
+  if (!stops.length) return;
+  const i = stops.indexOf(document.activeElement);
+  if (e.shiftKey ? i <= 0 : i === stops.length - 1) { e.preventDefault(); stops[e.shiftKey ? stops.length - 1 : 0].focus(); }
+});
+const okOnly = box => {
+  box.insertAdjacentHTML('beforeend', '<div class="nb-sheet-row"><button class="btn s-ok">OK</button></div>');
+  box.querySelector('.s-ok').onclick = sheetShut;
+};
+const when = iso => { const d = new Date(iso); return isNaN(+d) ? String(iso)
+  : d.toLocaleString('en-GB', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'}); };
+
+// ================= find and replace, inside the note you are in =================
+// The matches are shown with the browser's own highlighting, which paints over the text without
+// touching it - so searching can never change what gets saved.
+const FAR = $('.nb-far'), FARQ = $('.nb-far-q'), FARR = $('.nb-far-r');
+let hits = [], hitAt = -1;
+const canPaint = () => !!(window.Highlight && window.CSS && CSS.highlights);
+function paintHits() {
+  if (!canPaint()) return;
+  const rest = new Highlight(), one = new Highlight();
+  hits.forEach((r, i) => (i === hitAt ? one : rest).add(r));
+  CSS.highlights.set('nb-find', rest); CSS.highlights.set('nb-find-at', one);
+}
+function clearHits() {
+  hits = []; hitAt = -1;
+  if (canPaint()) { CSS.highlights.delete('nb-find'); CSS.highlights.delete('nb-find-at'); }
+}
+function farCount() {
+  $('.nb-far-n').textContent = !FARQ.value ? '' : hits.length ? `${hitAt + 1} of ${hits.length}` : 'Nothing found';
+}
+function findAll(keep) {
+  const was = keep ? hitAt : 0;
+  clearHits();
+  const q = FARQ.value;
+  if (!q) return farCount();
+  const low = q.toLowerCase(), walk = document.createTreeWalker(ED, NodeFilter.SHOW_TEXT);
+  for (let t = walk.nextNode(); t; t = walk.nextNode()) {
+    if (t.parentElement && t.parentElement.closest('a.wl')) continue;   // a note link is one whole thing
+    const text = t.nodeValue.toLowerCase();
+    for (let i = text.indexOf(low); i >= 0; i = text.indexOf(low, i + q.length)) {
+      const r = document.createRange(); r.setStart(t, i); r.setEnd(t, i + q.length); hits.push(r);
+    }
+  }
+  hitAt = hits.length ? Math.max(0, Math.min(was, hits.length - 1)) : -1;
+  paintHits(); farCount();
+}
+function farGo(step) {
+  if (!hits.length) return;
+  hitAt = (hitAt + step + hits.length) % hits.length;
+  const el = hits[hitAt].startContainer.parentElement;
+  if (el) el.scrollIntoView({block: 'center', behavior: 'smooth'});
+  paintHits(); farCount();
+}
+function farOne() {
+  if (hitAt < 0 || !hits[hitAt]) return;
+  const r = hits[hitAt];
+  r.deleteContents(); r.insertNode(document.createTextNode(FARR.value));
+  ED.normalize(); changed(); findAll(true);
+}
+function farAll() {
+  if (!FARQ.value || !hits.length) return status('Nothing to change');
+  const many = hits.length;
+  for (let i = hits.length - 1; i >= 0; i--) {   // back to front, so the earlier matches stay put
+    hits[i].deleteContents(); hits[i].insertNode(document.createTextNode(FARR.value));
+  }
+  ED.normalize(); changed(); findAll();
+  status(`Changed ${many} ${many === 1 ? 'one' : 'of them'}`);
+}
+function farOpen(replace) {
+  FAR.hidden = false;
+  const s = getSelection();
+  if (s.rangeCount && !s.isCollapsed && ED.contains(s.anchorNode)) {
+    const picked = s.toString().trim();
+    if (picked && picked.length < 120 && !picked.includes('\n')) FARQ.value = picked;
+  }
+  findAll();
+  if (replace) FARR.focus(); else { FARQ.focus(); FARQ.select(); }
+}
+function farClose() { FAR.hidden = true; clearHits(); ED.focus(); }
+FARQ.oninput = () => findAll();
+FARQ.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); farGo(e.shiftKey ? -1 : 1); } };
+FARR.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); farOne(); } };
+$('.nb-far-up').onclick = () => farGo(-1);
+$('.nb-far-down').onclick = () => farGo(1);
+$('.nb-far-one').onclick = farOne;
+$('.nb-far-all').onclick = farAll;
+$('.nb-far-x').onclick = farClose;
+
+// ================= printing =================
+// The whole app is one page, so a copy of the note is made for the printer and everything else
+// is taken out of the way while it prints.
+function printNote() {
+  const box = document.createElement('div');
+  box.className = 'nb-printing';
+  box.innerHTML = `<h1>${esc(base(cur || 'Note'))}</h1>` + ED.innerHTML;
+  box.querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable'));
+  box.querySelectorAll('input[type=checkbox]').forEach(el => el.disabled = true);
+  document.body.appendChild(box);
+  document.documentElement.classList.add('nb-print');
+  const done = () => {
+    box.remove(); document.documentElement.classList.remove('nb-print');
+    removeEventListener('afterprint', done); clearTimeout(t);
+  };
+  const t = setTimeout(done, 60000);     // in case the printer window never says it has finished
+  addEventListener('afterprint', done);
+  try { print(); } catch (_) { done(); }
+}
+
+// ================= the File menu =================
+const FMENU = $('.nb-fmenu'), FBTN = $('.nb-fbtn');
+const frow = (k, t, key, cls) => `<button role="menuitem" data-k="${k}"${cls ? ` class="${cls}"` : ''}>${esc(t)}` +
+  `${key ? `<span class="key">${esc(key)}</span>` : ''}</button>`;
+function drawFile() {
+  const rec = recent.filter(r => r !== cur && find(r)).slice(0, 5);
+  FMENU.innerHTML = [
+    frow('new', 'New note', 'Ctrl N'), frow('open', 'Open a note\u2026', 'Ctrl O'), frow('imp', 'Import a file\u2026'),
+    '<hr>',
+    frow('save', 'Save now', 'Ctrl S'), frow('sas', 'Save a copy in your notebook\u2026'),
+    frow('exp', 'Export as a file\u2026'), frow('revert', 'Go back to an earlier save\u2026'),
+    '<hr>',
+    frow('rename', 'Rename\u2026'), frow('dup', 'Duplicate this note'), frow('move', 'Move to a folder\u2026'),
+    frow('del', 'Move to the trash', '', 'danger'),
+    '<hr>',
+    frow('print', 'Print\u2026', 'Ctrl P'), frow('far', 'Find and replace\u2026', 'Ctrl H'), frow('count', 'Word count\u2026'),
+    '<hr>',
+    frow('undo', 'Undo', 'Ctrl Z'), frow('redo', 'Redo', 'Ctrl Shift Z'),
+    rec.length ? '<span class="label">Recent notes</span>' + rec.map(r =>
+      `<button role="menuitem" class="sm" data-open="${esc(r)}">${esc(base(r))}` +
+      `${r.includes('/') ? `<small>${esc(r)}</small>` : ''}</button>`).join('') : '',
+  ].join('');
+}
+function fileMenu(show) {
+  if (show === undefined) show = FMENU.hidden;
+  if (show) drawFile();
+  FMENU.hidden = !show;
+  FBTN.setAttribute('aria-expanded', show);
+  if (show) FMENU.querySelector('button').focus();
+}
+FBTN.onclick = e => { e.stopPropagation(); fileMenu(); };
+FMENU.onkeydown = e => {
+  const items = [...FMENU.querySelectorAll('button')], i = items.indexOf(document.activeElement);
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); items[(i + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus(); }
+  if (e.key === 'Escape') { e.preventDefault(); fileMenu(false); FBTN.focus(); }
+};
+FMENU.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  fileMenu(false);
+  if (b.dataset.open) return open(b.dataset.open);
+  const act = FILE[b.dataset.k]; if (act) act();
+};
+
+async function freeName(stem) { let want = stem, i = 2; while (find(want)) want = `${stem} ${i++}`; return want; }
+function undoRedo(redo) {
+  restore(); document.execCommand(redo ? 'redo' : 'undo');
+  flatten(ED); boxes(); changed(); sync();
+}
+async function moveTo(folder) {
+  const n = note(), a = api(); if (!n || !a) return;
+  await flush();
+  const want = (folder ? folder.replace(/^[\\/]+|[\\/]+$/g, '') + '/' : '') + base(n.name);
+  if (want === n.name) return status('It is already there');
+  const r = await a.nb_save(want, n.text, n.name);
+  if (r.error) return status(r.error);
+  pins = pins.map(p => p === n.name ? r.name : p); store('nbPins', JSON.stringify(pins));
+  status('Moved'); await load(r.name);
+}
+const FILE = {
+  new: () => create(null, ''),
+  save: () => { save(); status('Saved'); },
+  rename: () => { TITLE.focus(); TITLE.select(); status('Type the new name, then press Enter'); },
+  del: () => $('.nb-del').click(),
+  print: printNote,
+  far: () => farOpen(true),
+  undo: () => undoRedo(false),
+  redo: () => undoRedo(true),
+  open: () => sheet('Open a note',
+    '<input type="search" class="s-q" placeholder="Find a note" aria-label="Find a note"><div class="s-list"></div>', box => {
+      const q = box.querySelector('.s-q'), list = box.querySelector('.s-list');
+      const draw = () => {
+        const t = q.value.trim().toLowerCase();
+        list.innerHTML = notes.filter(x => !t || x.name.toLowerCase().includes(t)).sort((a, b) => b.mtime - a.mtime)
+          .slice(0, 80).map(x => `<button class="nb-pickrow" data-n="${esc(x.name)}"><span style="flex:1"><b>${esc(base(x.name))}</b>` +
+            `<small>${esc(x.name.includes('/') ? x.name.slice(0, x.name.lastIndexOf('/')) + ' \u00b7 ' : '')}${esc(ago(x.mtime))}</small></span></button>`).join('')
+          || '<p class="none">No notes match.</p>';
+      };
+      draw(); q.oninput = draw;
+      list.onclick = e => { const b = e.target.closest('[data-n]'); if (b) { sheetShut(); open(b.dataset.n); } };
+    }),
+  sas: async () => {
+    const n = note(); if (!n) return;
+    await flush();
+    sheet('Save a copy in your notebook',
+      '<p class="note">This makes another note with the same writing in it, and opens it. The one you are in now is left as it is.</p>' +
+      `<input type="text" class="s-n" aria-label="Name for the copy" value="${esc(await freeName(base(n.name) + ' copy'))}">` +
+      '<div class="nb-sheet-row"><button class="btn s-ok">Make the copy</button></div>', box => {
+        const go = async () => {
+          const want = box.querySelector('.s-n').value.trim(); if (!want) return;
+          sheetShut();
+          const folder = n.name.includes('/') && !want.includes('/') ? n.name.slice(0, n.name.lastIndexOf('/') + 1) : '';
+          await create(folder + want, n.text);
+          status('Copy made');
+        };
+        box.querySelector('.s-ok').onclick = go;
+        box.querySelector('.s-n').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+      });
+  },
+  dup: async () => {
+    const n = note(); if (!n) return;
+    await flush();
+    await create(await freeName(n.name + ' copy'), n.text);
+    status('Duplicated');
+  },
+  move: () => {
+    if (!cur) return;
+    const folders = [...new Set(notes.filter(x => x.name.includes('/')).map(x => x.name.slice(0, x.name.lastIndexOf('/'))))].sort();
+    const now = cur.includes('/') ? cur.slice(0, cur.lastIndexOf('/')) : '';
+    sheet('Move to a folder',
+      '<p class="note">Folders here are real folders inside your Notebook folder. Links to this note from other notes are kept up to date.</p>' +
+      `<input type="text" class="s-f" placeholder="Type a folder name" aria-label="Folder" value="${esc(now)}">` +
+      folders.map(x => `<button class="nb-pickrow" data-f="${esc(x)}"><span style="flex:1"><b>${esc(x)}</b></span></button>`).join('') +
+      '<div class="nb-sheet-row"><button class="ghost s-top">Out of every folder</button><button class="btn s-ok">Move it</button></div>', box => {
+        const go = folder => { sheetShut(); moveTo(folder); };
+        box.querySelector('.s-ok').onclick = () => go(box.querySelector('.s-f').value.trim());
+        box.querySelector('.s-top').onclick = () => go('');
+        box.querySelector('.s-f').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); go(e.target.value.trim()); } };
+        box.onclick = e => { const b = e.target.closest('[data-f]'); if (b) go(b.dataset.f); };
+      });
+  },
+  exp: async () => {
+    const a = api(); if (!a || !a.nb_formats) return status('Saving a note out as a file only works inside the app.');
+    await flush();
+    const out = ((await a.nb_formats()) || {}).out || [];
+    sheet('Export this note as a file',
+      '<p class="note">Every format carries a little less than the note itself. What each one drops is written underneath it.</p>' +
+      out.map(x => `<button class="nb-pickrow" data-f="${esc(x.id)}"><span style="flex:1"><b>${esc(x.name)}</b>` +
+        `<small>${esc(x.loses)}</small></span><span class="ext">${esc(x.ext)}</span></button>`).join(''), box => {
+        box.onclick = async e => {
+          const b = e.target.closest('[data-f]'); if (!b) return;
+          sheetShut(); status('Writing the file\u2026', true);
+          const r = (await a.nb_export(cur, (note() || {}).text || '', b.dataset.f)) || {};
+          status(r.cancelled ? 'Saved' : (r.error || r.msg || 'Saved'));
+        };
+      });
+  },
+  imp: async () => {
+    const a = api(); if (!a || !a.nb_import) return status('Bringing a file in only works inside the app.');
+    await flush();
+    status('Opening the file\u2026', true);
+    const r = (await a.nb_import()) || {};
+    if (r.cancelled) return status('Saved');
+    if (r.error || !r.text) return status(r.error || 'There was nothing in that file.');
+    const name = await freeName(r.name || 'Imported note');
+    await create(name, r.text);
+    const lost = (r.lost || []).join(', ');
+    if (lost) sheet('Brought in',
+      `<p class="note">\u201c${esc(name)}\u201d is in your notebook now, and is already saved.</p>` +
+      `<p class="note">That kind of file cannot hold everything a note can, so these did not come across: ${esc(lost)}.</p>`, okOnly);
+    else status('Brought in');
+  },
+  revert: async () => {
+    const a = api(); if (!a || !a.nb_backups || !cur) return;
+    await flush();
+    const list = (await a.nb_backups(cur)) || [];
+    if (!list.length) return sheet('Earlier saves',
+      '<p class="note">There are no earlier copies of this note yet. One is kept the first time it is saved and then every few minutes while you are writing, so come back later.</p>', okOnly);
+    sheet('Go back to an earlier save',
+      '<p class="note">A copy of this note is kept on your computer every few minutes while you write. Picking one puts it back. What is in the note right now is kept as a copy first, so this can be undone too.</p>' +
+      list.map(b => `<button class="nb-pickrow" data-b="${esc(b.file)}"><span style="flex:1"><b>${esc(when(b.when))}</b>` +
+        `<small>${b.words} word${b.words === 1 ? '' : 's'}${b.latest ? ' \u00b7 the last time it was saved' : ''}</small></span></button>`).join(''), box => {
+        box.onclick = async e => {
+          const b = e.target.closest('[data-b]'); if (!b) return;
+          const text = await a.nb_backup_read(b.dataset.b);
+          if (text == null) return status('That copy could not be read');
+          if (!confirm('Put this copy back over what is in the note now?\n\nWhat is in the note now is kept as a copy as well, so you can change your mind.')) return;
+          sheetShut();
+          const n = note(); if (!n) return;
+          if (a.nb_backup) { try { await a.nb_backup(cur, n.text, true); } catch (_) {} }
+          n.text = text; SRC.value = text;
+          await toEditor(text);
+          await save(); words(); info();
+          status('Put back');
+        };
+      });
+  },
+  count: () => {
+    const t = raw ? SRC.value : ED.innerText;
+    const w = t.trim() ? t.trim().split(/\s+/).length : 0;
+    const paras = raw ? SRC.value.split(/\n\s*\n/).filter(x => x.trim()).length
+      : [...ED.children].filter(x => x.textContent.trim() || x.querySelector('img')).length;
+    const cell = (v, l) => `<div><b>${v}</b><small>${l}</small></div>`;
+    sheet('Word count', '<div class="nb-counts">' + cell(w, 'words') + cell(t.length, 'characters')
+      + cell(t.replace(/\s/g, '').length, 'characters, no spaces') + cell(paras, 'paragraphs')
+      + cell(ED.querySelectorAll('li').length, 'list items')
+      + cell(Math.max(1, Math.round(w / 220)), 'minutes to read') + '</div>', okOnly);
+  },
 };
 
 // ================= typing: shortcuts, auto-formatting, links =================
@@ -2306,13 +2780,36 @@ $('.nb-gclose').onclick = () => { G.hidden = true; $('.nb-graph-btn').focus(); }
 G.querySelector('.nb-gscope').onclick = e => { const b = e.target.closest('button'); if (b) { gScope = b.dataset.s; store('nbGraph', gScope); showGraph(); } };
 
 // ================= keys that work anywhere in the Notebook tab =================
+// The ones everybody already knows. Ctrl+F now searches the note you are in, the way it does in
+// Word, so searching every note has moved to Ctrl+Shift+F. Nothing here clashes with the
+// formatting keys above (Ctrl+B/I/U/K, Ctrl+0 to 3, Ctrl+Shift+7/8/9, Ctrl+Shift+H) or with the
+// board's keys, which only listen while the Online tab is the one on screen.
+const NB_KEYS = {
+  n: () => create(null, ''), o: () => FILE.open(), s: () => { save(); status('Saved'); },
+  p: printNote, f: () => farOpen(false), h: () => farOpen(true), e: () => FILE.exp(),
+  g: () => G.hidden ? showGraph() : (G.hidden = true),
+  z: () => undoRedo(false), y: () => undoRedo(true),
+};
+const NB_SHIFT_KEYS = {
+  f: () => { setPanel('side', true); $('.nb-q').focus(); $('.nb-q').select(); },
+  z: () => undoRedo(true),
+};
 addEventListener('keydown', e => {
   if (!document.getElementById('notebook')?.classList.contains('on')) return;
-  if (e.key === 'Escape') { if (!G.hidden) { G.hidden = true; return; } if (!AC.hidden) { hideAc(); ED.focus(); return; } }
-  if (!(e.ctrlKey || e.metaKey)) return;
-  const k = e.key.toLowerCase(), act = {n: () => create(null, ''), s: () => { save(); status('Saved'); }, f: () => { setPanel('side', true); $('.nb-q').focus(); $('.nb-q').select(); },
-    g: () => G.hidden ? showGraph() : (G.hidden = true)}[k];
-  if (act && !e.shiftKey) { e.preventDefault(); act(); }
+  if (e.key === 'Escape') {
+    if (!SHEET.hidden) { sheetShut(); return; }
+    if (!FMENU.hidden) { fileMenu(false); FBTN.focus(); return; }
+    if (!FAR.hidden) { farClose(); return; }
+    if (!G.hidden) { G.hidden = true; return; }
+    if (!AC.hidden) { hideAc(); ED.focus(); return; }
+  }
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.defaultPrevented) return;
+  const k = e.key.toLowerCase();
+  // in a box you type into, Ctrl+Z belongs to that box
+  if ('zy'.includes(k) && /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || '')) return;
+  const act = e.shiftKey ? NB_SHIFT_KEYS[k] : NB_KEYS[k];
+  if (!act) return;
+  e.preventDefault(); act();
 });
 
 // load once the app bridge is up, and again whenever the tab is opened (files may have changed outside the app)

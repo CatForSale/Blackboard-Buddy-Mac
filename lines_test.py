@@ -626,6 +626,54 @@ with sync_playwright() as pw:
           pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-out')""")
           and not pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-outgone')"""))
 
+    # ---- the format bar sits beside what is picked out, never over it
+    def bar_vs(x, y, w, h):
+        bid = pg.evaluate("""(p) => { const o = bbOnline;
+            o.view({x: 0, y: 0, k: 1});
+            const b = o.add('note', p.x, p.y, {html: 'pick me'}, {size: [p.w, p.h], centre: false});
+            o.select([b.id]); return b.id; }""", {"x": x, "y": y, "w": w, "h": h})
+        pg.wait_for_timeout(300)
+        got = pg.evaluate("""(id) => {
+            const f = document.querySelector('.ol-fmt'), r = f.getBoundingClientRect();
+            const n = document.querySelector(`.ol-b[data-id="${id}"]`).getBoundingClientRect();
+            return {on: f.classList.contains('on'), bar: {t: r.top, b: r.bottom, l: r.left, r: r.right},
+                    blk: {t: n.top, b: n.bottom, l: n.left, r: n.right},
+                    over: !(r.right <= n.left || r.left >= n.right || r.bottom <= n.top || r.top >= n.bottom)}; }""", bid)
+        pg.evaluate(f"() => bbOnline.remove(['{bid}'])")
+        pg.wait_for_timeout(200)
+        return got
+
+    top = bar_vs(500, 8, 240, 120)
+    check("the bar comes up for what is picked out", top["on"])
+    check("a block at the top of the board does not get the bar laid over it", not top["over"],
+          f"bar {top['bar']} block {top['blk']}")
+    check("with no room above, the bar goes underneath instead", top["bar"]["t"] >= top["blk"]["b"])
+
+    mid = bar_vs(500, 350, 240, 120)
+    check("with room above, the bar sits just above what is picked out",
+          not mid["over"] and mid["bar"]["b"] <= mid["blk"]["t"], f"bar {mid['bar']} block {mid['blk']}")
+    check("and close to it rather than away at the top of the board",
+          mid["blk"]["t"] - mid["bar"]["b"] < 20, mid["blk"]["t"] - mid["bar"]["b"])
+
+    low = bar_vs(500, 640, 240, 120)
+    check("a block low down keeps the bar off it too", not low["over"])
+
+    left = bar_vs(0, 300, 160, 100)
+    check("the bar stays clear of the tool rail",
+          left["bar"]["l"] >= pg.evaluate("() => document.querySelector('.ol-tools').getBoundingClientRect().right"),
+          left["bar"]["l"])
+    right = bar_vs(1240, 300, 160, 100)
+    check("and does not run off the right-hand edge",
+          right["bar"]["r"] <= pg.evaluate("() => document.querySelector('#online .ol').getBoundingClientRect().right"),
+          right["bar"]["r"])
+
+    pg.evaluate("() => { document.querySelector('.ol-chat').hidden = false; }")
+    with_chat = bar_vs(1100, 300, 240, 120)
+    check("with the message box open the bar keeps out of its way",
+          with_chat["bar"]["r"] <= pg.evaluate("() => document.querySelector('.ol-chat').getBoundingClientRect().left"),
+          with_chat["bar"]["r"])
+    pg.evaluate("() => { document.querySelector('.ol-chat').hidden = true; }")
+
     br.close()
 
 IGNORE = ("drawAccounts", "notes.filter", "lacks the 'allow-same-origin' flag")

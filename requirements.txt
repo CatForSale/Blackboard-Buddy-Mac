@@ -3,6 +3,7 @@ playwright>=1.50
 markdown
 python-pptx
 python-docx
+pypdf
 python-dotenv
 pywebview
 pyinstaller
