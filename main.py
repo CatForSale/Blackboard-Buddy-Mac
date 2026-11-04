@@ -60,7 +60,7 @@ ENV = BASE / ".env"
 load_dotenv(ENV)
 
 BB_URL = os.getenv("BB_URL", "https://blackboard.uwe.ac.uk")
-VERSION = "1.2.2"  # bump this for every release you upload
+VERSION = "1.3.1"  # bump this for every release you upload
 UPDATE_REPO = "CatForSale/blackboard-buddy-releases"  # GitHub "owner/repo" whose Releases hold new versions; empty = no update checks
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "45"))
 NOTES_DAYS = int(os.getenv("NOTES_DAYS", "14"))
@@ -1138,7 +1138,7 @@ html.no-anim .wctl button::before{transition:none} html.no-anim .wctl svg{transi
 .acct{position:fixed;top:18px;left:18px;z-index:10;width:40px;height:40px;border-radius:50%;border:0;cursor:pointer;
  align-items:center;justify-content:center;padding:0;color:var(--text)}
 .av{font:800 18px/1 var(--dotf);text-transform:uppercase}
-html.intl .av,html.intl .pc-av{font-family:"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif;text-transform:none}
+html.intl .av,html.intl .pc-av{font-family:"DotGothic16","Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif;text-transform:none;font-synthesis:none}
 .ask{position:fixed;right:22px;bottom:22px;z-index:10;border:0;border-radius:999px;padding:0 16px 0 13px;height:46px;gap:8px;
  align-items:center;cursor:pointer;color:var(--text);font:11.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;
  transition:transform .5s var(--bounce)}
@@ -1392,8 +1392,11 @@ SI.querySelector('.si-go').onclick = () => { SI.hidden = true; pywebview.api.sig
 window.addEventListener('pywebviewready', () => pywebview.api.state().then(s => { if (s.signin) bbSignin(); if (s.update) bbUpdate(s.update); }));
 // update prompt, shown when a newer version is on GitHub
 const UP = document.querySelector('.update');
-window.bbUpdate = u => {
-  UP.dataset.v = u.version; try { if (sessionStorage.updLater === u.version) return; } catch (_) {}
+window.bbUpdate = (u, asked) => {
+  // Later quietens the prompt that comes up by itself. Asking for the update on purpose is a
+  // different thing, and must always get an answer - otherwise Later means never.
+  UP.dataset.v = u.version;
+  if (!asked) { try { if (sessionStorage.updLater === u.version) return; } catch (_) {} }
   UP.querySelector('.up-msg').innerHTML = `Version <b>${u.version}</b> is ready (you have ${BB.version}).` + (u.notes ? `<br>${u.notes.replace(/[<>&]/g, '')}` : '');
   UP.querySelector('.up-go').disabled = false; UP.querySelector('.up-go').textContent = 'Update now';
   UP.hidden = false;
@@ -1854,7 +1857,7 @@ function paintCard(p) {
   dressAvatar(PCARD.querySelector('.pc-av'), p);
   const nm = PCARD.querySelector('.pc-name'); nm.textContent = p.name || 'Your name';
   nm.style.fontFamily = (PC_FONTS[p.font] || PC_FONTS.dot)[1]; nm.dataset.font = p.font;
-  nm.classList.toggle('intl-name', !english(p.name));
+  nm.classList.toggle('intl-name', !english(p.name) && (!p.font || p.font === 'dot'));   // a font you picked wins
   PCARD.querySelector('.pc-tag').textContent = p.tag || '';
   PCARD.querySelector('.pc-meta').textContent = p.course || '';
   PCARD.querySelector('.pc-badges').replaceChildren(...(p.badges || []).map(t => { const s = document.createElement('span'); s.textContent = t; return s; }));
@@ -1990,7 +1993,9 @@ A.querySelector('.s-ver').textContent = 'Version ' + BB.version;
 A.querySelector('.s-check').onclick = async () => {
   const m = A.querySelector('.s-check-msg'); m.textContent = 'Checking…';
   const u = await pywebview.api.check_update();
-  if (u && u.version) { m.textContent = ''; closeSheets(); bbUpdate(u); }
+  if (u && u.version) { m.textContent = ''; closeSheets();
+    try { sessionStorage.removeItem('updLater'); } catch (_) {}
+    bbUpdate(u, true); }
   else m.textContent = u && u.error ? u.error : 'You have the latest version.';
 };
 const UN = {
@@ -2142,6 +2147,7 @@ async function drawShare(msg) {
 SH && A.querySelector('.set-tab[data-s=share]').addEventListener('click', () => drawShare());
 // whose notes these are, at the top of This week
 if (BB.follow) {
+  document.documentElement.classList.add('following');     // their grades stay theirs
   const n = document.createElement('div'); n.className = 'follow-note';
   n.innerHTML = '<i></i><span></span><button>Settings</button>';
   n.querySelector('span').textContent = 'Shared by ' + (BB.follow.name || 'a classmate') + ' · their notes from ' + shWhen(BB.follow.synced || BB.follow.updated);
@@ -3276,7 +3282,7 @@ STUDY_HTML = """
 .st-badge.just > b{animation:st-spin .8s cubic-bezier(.2,.9,.3,1.3)}
 /* hover (or tab to) a badge and it says what it is for and how far along you are */
 .st-badge{position:relative}
-.st-btip{position:absolute;top:calc(100% + 8px);left:50%;transform:translate(-50%,-4px);width:208px;
+.st-btip{position:absolute;top:calc(100% + 8px);left:50%;transform:translate(calc(-50% + var(--tx,0px)),-4px);width:208px;max-width:calc(100vw - 16px);box-sizing:border-box;
  display:grid;gap:6px;padding:10px 12px;border-radius:12px;background:var(--glass-strong);color:var(--text);
  backdrop-filter:blur(22px) saturate(140%);-webkit-backdrop-filter:blur(22px) saturate(140%);
  border:1px solid var(--rim);font:11px/1.45 var(--mono);text-align:left;text-transform:none;
@@ -3286,7 +3292,7 @@ STUDY_HTML = """
 .st-btip u{text-decoration:none;color:var(--muted)}
 .st-btip-bar{display:block;height:3px;border-radius:999px;background:var(--line)}
 .st-btip-bar u{display:block;height:100%;border-radius:999px;background:var(--muted)}
-.st-badge:hover .st-btip,.st-badge:focus-visible .st-btip{opacity:1;visibility:visible;transform:translate(-50%,0)}
+.st-badge:hover .st-btip,.st-badge:focus-visible .st-btip{opacity:1;visibility:visible;transform:translate(calc(-50% + var(--tx,0px)),0)}
 .st-cshead{margin-top:16px} .st-cs{margin-top:8px}
 .st-cs i.csw{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px;border:1px solid var(--line)}
 .csw.plain{background:var(--inset)} .csw.ocean{background:linear-gradient(135deg,#3b82f6,#2fb36b)} .csw.sunset{background:linear-gradient(135deg,#f5a524,#e5484d)} .csw.aurora{background:linear-gradient(135deg,#a78bfa,#f472b6,#2fb36b)}
@@ -4071,7 +4077,19 @@ STUDY_JS = r"""
         + `<span>${esc(what)}</span>${bar}<u>${esc(when)}</u></span></span>`;
     }).join('');
     $('.st-bcount').textContent = Object.keys(ST.badges).length + ' / ' + BADGES.length;
+    fitTips();
   }
+  // a tooltip by the edge of the screen slides along until all of it is on the screen
+  function fitTips() {
+    document.querySelectorAll('.st-btip').forEach(t => {
+      const r = t.parentElement.getBoundingClientRect(); if (!r.width) return;
+      const w = Math.min(208, innerWidth - 16), mid = r.left + r.width / 2;
+      const left = Math.max(8, Math.min(innerWidth - 8 - w, mid - w / 2));
+      t.style.setProperty('--tx', Math.round(left - (mid - w / 2)) + 'px');
+    });
+  }
+  addEventListener('resize', fitTips);
+  if (window.ResizeObserver) new ResizeObserver(fitTips).observe($('.st-bgrid'));
   const STYLES = [['plain', 'Plain', 1], ['ocean', 'Ocean', 3], ['sunset', 'Sunset', 5], ['aurora', 'Aurora', 8]];
   function styles() {
     const lv = lvlOf(ST.xp).l + 1;
@@ -4702,11 +4720,11 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
     page = f"""<!doctype html><html lang="en" class="{'following' if following() else 'locked' if not signed_in() else ''}{' mac' if IS_MAC else ''}{'' if plain_english(display_name(snapshot)) else ' intl'}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackboard Buddy</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Doto:wght@700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Doto:wght@700;800;900&family=DotGothic16&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script>try{{const t=localStorage.theme;if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}}catch(_){{}}</script>
 <style>
 :root{{--spring:linear(0.000,0.023,0.078,0.151,0.234,0.318,0.400,0.476,0.547,0.611,0.667,0.717,0.760,0.798,0.830,0.857,0.881,0.900,0.917,0.931,0.943,0.953,0.961,0.968,0.973,0.978,0.982,0.985,0.988,0.990,0.992,0.993,0.995,0.996,0.996,0.997,0.998,0.998,0.998,0.999,0.999,0.999,0.999,0.999,1.000,1.000,1.000,1.000,1);--bounce:linear(0.000,0.032,0.112,0.220,0.340,0.461,0.576,0.679,0.768,0.843,0.903,0.949,0.983,1.008,1.024,1.033,1.038,1.038,1.036,1.033,1.029,1.024,1.019,1.015,1.011,1.008,1.005,1.003,1.002,1.000,0.999,0.999,0.999,0.999,0.999,0.999,0.999,0.999,0.999,0.999,0.999,1.000,1.000,1.000,1.000,1.000,1.000,1.000,1);
- --dotf:"Doto","Space Mono",ui-monospace,monospace;--mono:"Space Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+ --dotf:"Doto","DotGothic16","Space Mono",ui-monospace,monospace;--mono:"Space Mono","DotGothic16",ui-monospace,"Cascadia Mono",Consolas,monospace;
  --text:#0b0b0b;--muted:#6a6a6a;--accent:#0b0b0b;--red:#d71921;--line:rgba(0,0,0,.09);--dot:rgba(0,0,0,.13);
  --glass:rgba(255,255,255,.6);--glass-strong:rgba(255,255,255,.95);--rim:rgba(0,0,0,.08);--inset:rgba(0,0,0,.035);
  --shadow:0 1px 2px rgba(0,0,0,.04),0 8px 28px rgba(0,0,0,.05);--bg:#efefef}}
@@ -4772,12 +4790,17 @@ html.intro-on header,html.intro-on main,html.intro-on nav,html.intro-on .theme,h
 @media (max-width:600px){{.count{{flex-direction:column;align-items:flex-start}} .count .what{{text-align:left}} .count .num{{font-size:72px}}}}
 header{{max-width:880px;margin:56px auto 8px;padding:0 20px}}
 header h1{{margin:0;font:800 60px/1 var(--dotf);text-transform:uppercase;letter-spacing:.01em}}
-/* The dotted font only draws the English alphabet, so a name in another writing system came out
-   in a different font beside it. When that happens the whole line uses one plain font, and the
-   spacing and capitals that break joined-up writing are dropped. */
-html.intl header h1,html.intl .mod-title{{font-family:"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif;
+header h1.dotted{{position:relative;font-size:60px;line-height:1;color:var(--text)}}
+header h1.dotted{{-webkit-text-fill-color:transparent}} header h1.dotted::selection{{-webkit-text-fill-color:var(--text)}}
+header h1 .h1-dots{{position:absolute;left:0;top:50%;transform:translateY(-50%);pointer-events:none}}
+/* Doto only draws the English alphabet, so a name in another writing system came out in a
+   different font beside it. Then the whole line takes DotGothic16, a pixel font with Japanese, and
+   any script that has no pixel font (Korean, Arabic, Thai...) falls through to a plain one. The
+   spacing and capitals that break joined-up writing are dropped, and no bold is faked, which would
+   smear the pixels. */
+html.intl header h1,html.intl .mod-title{{font-family:"DotGothic16","Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif;font-synthesis:none;
  text-transform:none;letter-spacing:0;font-weight:700}}
-.intl-name{{font-family:"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif !important;
+.intl-name{{font-family:"DotGothic16","Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif !important;font-synthesis:none;
  text-transform:none !important;letter-spacing:0 !important;font-weight:700}}
 .sub{{color:var(--muted);margin-top:10px;font:11.5px/1.4 var(--mono);text-transform:uppercase;letter-spacing:.12em}}
 /* floating tab bar */
@@ -4920,7 +4943,7 @@ btns.forEach(b=>b.onclick=()=>show(b.dataset.tab));
 const vis=()=>btns.filter(b=>!b.hidden);
 window.bbShow=show;window.bbTabs=btns;
 // mouse side buttons: back closes whatever is open on top first, then both step through the tabs you've visited
-const overlay=()=>(typeof V!=='undefined'&&!V.hidden)||document.querySelector('.sheet.on,.map-wrap.full,.signin:not([hidden]),[role=dialog]:not([hidden]),[role=alertdialog]:not([hidden])');
+const overlay=()=>(typeof V!=='undefined'&&!V.hidden)||[...document.querySelectorAll('.sheet.on,.map-wrap.full,.signin:not([hidden]),[role=dialog]:not([hidden]),[role=alertdialog]:not([hidden])')].some(e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden');
 const walk=d=>{{const j=TH.i+d;if(j<0||j>=TH.l.length)return;const b=btns.find(x=>x.dataset.tab===TH.l[j]);
  if(!b||b.hidden){{TH.l.splice(j,1);if(d<0)TH.i--;return walk(d)}}TH.i=j;TH.walk=true;show(TH.l[j])}};
 ['mousedown','auxclick'].forEach(t=>addEventListener(t,ev=>{{if(ev.button===3||ev.button===4)ev.preventDefault()}},true));
@@ -4951,6 +4974,32 @@ tb.onclick=()=>{{if(switching)return;  // ignore clicks until the current switch
  vt.finished.finally(()=>{{r.classList.remove('switching');switching=false}})}};
 
 // intro: name lights up dot by dot (5x7 dot-matrix font), then lifts away
+// Text in any writing system as dots: drawn at 16px in the pixel font, or in whatever font has the
+// letters (Korean, Arabic, Thai...), then each pixel read back. Gives {{cols,rows,on(x,y)}}, or null.
+window.bbDotGrid=text=>{{const R=16,o=document.createElement('canvas'),g=o.getContext('2d'),
+  f='16px "DotGothic16","Doto","Malgun Gothic","Microsoft YaHei UI","Nirmala UI","Leelawadee UI","Segoe UI",sans-serif';
+ g.font=f;const w=Math.ceil(g.measureText(text).width)+4;if(!w||w>900)return null;
+ o.width=w;o.height=R+4;g.font=f;g.textBaseline='top';g.fillText(text,2,2);
+ const px=g.getImageData(0,0,w,R+4).data,lit=(x,y)=>px[(y*w+x)*4+3]>110;
+ let x0=w,x1=-1,y0=R+4,y1=-1;for(let y=0;y<R+4;y++)for(let x=0;x<w;x++)if(lit(x,y)){{x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y)}}
+ if(x1<0)return null;return {{cols:x1-x0+1,rows:y1-y0+1,on:(x,y)=>lit(x+x0,y+y0)}}}};
+// The big heading: Doto only has the English alphabet, so a name in any other writing system is drawn in dots
+// to match. The real text stays underneath, for copying and screen readers.
+(function dotHeading(){{
+ const h=document.querySelector('header h1');if(!h||![...h.textContent].some(c=>c.charCodeAt(0)>127))return;
+ const text=h.textContent.trim(),cv=document.createElement('canvas');cv.className='h1-dots';cv.setAttribute('aria-hidden','true');
+ const draw=()=>{{const g=bbDotGrid(text);if(!g)return;
+  h.classList.add('dotted');if(!cv.isConnected)h.prepend(cv);
+  const room=(h.parentElement||h).clientWidth||innerWidth,
+   px=Math.max(2,Math.min(Math.round(parseFloat(getComputedStyle(h).fontSize)*.86/g.rows),Math.floor(room/g.cols))),dpr=devicePixelRatio||1,c=cv.getContext('2d');
+  cv.width=g.cols*px*dpr;cv.height=g.rows*px*dpr;cv.style.width=g.cols*px+'px';cv.style.height=g.rows*px+'px';
+  c.setTransform(dpr,0,0,dpr,0,0);c.fillStyle=getComputedStyle(h).color;
+  for(let y=0;y<g.rows;y++)for(let x=0;x<g.cols;x++)if(g.on(x,y)){{c.beginPath();c.arc(x*px+px/2,y*px+px/2,px*.42,0,7);c.fill()}}}};
+ Promise.race([document.fonts.load('16px "DotGothic16"',text),new Promise(r=>setTimeout(r,1500))]).then(draw,draw);
+ new MutationObserver(draw).observe(document.documentElement,{{attributes:true,attributeFilter:['data-theme']}});
+ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',draw);
+ matchMedia('(max-width:600px)').addEventListener('change',draw);
+}})();
 (function intro(){{
  const el=document.querySelector('.intro');if(!el)return;
  let seen=false;try{{seen=sessionStorage.introSeen==='1';sessionStorage.introSeen='1'}}catch(_){{}}
@@ -4961,27 +5010,37 @@ tb.onclick=()=>{{if(switching)return;  // ignore clicks until the current switch
   L:'1010101010101F',M:'111B1515111111',N:'11111915131111',O:'0E11111111110E',P:'1E11111E101010',Q:'0E11111115120D',
   R:'1E11111E141211',S:'0F10100E01011E',T:'1F040404040404',U:'1111111111110E',V:'11111111110A04',
   W:'1111111515150A',X:'11110A040A1111',Y:'1111110A040404',Z:'1F01020408101F',' ':'00000000000000'}};
- const text=(document.querySelector('header h1').textContent||'HELLO').toUpperCase().replace(/[^A-Z ]/g,'').slice(0,12)||'HELLO';
- const cols=text.length*6-1,rows=7,cv=el.querySelector('canvas'),ctx=cv.getContext('2d'),dpr=devicePixelRatio||1;
- const pitch=Math.min(26,Math.floor(Math.min(innerWidth*.78/cols,innerHeight*.32/rows)));
- cv.width=cols*pitch*dpr;cv.height=rows*pitch*dpr;cv.style.width=cols*pitch+'px';cv.style.height=rows*pitch+'px';ctx.scale(dpr,dpr);
- const dots=[];
- [...text].forEach((ch,ci)=>{{const g=F[ch]||F[' '];for(let r=0;r<7;r++){{const bits=parseInt(g.substr(r*2,2),16);
-  for(let c=0;c<5;c++)dots.push({{x:ci*6+c,y:r,on:!!(bits&(16>>c))}})}}}});
- dots.forEach(d=>d.t=d.on?200+d.x*62+Math.random()*320:0);
+ const raw=(document.querySelector('header h1').textContent||'').trim().toUpperCase();
+ const plain=/^[A-Z ]+$/.test(raw);
+ let text=plain?raw.slice(0,12):[...raw].slice(0,10).join(''),cols=0,rows=7,dots=[],pitch=0,step=62;
+ const cv=el.querySelector('canvas'),ctx=cv.getContext('2d'),dpr=devicePixelRatio||1;
+ const letters=()=>{{if(!plain)text='HELLO';cols=text.length*6-1;rows=7;dots=[];
+  [...text].forEach((ch,ci)=>{{const g=F[ch]||F[' '];for(let r=0;r<7;r++){{const bits=parseInt(g.substr(r*2,2),16);
+   for(let c=0;c<5;c++)dots.push({{x:ci*6+c,y:r,on:!!(bits&(16>>c))}})}}}})}};
+ // Japanese or any other writing system: draw it in the pixel font at its own size, then read each pixel back as a dot
+ const glyphs=()=>{{const g=bbDotGrid(text);if(!g||g.cols>400)return false;
+  cols=g.cols;rows=g.rows;dots=[];
+  for(let y=0;y<rows;y++)for(let x=0;x<cols;x++)dots.push({{x,y,on:g.on(x,y)}});
+  return true}};
  const css=getComputedStyle(document.documentElement),fg=css.getPropertyValue('--text').trim(),dim=css.getPropertyValue('--line').trim();
  const spring=t=>t>=1?1:1-Math.exp(-7*t)*Math.cos(9*t);  // overshoots a little, then settles
- const t0=performance.now();let done=false;
+ let t0=performance.now(),done=false;
+ const start=()=>{{if(!(plain?(letters(),true):glyphs()))letters();
+  pitch=Math.min(26,Math.floor(Math.min(innerWidth*.78/cols,innerHeight*.32/rows)));step=Math.min(62,2600/cols);
+  cv.width=cols*pitch*dpr;cv.height=rows*pitch*dpr;cv.style.width=cols*pitch+'px';cv.style.height=rows*pitch+'px';ctx.scale(dpr,dpr);
+  dots.forEach(d=>d.t=d.on?200+d.x*step+Math.random()*320:0);
+  t0=performance.now();requestAnimationFrame(frame);setTimeout(type,200+cols*step)}};
  function frame(now){{const t=now-t0;ctx.clearRect(0,0,cols*pitch,rows*pitch);
   for(const d of dots){{const cx=d.x*pitch+pitch/2,cy=d.y*pitch+pitch/2;
    ctx.fillStyle=dim;ctx.beginPath();ctx.arc(cx,cy,pitch*.12,0,7);ctx.fill();
    if(d.on&&t>d.t){{const s=spring((t-d.t)/560);ctx.fillStyle=fg;ctx.beginPath();ctx.arc(cx,cy,Math.max(0,pitch*.36*s),0,7);ctx.fill()}}}}
   if(!done)requestAnimationFrame(frame)}}
- requestAnimationFrame(frame);
+ // the pixel font has to be in before a name can be drawn with it; wait a moment for it, not for ever
+ if(plain)start();else Promise.race([document.fonts.load('16px "DotGothic16"',text),new Promise(r=>setTimeout(r,1500))]).then(start,start);
  // subtitle types itself out
  const sub=el.querySelector('.intro-sub'),
   full='BLACKBOARD BUDDY · '+new Date().toLocaleDateString('en-GB',{{weekday:'short',day:'2-digit',month:'short'}}).toUpperCase().replace(',','');let n=0;
- const typer=setTimeout(function type(){{sub.textContent=full.slice(0,++n);if(n<full.length)setTimeout(type,45)}},200+cols*62);
+ let typer=0;function type(){{if(done)return;sub.textContent=full.slice(0,++n);if(n<full.length)typer=setTimeout(type,45)}}
  const finish=()=>{{if(done)return;done=true;clearTimeout(typer);el.classList.add('out');
   try{{window.SFX&&SFX.play('flash')}}catch(_){{}}
   document.documentElement.classList.remove('intro-on');

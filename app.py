@@ -23,7 +23,42 @@ import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import webview
+
+def _unblock_our_own_files():
+    """Take Windows' "this came from the internet" mark off our own files, before anything reads them.
+
+    Everything unpacked from a downloaded zip carries that mark, and .NET then refuses to load
+    the assembly the window is built on, so the app dies on launch with "Failed to resolve
+    Python.Runtime.Loader.Initialize". The exe.config beside the exe settles that properly; this
+    is the belt as well as the braces, for a copy that somehow arrives without it. It only ever
+    touches files we shipped, it is skipped entirely once done, and it must run before the import
+    below, because by then it is already too late.
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    here = Path(sys.executable).parent
+    st = Path(sys.executable).stat()
+    import zlib
+    where = zlib.crc32(str(here).lower().encode("utf-8"))      # a copy somewhere else is checked on its own
+    done = Path(os.getenv("LOCALAPPDATA", here)) / "BlackboardBuddy" / f"unblocked-{where:08x}-{st.st_size}-{int(st.st_mtime)}"
+    if done.exists():
+        return
+    for f in here.rglob("*"):
+        if f.suffix.lower() in (".dll", ".exe", ".pyd"):
+            try:
+                os.remove(str(f) + ":Zone.Identifier")
+            except OSError:
+                pass                      # not marked, or not ours to change: either way, carry on
+    try:
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+
+
+_unblock_our_own_files()
+
+import webview  # noqa: E402
 
 import main
 import online
@@ -39,6 +74,9 @@ BACKUPS_KEPT = 20           # how many of those to hold on to, per board
 IS_WIN = sys.platform == "win32"
 NO_WINDOW = 0x08000000 if IS_WIN else 0     # CREATE_NO_WINDOW; anything but 0 is an error on a Mac
 DETACHED = 0x00000008 if IS_WIN else 0      # DETACHED_PROCESS
+# For the helper scripts that outlive the app (update, uninstall). Not DETACHED: a script started
+# with no console at all quietly dies at its first tasklist/find, so the update never happened.
+HELPER = (0x08000000 | 0x00000200) if IS_WIN else 0   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
 
 def _file_name(name):
@@ -892,13 +930,34 @@ class Api:
         # a little script waits for this window to close, copies the new files over
         # (your .env, data and notes are not in the zip, so they stay), then reopens the app
         bat = work / "update.bat"
+        ulog = main.LOCAL / "update.log"
+        # Wait for this copy to close, but not for ever. It only has to let go of its files; if
+        # it is wedged and never does, waiting for it means the new version is never copied in
+        # and the app never comes back - so after twenty seconds, end it and carry on.
         bat.write_text(f"""@echo off
+setlocal
+set PID={os.getpid()}
+set /a N=0
+echo [update] waiting for the old version to close >>"{ulog}"
 :wait
-tasklist /FI "PID eq {os.getpid()}" | find "{os.getpid()}" >nul && (timeout /t 1 /nobreak >nul & goto wait)
-robocopy "{exe.parent}" "{app_dir}" /E /R:3 /W:1 /NFL /NDL /NJH /NJS >nul
+tasklist /FI "PID eq %PID%" 2>nul | find "%PID%" >nul || goto gone
+set /a N+=1
+if %N% GEQ 20 goto force
+ping -n 2 127.0.0.1 >nul
+goto wait
+:force
+echo [update] it would not close on its own, ending it >>"{ulog}"
+taskkill /PID %PID% /F >nul 2>&1
+ping -n 3 127.0.0.1 >nul
+:gone
+robocopy "{exe.parent}" "{app_dir}" /E /R:3 /W:2 /NFL /NDL /NJH /NJS >>"{ulog}" 2>&1
+if errorlevel 8 (echo [update] copying the new version FAILED, code %errorlevel% >>"{ulog}") ^
+ else (echo [update] new version copied in >>"{ulog}")
 start "" "{app_dir / 'Blackboard Buddy.exe'}"
+echo [update] started it again >>"{ulog}"
 """, encoding="utf-8")
-        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=NO_WINDOW | DETACHED)
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=HELPER, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         threading.Timer(0.5, window.destroy).start()
         return "ok"
 
@@ -1049,7 +1108,7 @@ Remove-Item -LiteralPath $PSCommandPath
 """, encoding="utf-8-sig")
         main.log_quiet(f"uninstall: {sorted(keep)}")
         subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(ps1)],
-                         creationflags=NO_WINDOW | DETACHED)
+                         creationflags=HELPER, close_fds=True)
         threading.Timer(0.8, window.destroy).start()
         return {"ok": True, "saved": saved}
 
@@ -1350,7 +1409,7 @@ def welcome_page(need_key, need_url, need_name=False):
     url = html.escape(main.BB_URL)
     form = need_key or need_url or need_name
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Doto:wght@800&family=Space+Mono&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Doto:wght@800&family=DotGothic16&family=Space+Mono&display=swap" rel="stylesheet">
 <style>
 :root{{color-scheme:light dark;--bg:#efefef;--card:rgba(255,255,255,.75);--text:#0b0b0b;--muted:#7b7b7b;--line:rgba(0,0,0,.1);--dot:rgba(0,0,0,.13)}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#000;--card:rgba(18,18,18,.75);--text:#f2f2f2;--muted:#8a8a8a;--line:rgba(255,255,255,.12);--dot:rgba(255,255,255,.11)}}}}
@@ -1360,7 +1419,7 @@ body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(-
 .card{{width:min(420px,88vw);padding:34px;border-radius:28px;background:var(--card);border:1px solid var(--line);
  backdrop-filter:blur(22px);animation:rise .8s cubic-bezier(.2,.9,.3,1.2) both}}
 @keyframes rise{{from{{opacity:0;transform:translateY(16px) scale(.97);filter:blur(6px)}}}}
-h1{{margin:0 0 4px;font:800 34px/1.1 "Doto","Space Mono",monospace;text-transform:uppercase}}
+h1{{margin:0 0 4px;font:800 34px/1.1 "Doto","DotGothic16","Space Mono",monospace;text-transform:uppercase}}
 .sub{{color:var(--muted);margin:0 0 22px;font-size:14px}}
 label{{display:block;margin:16px 0 6px;font:11px "Space Mono",Consolas,monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}}
 input{{width:100%;box-sizing:border-box;padding:12px 16px;border-radius:14px;border:1px solid var(--line);background:transparent;color:inherit;font:inherit}}
@@ -1995,6 +2054,14 @@ def start_colour():
     return "#0b0b0b" if main.settings().get("theme") == "dark" else "#efefef"
 
 
+def _end_stuck_copies():
+    """Force-close any other copy of this exact program, leaving this one running."""
+    if not getattr(sys, "frozen", False):
+        return
+    subprocess.run(["taskkill", "/F", "/T", "/IM", Path(sys.executable).name,
+                    "/FI", f"PID ne {os.getpid()}"], creationflags=NO_WINDOW, capture_output=True)
+
+
 def only_one_copy():
     """True if this is the only copy running. A second one would fight the first for the
     browser's data folder and open as an empty window, so it bows out and raises the first."""
@@ -2012,10 +2079,49 @@ def only_one_copy():
         # here would leave nothing on screen, so wait for it to let go and open as normal.
         main.log_quiet("launch: the last copy is still shutting down, waiting for it")
         if windll.kernel32.WaitForSingleObject(handle, 20000) not in (0, 0x80):   # WAIT_OBJECT_0, WAIT_ABANDONED
-            main.log_quiet("launch: the last copy never finished shutting down")
-            return False
+            # Twenty seconds on and it still has not let go. If it had a window we would have
+            # raised it above, so it is wedged with nothing on screen. Bowing out here is what
+            # makes the app refuse to open at all: you click it, nothing happens, you click
+            # again, nothing happens. End it and take its place.
+            if _find_window():
+                main.log_quiet("launch: the last copy is slow but has a window, raising that instead")
+                return False
+            main.log_quiet("launch: the last copy is wedged with no window, ending it and taking over")
+            _end_stuck_copies()
+            windll.kernel32.WaitForSingleObject(handle, 5000)
     globals()["_one_copy"] = handle                    # held for the life of the process
     return True
+
+
+def leave_for_good(why):
+    """Stop, whatever is still holding on.
+
+    Closing politely depends on every window going and every native thread letting go. When one
+    does not, the process sits there with no window on screen, still holding the browser's data
+    folder - and then the next launch finds a copy "already running" that it cannot raise, so the
+    app just stops opening, and an update never gets copied in because it is waiting for this
+    copy to close. Nothing is lost by ending here: notes and boards are written as they change.
+    """
+    main.log_quiet("launch: " + why)
+    for p in list(_TERMS.values()):           # os._exit skips atexit, which is what stops these otherwise
+        try:
+            if p.poll() is None:
+                _kill(p)
+        except Exception:
+            pass
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.flush()
+        except Exception:
+            pass
+    os._exit(0)
+
+
+def _leave_if_stuck():
+    """The window has gone. Give the usual shutdown a few seconds, then insist."""
+    t = threading.Timer(8.0, leave_for_good, args=("the window closed but we are still here, stopping",))
+    t.daemon = True            # or this timer would itself be a reason not to exit
+    t.start()
 
 
 def run():
@@ -2055,6 +2161,7 @@ def run():
                                        background_color=start_colour(), frameless=IS_WIN, easy_drag=False)
     # closing the app closes the Blackboard window too, so nothing is left running in the background
     window.events.closed += lambda: viewer in webview.windows and viewer.destroy()
+    window.events.closed += lambda: _leave_if_stuck()
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
     # only the title strip itself drags the window, never the buttons sitting on it
     webview.settings["DRAG_REGION_DIRECT_TARGET_ONLY"] = True
@@ -2066,7 +2173,7 @@ def run():
         import traceback
         main.log_quiet("launch FAILED: " + traceback.format_exc()[-600:])
         raise
-    main.log_quiet("launch: closed")
+    leave_for_good("closed")
 
 
 if __name__ == "__main__":

@@ -410,6 +410,10 @@ main:has(#online.on)::after{height:0}
 .ol-b.locked::before{content:"\1F512";position:absolute;right:6px;top:4px;z-index:4;font-size:11px;opacity:.5}
 .ol-draft{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 .ol-draft path{fill:none;stroke:var(--text);stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
+/* someone else's pen, as they draw */
+.ol-peerink{position:absolute;left:0;top:0;width:1px;height:1px;overflow:visible;pointer-events:none;z-index:99998}
+.ol-peerink path{fill:none;stroke:var(--text);stroke-width:3;stroke-linecap:round;stroke-linejoin:round;transition:opacity .4s}
+.ol-peerink path.gone{opacity:0}
 .ol-marquee{position:absolute;display:none;border:1px dashed var(--sel);background:color-mix(in srgb,var(--sel) 8%,transparent);pointer-events:none}
 .ol-empty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:var(--muted);
  font:12px/1.9 var(--mono);letter-spacing:.06em;pointer-events:none;text-transform:uppercase}
@@ -858,7 +862,11 @@ html.no-anim .ol-fmtpop.on{animation:none}
 .ide-tabs .tab b{font-weight:400;opacity:.6;padding:0 2px} .ide-tabs .tab b:hover{opacity:1}
 .ide-ed{flex:1;min-height:120px;position:relative}
 .ide-ta{position:absolute;inset:0;width:100%;height:100%;border:0;resize:none;outline:none;padding:12px 16px;background:var(--bg);color:var(--text);
- font:13.5px/1.6 "Cascadia Code",Consolas,var(--mono);white-space:pre;tab-size:4}
+ font:13.5px/1.6 "Cascadia Code",Consolas,var(--mono);font-size:var(--ide-fs,13.5px);white-space:pre;tab-size:4}
+.ide-out,.ide-cout,.ide-tout,.ide-lout{font-size:calc(var(--ide-fs,14px) - 1.5px)!important}
+.ide-zoom{display:inline-flex;align-items:center;gap:2px}
+.ol-ide .ide-zoom button{border:0;padding:0 6px;font:inherit;font-size:11px;color:var(--muted);background:transparent;border-radius:6px;cursor:pointer;letter-spacing:0}
+.ol-ide .ide-zoom button:hover{color:var(--text);background:var(--inset)} .ide-zoom b{font-weight:400;min-width:28px;text-align:center}
 .ide-panel{height:32%;min-height:110px;flex:none;border-top:1px solid var(--line);display:flex;flex-direction:column}
 .ide-ph{display:flex;align-items:center;gap:6px;padding:6px 10px;flex:none}
 .ol-ide .ide-ph [data-p]{border:0;color:var(--muted)} .ol-ide .ide-ph [data-p].on{color:var(--text);box-shadow:inset 0 -2px 0 var(--text);border-radius:0}
@@ -1139,12 +1147,22 @@ function dress(b, d) {
   d.classList.toggle('solid', b.kind === 'shape' && D.fill === 'solid');
 }
 
+// The page an output block is showing, if it is the same run of the same page: that part is left
+// exactly where it is when the block is redrawn, since taking a frame out of the page restarts it.
+const pageKey = b => (b.data.at || '') + '\n' + b.data.html;
+function keptPage(b, d) {
+  if (b.kind !== 'output' || !b.data || !b.data.html || outShow(b) !== 'web') return null;
+  const body = d.querySelector(':scope > .ol-outb'), f = body && body.querySelector(':scope > iframe');
+  return f && f._key === pageKey(b) ? body : null;
+}
 function paint(b) {
   if (b.kind === 'arrow') return drawLinks();
   const d = node(b), rs = d.querySelector('.ol-rs'); place(b);
   if (S.editing === b.id) return;   // never replace what you're typing in
-  [...d.childNodes].forEach(c => !(c.classList && c.classList.contains('ol-rs')) && c.remove());
-  const add = e => d.insertBefore(e, rs), D = b.data || {};
+  const kept = keptPage(b, d);
+  [...d.childNodes].forEach(c => !(c.classList && c.classList.contains('ol-rs')) && c !== kept && c.remove());
+  let at = kept || rs;                // until the kept part is reached, what is added goes in front of it
+  const add = e => d.insertBefore(e, at), D = b.data || {};
   dress(b, d);
   const tag = add(h('div', 'ol-tag'));
   try { tag.textContent = shortName(b); } catch (_) { tag.textContent = b.kind; }
@@ -1200,20 +1218,26 @@ function paint(b) {
   else if (b.kind === 'output') {
     const head = add(h('div', 'ol-h'));
     head.appendChild(h('span', 'ol-t', D.title || 'Output'));
-    const from = feederOf(b.id), busy = !!from && running.has(from);
+    const feeds = feedersOf(b.id), from = feeds[0], busy = feeds.some(i => running.has(i));
     if (from) { const r = head.appendChild(h('button', 'run' + (busy ? ' stop' : ''), busy ? '■ Stop' : '▶ Run'));
-      r.dataset.act = 'orun'; r.title = 'Run the code this is joined to again'; }
+      r.dataset.act = 'orun'; r.title = feeds.length > 1 ? `Run all ${feeds.length} code blocks joined to this` : 'Run the code this is joined to again'; }
     const op = head.appendChild(h('button', '', 'Open')); op.dataset.act = 'obig'; op.title = 'Open the result on its own';
     const cp = head.appendChild(h('button', '', 'Copy')); cp.dataset.act = 'ocopy'; cp.title = 'Copy what is in it';
     const cl = head.appendChild(h('button', '', 'Clear')); cl.dataset.act = 'oclear'; cl.title = 'Empty it';
-    const body = add(h('div', 'ol-outb' + (D.wrap === false ? '' : ' wrap') + (D.ok === false ? ' bad' : '')));
+    const cls = 'ol-outb' + (D.wrap === false ? '' : ' wrap') + (D.ok === false ? ' bad' : '');
+    let body;
+    if (kept) { body = kept; at = rs; body.className = cls; [...body.childNodes].forEach(c => c.tagName !== 'IFRAME' && c.remove()); }
+    else body = add(h('div', cls));
     const show = outShow(b);
-    if (busy) body.appendChild(h('p', 'ol-outw', 'Running…'));
+    if (busy) body.insertBefore(h('p', 'ol-outw', 'Running…'), body.firstChild);
     if (show === 'web' && D.html) {
-      const f = document.createElement('iframe');
-      f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
-      f.srcdoc = D.html;                                 // srcdoc first, then into the page, or it stays white
-      body.appendChild(f);
+      if (!kept) {
+        const f = document.createElement('iframe');
+        f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals');
+        f.srcdoc = D.html;                               // srcdoc first, then into the page, or it stays white
+        f._key = pageKey(b);
+        body.appendChild(f);
+      }
     } else {
       const pics = (D.imgs || []).filter(s => okImg(s)).slice(-6);
       if (show !== 'image' || !pics.length) {
@@ -1282,7 +1306,24 @@ const outputsOf = id => joinedTo(id, ['output']);
 const linesOn = id => [...S.blocks.values()].filter(a => a.kind === 'arrow'
   && (a.data?.from === id || a.data?.to === id)
   && S.blocks.has(a.data.from) && S.blocks.has(a.data.to));
-const feederOf = id => (joinedTo(id, ['code', 'proj'])[0] || {}).id || null;
+// every code block feeding this output, top to bottom as they sit on the board
+const feedersOf = id => joinedTo(id, ['code', 'proj']).sort((a, b) => a.y - b.y || a.x - b.x).map(b => b.id);
+const feederOf = id => feedersOf(id)[0] || null;
+// With more than one code block joined, each keeps its own part of the output, under its name,
+// so one run does not wipe out what another printed.
+function outPut(o, src, text) {
+  const all = feedersOf(o.id);
+  if (all.length < 2) { o.data = {...o.data, text, parts: undefined}; return; }
+  const parts = {...(o.data.parts || {})};
+  parts[src] = text;
+  Object.keys(parts).forEach(k => { if (!all.includes(k)) delete parts[k]; });
+  const joined = all.filter(k => parts[k] != null).map(k => {
+    const c = S.blocks.get(k);
+    return '\u2500\u2500 ' + (c ? projTitle(c) : 'Code') + ' \u2500\u2500\n' + (parts[k] || '').replace(/\n+$/, '');
+  }).join('\n\n');
+  o.data = {...o.data, parts, text: joined.length > 20000 ? '\u2026\n' + joined.slice(-20000) : joined};
+}
+const partOf = (o, src) => feedersOf(o.id).length > 1 ? ((o.data.parts || {})[src] || '') : (o.data.text || '');
 // A line appearing or going away changes what an output block holds and whether a code block
 // still shows a result of its own, so both kinds are redrawn.
 const repaintJoins = () => S.blocks.forEach(b => {
@@ -1300,16 +1341,17 @@ function outShow(b) {
 const outWas = new Map();
 function outStart(id) {
   outputsOf(id).forEach(o => {
-    const keep = o.data.add === true ? (o.data.text || '') : '';
-    outWas.set(o.id, keep);
-    o.data = {...o.data, text: keep, imgs: o.data.add === true ? (o.data.imgs || []) : [], html: '', ok: true, src: id};
+    const keep = o.data.add === true ? partOf(o, id) : '';
+    outWas.set(o.id + ' ' + id, keep);
+    o.data = {...o.data, imgs: o.data.add === true ? (o.data.imgs || []) : [], html: '', ok: true, src: id};
+    outPut(o, id, keep);
     if (S.editing !== o.id) paint(o);
   });
 }
 // while it runs: shown as it arrives, not saved - the end of the run is what gets written down
 function outText(id, s) {
   outputsOf(id).forEach(o => {
-    o.data = {...o.data, text: ((o.data.text || '') + s).slice(-20000)};
+    outPut(o, id, (partOf(o, id) + s).slice(-20000));
     if (S.editing !== o.id) paint(o);
   });
 }
@@ -1329,22 +1371,22 @@ function outWeb(id, html) {
 }
 function outDone(id, out) {
   outputsOf(id).forEach(o => {
-    const text = (outWas.get(o.id) || '') + (out.text || '');
-    outWas.delete(o.id);
-    o.data = {...o.data, text: text.length > 20000 ? '…\n' + text.slice(-20000) : text, html: '',
-              ok: out.ok !== false, src: id, by: out.by || (S.me ? S.me.name : meName()), at: out.at || now()};
+    const text = (outWas.get(o.id + ' ' + id) || '') + (out.text || '');
+    outWas.delete(o.id + ' ' + id);
+    o.data = {...o.data, html: '', ok: out.ok !== false, src: id, by: out.by || (S.me ? S.me.name : meName()), at: out.at || now()};
+    outPut(o, id, text.length > 20000 ? '…\n' + text.slice(-20000) : text);
     if (S.editing === o.id) paint(o); else put(o, {soon: true});
   });
 }
 function outClear(b) {
-  change(b.id, x => { x.data = {...x.data, text: '', imgs: [], html: '', ok: true, by: '', at: ''}; });
+  change(b.id, x => { x.data = {...x.data, text: '', parts: undefined, imgs: [], html: '', ok: true, by: '', at: ''}; });
 }
 function outRun(b) {
-  const from = feederOf(b.id);
-  if (!from) return toast('Draw a line from a code block to this one first (press A on the code block)');
-  const code = S.blocks.get(from); if (!code) return;
-  if (running.has(from)) { running.get(from)(); return; }
-  boardRun(code);
+  const all = feedersOf(b.id);
+  if (!all.length) return toast('Draw a line from a code block to this one first (press A on the code block)');
+  const on = all.filter(i => running.has(i));
+  if (on.length) { on.forEach(i => running.get(i)()); return; }
+  all.forEach(i => { const code = S.blocks.get(i); if (code) boardRun(code); });
 }
 // The result on its own, filling the board: a page you can really use, a picture big enough to
 // look at, or output with room to scroll.
@@ -1686,6 +1728,8 @@ function asFeed(data) {
 const relLook = r => ({ends: REL[r].ends, dash: REL[r].dash, color: REL[r].color});
 
 function remove(ids) {
+  const theirs = ids.map(heldBy).filter(Boolean);
+  if (theirs.length) { toast(`${theirs[0].name || 'Someone'} has ${ids.length > 1 ? 'some of these' : 'this one'} right now`); ids = ids.filter(i => !heldBy(i)); if (!ids.length) return; }
   const all = new Set(ids);
   S.blocks.forEach(b => { if (b.kind === 'arrow' && (all.has(b.data?.from) || all.has(b.data?.to))) all.add(b.id); });
   const steps = [];
@@ -1697,7 +1741,7 @@ function remove(ids) {
 function undo(redo) {
   const steps = (redo ? future : history).pop(); if (!steps) return;
   (redo ? history : future).push(steps);
-  steps.forEach(s => { const want = redo ? s.after : s.before, id = (s.before || s.after).id;
+  (redo ? steps : [...steps].reverse()).forEach(s => { const want = redo ? s.after : s.before, id = (s.before || s.after).id;
     if (want) put(snap(want)); else { const b = S.blocks.get(id); if (b) { S.blocks.delete(id); unpaint(id); Sync.remove(b); } } });
   emptyState(); repaintJoins(); sfx('tab');
 }
@@ -1769,9 +1813,40 @@ function regrowBoxes(ids) {
 }
 
 function inside(shape) {
+  // a box can hold a smaller box, never one its own size or bigger: two boxes would otherwise
+  // each count as holding the other and keep growing round each other
   return [...S.blocks.values()].filter(b => b.id !== shape.id && b.kind !== 'arrow' && !locked(b)
+    && !(b.kind === 'shape' && b.w * b.h >= shape.w * shape.h)
     && b.x + b.w / 2 > shape.x && b.x + b.w / 2 < shape.x + shape.w
     && b.y + b.h / 2 > shape.y && b.y + b.h / 2 < shape.y + shape.h);
+}
+// Two groups may sit one inside the other, but never half over each other. When they do, one
+// moves aside, with everything in it, to the nearest side where it is clear. A box in `fixed`
+// keeps its place; otherwise the one in `prefer` (what was just moved or pasted) gives way.
+// Whatever moves keeps its place from then on, so a shove can carry on down the line.
+function pushApart(fixed = [], prefer = []) {
+  const gap = 24, steps = [], firm = new Set(fixed), pref = new Set(prefer), stuck = new Set();
+  const boxes = () => [...S.blocks.values()].filter(b => b.kind === 'shape');
+  const holds = (a, b) => b.x >= a.x && b.y >= a.y && b.x + b.w <= a.x + a.w && b.y + b.h <= a.y + a.h;
+  const over = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h && !holds(a, b) && !holds(b, a);
+  boxes().forEach(b => { if (locked(b) || heldBy(b.id)) firm.add(b.id); });
+  for (let round = 0; round < 40; round++) {
+    const list = boxes();
+    let pair = null;
+    for (let i = 0; i < list.length && !pair; i++) for (let j = i + 1; j < list.length && !pair; j++)
+      if (!stuck.has(list[i].id + ' ' + list[j].id) && over(list[i], list[j])) pair = [list[i], list[j]];
+    if (!pair) break;
+    let [a, b] = pair;                                       // b is the one that moves
+    const fa = firm.has(a.id), fb = firm.has(b.id);
+    if (fa && fb) { stuck.add(a.id + ' ' + b.id); continue; }          // neither may move: leave them
+    if (fb || (!fa && pref.has(a.id) && !pref.has(b.id))) [a, b] = [b, a];
+    const ways = [[a.x + a.w + gap - b.x, 0], [a.x - gap - b.x - b.w, 0], [0, a.y + a.h + gap - b.y], [0, a.y - gap - b.y - b.h]];
+    const [dx, dy] = ways.sort((u, v) => Math.abs(u[0] + u[1]) - Math.abs(v[0] + v[1]))[0];
+    withInsides([b.id]).forEach(id => { const c = S.blocks.get(id); if (!c || c.kind === 'arrow' || (c.kind === 'shape' && c !== b && !holds(b, c))) return;
+      const before = snap(c); c.x += dx; c.y += dy; put(c, {soon: true}); steps.push({before, after: snap(c)}); });
+    firm.add(b.id);
+  }
+  return steps;
 }
 function withInsides(ids) {
   const out = new Set(ids);
@@ -1795,8 +1870,10 @@ function startEdit(id, at) {
   const coding = b.kind === 'code' || b.kind === 'proj';
   const who = peerOn(id);
   if (who) { if (coding) { if (S.editing) stopEdit(); IDE.open(b, true, who); return; } toast(`${who.name} is typing in this one`); return; }
+  const mover = heldBy(id);
+  if (mover) { toast(`${mover.name || 'Someone'} is moving this one`); return; }
   if (S.editing && S.editing !== id) stopEdit();
-  S.editing = id; editBefore = snap(b); select([id]); Sync.presence();
+  S.editing = id; S.editSince = Date.now(); editBefore = snap(b); select([id]); Sync.presence();
   const d = node(b); d.classList.add('editing');
   if (coding) { IDE.open(b, false); return; }
   if (b.kind === 'term') {
@@ -2034,7 +2111,117 @@ function runIn(kind, files, main, stdin, out, opt = {}) {
   });
 }
 // a web page made of the project's files, with its console sent back to the Output panel
-function webPage(files, main) {
+// Runs inside a page the app shows. A new window or tab - window.open, or a link or form with a
+// target - opens as a pop-up window over that same page, instead of somewhere it cannot be
+// reached. window.open hands back a stand-in for the new window that does what pages usually do
+// with one: write into it, send it messages and hear back (opener.postMessage), move it on to
+// another page, close it. Other pages of the same project open in it too, and so do links
+// between those pages. Written as a function so it can be copied into the page as it is.
+function popShim(PAGES) {
+  const W = {}; let n = 0, top = 2147483000, ids = 0;
+  const page = u => { const k = String(u || '').replace(/^\.\//, '').split(/[?#]/)[0]; return PAGES[k] != null ? PAGES[k] : null; };
+  const live = {};                                   // pop-up id -> its stand-in window, for messages coming back
+  // what goes at the top of a pop-up's page: its way back to the page that opened it
+  const back = id => '<script>(()=>{const s=(k,m)=>parent.postMessage({bbpop:' + id + ',k,m},"*");'
+    + 'window.opener={postMessage:m=>s("m",m),closed:false,focus(){},close(){}};window.close=()=>s("x");'
+    + 'addEventListener("DOMContentLoaded",()=>document.title&&s("t",document.title))})()<\/script>';
+  addEventListener('message', e => {
+    const d = e.data; if (!d || d.bbpop == null || !live[d.bbpop]) return;
+    e.stopImmediatePropagation();
+    const fw = live[d.bbpop];
+    if (d.k === 'x') fw.close();
+    else if (d.k === 't') fw.document.title = String(d.m).slice(0, 80);
+    else if (d.k === 'm') { const ev = new MessageEvent('message', {data: d.m, origin: e.origin});
+      Object.defineProperty(ev, 'source', {value: fw}); dispatchEvent(ev); }
+  }, true);
+  function open(u, name, feat) {
+    u = u == null ? '' : String(u); name = name ? String(name) : '';
+    if (name && name !== '_blank' && W[name] && !W[name].closed) { W[name].focus(); if (u) W[name].location = u; return W[name]; }
+    const num = k => { const m = new RegExp(k + '\\s*=\\s*(\\d+)').exec(feat || ''); return m ? +m[1] : 0; };
+    const vw = innerWidth, vh = innerHeight, w = Math.min(vw - 16, num('width') || Math.max(260, vw * .7)),
+      h = Math.min(vh - 16, (num('height') || Math.max(180, vh * .62)) + 30), k = n++ % 6, id = ++ids;
+    const box = document.createElement('div'), bar = document.createElement('div'), t = document.createElement('span'),
+      ext = document.createElement('button'), x = document.createElement('button'), f = document.createElement('iframe');
+    box.setAttribute('data-bb-pop', '');
+    box.style.cssText = `position:fixed;left:${Math.max(8, (vw - w) / 2 + k * 18)}px;top:${Math.max(8, (vh - h) / 2 + k * 18)}px;width:${w}px;height:${h}px;`
+      + `z-index:${++top};display:flex;flex-direction:column;background:#fff;border:1px solid #8888;border-radius:10px;overflow:hidden;`
+      + 'resize:both;min-width:160px;min-height:90px;box-shadow:0 18px 50px -12px rgba(0,0,0,.55);font:12px system-ui,sans-serif;color:#222';
+    bar.style.cssText = 'flex:none;display:flex;align-items:center;gap:6px;padding:0 6px 0 10px;height:30px;background:#eceef2;cursor:move;user-select:none';
+    t.style.cssText = 'flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-weight:600';
+    const btn = b => { b.style.cssText = 'border:0;background:none;font:15px/1 system-ui;cursor:pointer;padding:4px 6px;border-radius:6px;color:#333'; };
+    btn(ext); btn(x); ext.textContent = '↗'; ext.title = 'Open in your browser'; x.textContent = '×'; x.title = 'Close';
+    f.style.cssText = 'flex:1;width:100%;border:0;background:#fff';
+    f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals');
+    bar.append(t, ext, x); box.append(bar, f);
+    let cur = 'about:blank', buf = '', soon = 0, ready = false, queue = [];
+    const show = html => { ready = false; f.srcdoc = back(id) + html; };
+    const go = v => {
+      v = String(v || ''); cur = v || 'about:blank';
+      ext.hidden = !/^https?:\/\//i.test(v);
+      t.textContent = v && !/^about:/.test(v) ? v : (name && name !== '_blank' ? name : 'New window');
+      if (!v || /^about:/.test(v)) return;
+      const pg = page(v);
+      if (pg != null) show(pg);
+      else if (/^https?:\/\//i.test(v)) { ready = false; f.removeAttribute('srcdoc'); f.src = v; }
+      else show('<p style="font:14px sans-serif;padding:16px">Could not find ' + v.replace(/[<&]/g, '') + ' in this project.</p>');
+    };
+    const flush = () => { soon = 0; show(buf); };
+    const later = () => { if (!soon) soon = setTimeout(flush, 0); };
+    const doc = {
+      write: (...a) => { buf += a.join(''); later(); }, writeln: (...a) => { buf += a.join('') + '\n'; later(); },
+      open() { buf = ''; return doc; }, close() { clearTimeout(soon); flush(); },
+      get title() { return t.textContent; }, set title(v) { t.textContent = v; },
+      body: {get innerHTML() { return buf; }, set innerHTML(v) { buf = String(v); clearTimeout(soon); flush(); }},
+    };
+    const loc = {get href() { return cur; }, set href(v) { go(v); }, assign: v => go(v), replace: v => go(v), reload: () => go(cur), toString: () => cur};
+    const fw = {
+      name, opener: window, document: doc, closed: false,
+      get location() { return loc; }, set location(v) { go(v); },
+      close() { if (fw.closed) return; fw.closed = true; box.remove(); delete live[id]; },
+      focus() { box.style.zIndex = ++top; }, blur() {}, print() {}, moveTo() {}, moveBy() {},
+      resizeTo(a, b) { box.style.width = a + 'px'; box.style.height = b + 30 + 'px'; },
+      postMessage(m) { if (ready) f.contentWindow.postMessage(m, '*'); else queue.push(m); },
+      addEventListener() {}, removeEventListener() {},
+    };
+    f.addEventListener('load', () => { ready = true; queue.splice(0).forEach(m => f.contentWindow.postMessage(m, '*')); });
+    live[id] = fw;
+    ext.onclick = () => parent.postMessage({bbext: cur}, '*');
+    x.onclick = () => fw.close();
+    (document.body || document.documentElement).appendChild(box);
+    box.addEventListener('pointerdown', () => fw.focus());
+    bar.addEventListener('pointerdown', e => {
+      if (e.target.closest('button')) return;
+      const sx = e.clientX - box.offsetLeft, sy = e.clientY - box.offsetTop; bar.setPointerCapture(e.pointerId);
+      f.style.pointerEvents = 'none';
+      const mv = ev => { box.style.left = Math.max(-box.offsetWidth + 60, Math.min(innerWidth - 60, ev.clientX - sx)) + 'px';
+                         box.style.top = Math.max(0, Math.min(innerHeight - 30, ev.clientY - sy)) + 'px'; };
+      const up = () => { bar.removeEventListener('pointermove', mv); bar.removeEventListener('pointerup', up); f.style.pointerEvents = ''; };
+      bar.addEventListener('pointermove', mv); bar.addEventListener('pointerup', up);
+    });
+    go(u);
+    if (name && name !== '_blank') W[name] = fw;
+    return fw;
+  }
+  window.open = (u, name, feat) => open(u, name, feat);
+  // a link or form aimed at a new tab opens a pop-up; a link to another page of the project opens that page here
+  document.addEventListener('click', e => {
+    const a = e.target.closest && e.target.closest('a[href]'); if (!a || e.defaultPrevented) return;
+    const href = a.getAttribute('href') || '', tg = (a.getAttribute('target') || '').toLowerCase();
+    if (/^(#|javascript:|mailto:|tel:)/i.test(href)) return;
+    if (tg && !['_self', '_top', '_parent'].includes(tg)) { e.preventDefault(); open(href, tg); return; }
+    const pg = page(href);
+    if (pg != null) { e.preventDefault(); document.open(); document.write(pg); document.close(); }
+    else if (/^https?:\/\//i.test(href)) { e.preventDefault(); open(href, '_blank'); }
+  }, true);
+  document.addEventListener('submit', e => {
+    const fm = e.target, tg = (fm.getAttribute('target') || '').toLowerCase();
+    if (!tg || ['_self', '_top', '_parent'].includes(tg)) return;
+    e.preventDefault(); const w = open('', tg);
+    w.document.write('<pre style="font:13px monospace;padding:12px">' + [...new FormData(fm)].map(([k, v]) => k + ' = ' + v).join('\n').replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;') + '</pre>');
+    w.document.close();
+  }, true);
+}
+function webPage(files, main, alone) {
   const get = n => { const f = files.find(x => x.n === n.replace(/^\.\//, '')); return f ? f.t : null; };
   const hook = '<script>(()=>{const s=(e,a)=>parent.postMessage({bbrun:1,err:e,s:a.map(x=>typeof x==="string"?x:JSON.stringify(x)).join(" ")},"*");'
     + 'for(const k of ["log","info","warn","error"]){const o=console[k];console[k]=(...a)=>{s(k==="warn"||k==="error",a);o.apply(console,a)}}'
@@ -2042,8 +2229,18 @@ function webPage(files, main) {
   let html = get(main) || '';
   html = html.replace(/<link\b[^>]*?href=["']([^"']+)["'][^>]*>/gi, (m, n) => /stylesheet/i.test(m) && get(n) != null ? '<style>' + get(n) + '</style>' : m)
     .replace(/<script\b([^>]*?)\bsrc=["']([^"']+)["']([^>]*)>\s*<\/script>/gi, (m, a, n, c) => get(n) != null ? '<script' + a + c + '>' + get(n).replace(/<\/script/gi, '<\\/script') + '<\/script>' : m);
-  return /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, x => x + hook) : hook + html;
+  // the other pages of the project, ready for the pop-ups and links in this one
+  const pages = {};
+  if (!alone) files.filter(f => /\.html?$/i.test(f.n) && f.n !== main).slice(0, 20).forEach(f => { pages[f.n] = webPage(files, f.n, true); });
+  const pops = alone ? '' : '<script>(' + popShim.toString() + ')(' + JSON.stringify(pages).replace(/</g, '\\u003c') + ')<\/script>';
+  return /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, x => x + hook + pops) : hook + pops + html;
 }
+// a pop-up's "open in your browser" button
+addEventListener('message', ev => {
+  if (!ev.data || typeof ev.data.bbext !== 'string' || ev.source === window) return;
+  const u = okUrl(ev.data.bbext); if (!u || !/^https?:/i.test(u)) return;
+  api()?.open_inside ? api().open_inside(u, u) : window.open(u);
+});
 async function run(b, stdin, sink, img) {
   if (running.has(b.id)) { running.get(b.id)(); return; }
   const files = filesOf(b), main = mainFile(b), kind = RUN_EXT[ext(main)];
@@ -2154,7 +2351,7 @@ const IDE = (() => {
      <div class="ide-panel"><i class="ide-grip" title="Drag to resize"></i><div class="ide-ph"><button data-p="out" class="on">Output</button><button data-p="view">Preview</button>
        <button data-p="term">Terminal</button><button data-p="con">Console</button><button data-p="find">Search</button><button data-p="ai">AI</button>
        <input class="ide-in" placeholder="Input for input() — one line each, separate with  |  " aria-label="Program input"><button class="ide-clear">Clear</button></div>
-      <pre class="ide-out ide-pane"></pre><iframe class="ide-view ide-pane" sandbox="allow-scripts allow-modals" title="Preview"></iframe>
+      <pre class="ide-out ide-pane"></pre><iframe class="ide-view ide-pane" sandbox="allow-scripts allow-forms allow-modals" title="Preview"></iframe>
       <div class="ide-term ide-pane"><div class="ide-tbar"><span>Run command</span><input class="ide-cmd" spellcheck="false" aria-label="Run command"><span class="ide-tst"></span><button class="ide-fold" title="Open this project's folder on your computer">Folder</button></div>
        <pre class="ide-tout"></pre><input class="ide-tin" spellcheck="false" placeholder="A command, Enter runs it in the project folder: pip install requests · git status · javac Main.java" aria-label="Terminal"></div>
       <div class="ide-con ide-pane"><pre class="ide-cout"></pre><input class="ide-cin" spellcheck="false" placeholder=">>> Python here, Enter runs it. Your last run's variables are still here" aria-label="Python console"></div>
@@ -2162,14 +2359,15 @@ const IDE = (() => {
       <div class="ide-ai ide-pane"><div class="ide-ans"></div>
         <div class="ide-aiin"><textarea class="ide-ait" rows="1" placeholder="Ask about your code… (select lines first to ask about just those)" aria-label="Ask AI"></textarea><button class="ide-aisend">Ask</button></div></div></div></div>
     <div class="ide-live"><i class="ide-lgrip" title="Drag to resize"></i><div class="ide-lh"><span>Display</span><span class="ide-lst"></span><button class="ide-lre" title="Show it again" aria-label="Show it again">↻</button></div>
-     <div class="ide-lbody"><iframe class="ide-lv" sandbox="allow-scripts allow-modals" title="Display"></iframe><pre class="ide-lout"></pre><div class="ide-lpc"><p></p><button class="btn ide-lgo">▶ Run on this PC</button></div></div></div></div>
-   <div class="ide-status"><span class="ide-pos">Ln 1, Col 1</span><span class="ide-lg"></span><span class="ide-hint">Ctrl+P files · Ctrl+Shift+P all commands</span><span class="ide-saved"></span></div>
+     <div class="ide-lbody"><iframe class="ide-lv" sandbox="allow-scripts allow-forms allow-modals" title="Display"></iframe><pre class="ide-lout"></pre><div class="ide-lpc"><p></p><button class="btn ide-lgo">▶ Run on this PC</button></div></div></div></div>
+   <div class="ide-status"><span class="ide-pos">Ln 1, Col 1</span><span class="ide-lg"></span><span class="ide-hint">Ctrl+P files · Ctrl+Shift+P all commands</span><span class="ide-zoom" title="Text size (Ctrl + and Ctrl −, Ctrl 0 for the usual, or Ctrl + wheel)"><button class="ide-zm" aria-label="Smaller text">A−</button><b class="ide-zv"></b><button class="ide-zp" aria-label="Bigger text">A+</button></span><span class="ide-saved"></span></div>
    <div class="ide-start"><div><h3>Start a project</h3><p>Pick a starting point. You can add, upload, link and delete files after.</p><div class="ide-tpl"></div></div></div>`;
   const q = s => el.querySelector(s);
   let mon = null, ed = null, ta = null, b = null, ro = false, file = null, tabs = [], quiet = false, savedT = null, marked = [], lastId = null, hi = 0, provided = false;
   const models = new Map(), closed = new Set(), chat = [], hist = [];
   const P = (() => { const d = {wrap: false, mini: true, size: 14, ph: 0}; try { return {...d, ...JSON.parse(localStorage.bbIde || '{}')}; } catch (_) { return d; } })();
   const keepP = () => { try { localStorage.bbIde = JSON.stringify(P); } catch (_) {} };
+  const showSize = () => { el.style.setProperty('--ide-fs', P.size + 'px'); const v = el.querySelector('.ide-zv'); if (v) v.textContent = P.size + 'px'; };
   const theme = () => ((document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')) === 'dark' ? 'bb-dark' : 'bb-light');
   const saved = t => { q('.ide-saved').textContent = t; };
   const isProj = () => b && b.kind === 'proj';
@@ -2193,7 +2391,7 @@ const IDE = (() => {
         {token: 'keyword', foreground: 'ffffff', fontStyle: 'bold'}, {token: 'string', foreground: 'd9a7a7'}],
         colors: {'editor.background': '#0c0c0c', 'editorLineNumber.foreground': '#4a4a4a', 'editorCursor.foreground': '#ff5a5f', 'editor.selectionBackground': '#5a1a1d', 'editor.lineHighlightBackground': '#161616'}});
       ed = mon.editor.create(q('.ide-ed'), {theme: theme(), automaticLayout: true, fontFamily: '"Cascadia Code", Consolas, "Space Mono", monospace', fontSize: P.size,
-        minimap: {enabled: P.mini}, wordWrap: P.wrap ? 'on' : 'off', scrollBeyondLastLine: false, tabSize: 4, bracketPairColorization: {enabled: true}, smoothScrolling: true, mouseWheelZoom: true,
+        minimap: {enabled: P.mini}, wordWrap: P.wrap ? 'on' : 'off', scrollBeyondLastLine: false, tabSize: 4, bracketPairColorization: {enabled: true}, smoothScrolling: true, mouseWheelZoom: false,
         cursorSmoothCaretAnimation: 'on', stickyScroll: {enabled: true}, fixedOverflowWidgets: true, padding: {top: 10}, guides: {bracketPairs: true}, linkedEditing: true, renderWhitespace: 'selection'});
       ed.onDidChangeCursorPosition(e => { q('.ide-pos').textContent = `Ln ${e.position.lineNumber}, Col ${e.position.column}`; });
       ed.addCommand(mon.KeyMod.CtrlCmd | mon.KeyCode.Enter, () => go());
@@ -2720,8 +2918,14 @@ const IDE = (() => {
   };
   function quick() { if (!b) return; pick('Go to a file', filesOf(b).map(f => ({label: f.n, sub: f.link ? 'linked from the board' : f.n === mainFile(b) ? 'Run starts here' : '', run: () => show(f.n)}))); }
   const act = id => { if (!ed) return toast('This needs the full editor (it loads from the internet)'); ed.focus(); const a = ed.getAction(id); a ? a.run() : ed.trigger('bb', id, null); };
-  function setP(k, v) { P[k] = v; keepP(); if (ed) ed.updateOptions({wordWrap: P.wrap ? 'on' : 'off', minimap: {enabled: P.mini}, fontSize: P.size}); }
-  const size = d => { setP('size', clamp(P.size + d, 10, 26)); toast('Text size ' + P.size); };
+  function setP(k, v) { P[k] = v; keepP(); showSize(); if (ed) ed.updateOptions({wordWrap: P.wrap ? 'on' : 'off', minimap: {enabled: P.mini}, fontSize: P.size}); }
+  const size = d => { const was = P.size; setP('size', d === 0 ? 14 : clamp(P.size + d, 10, 26)); if (P.size !== was) toast('Text size ' + P.size); };
+  showSize();
+  q('.ide-zm').onclick = () => size(-1); q('.ide-zp').onclick = () => size(1); q('.ide-zv').onclick = () => size(0);
+  // Ctrl + wheel anywhere in the editor: the same size as the buttons, kept for next time
+  let wheelAt = 0;
+  el.addEventListener('wheel', ev => { if (!(ev.ctrlKey || ev.metaKey)) return; ev.preventDefault(); ev.stopPropagation();
+    if (Date.now() - wheelAt < 60) return; wheelAt = Date.now(); size(ev.deltaY < 0 ? 1 : -1); }, {capture: true, passive: false});
   async function exportTo(how) {
     if (!b) return; if (!api() || !api().ol_vscode) { toast('This works in the Blackboard Buddy app'); return; }
     toast(await api().ol_vscode(b.data.title || (isProj() ? 'Project' : 'Code'), filesOf(b).map(f => ({n: f.n, t: f.t})), how));
@@ -2760,6 +2964,7 @@ const IDE = (() => {
     if (ev.altKey && !c && k === 'z') { setP('wrap', !P.wrap); return true; }
     if (c && (k === '=' || k === '+')) { size(1); return true; }
     if (c && k === '-') { size(-1); return true; }
+    if (c && k === '0') { size(0); return true; }
     if (c && k === 'enter' && !ev.target.closest('.monaco-editor, .ide-ait, .ide-cin, .ide-pick')) { go(); return true; }
     return false;
   }
@@ -2943,6 +3148,8 @@ board.addEventListener('pointerdown', ev => {
   if (t.classList.contains('ol-rs')) {
     const b = S.blocks.get(id);
     if (locked(b)) { ev.preventDefault(); return; }
+    const who = heldBy(id);
+    if (who) { ev.preventDefault(); toast(`${who.name || 'Someone'} has this one right now`); return; }
     const n = b.kind === 'shape' ? needs(b) : null;
     const c = t.dataset.c || 'se';
     drag = {kind: 'resize', id, p, c, before: snap(b), x: b.x, y: b.y, w: b.w, h: b.h, ratio: b.w / b.h,
@@ -2955,8 +3162,11 @@ board.addEventListener('pointerdown', ev => {
     if (ev.shiftKey || ev.ctrlKey) { S.sel.has(id) ? S.sel.delete(id) : S.sel.add(id); select([...S.sel]); }
     else if (!S.sel.has(id)) select([id]);
     if (locked(S.blocks.get(id))) { ev.preventDefault(); return; }   // pick it up with the lock off
+    const who = heldBy(id);
+    if (who) { ev.preventDefault(); toast(`${who.name || 'Someone'} has this one right now`); return; }
     toFront([...S.sel]);
-    drag = {kind: 'move', p, moved: false, items: withInsides([...S.sel]).map(i => S.blocks.get(i)).filter(Boolean).map(b => ({b, x: b.x, y: b.y, before: snap(b)})), at: t};
+    // whatever someone else has hold of stays with them
+    drag = {kind: 'move', p, moved: false, items: withInsides([...S.sel]).filter(i => !heldBy(i)).map(i => S.blocks.get(i)).filter(Boolean).map(b => ({b, x: b.x, y: b.y, before: snap(b)})), at: t};
     board.setPointerCapture(ev.pointerId); ev.preventDefault(); return;
   }
   // The middle of a box lets clicks through, so that what sits in it stays usable - but a
@@ -3017,7 +3227,7 @@ board.addEventListener('pointermove', ev => {
     b.x = c.includes('w') ? drag.x + drag.w - b.w : drag.x; b.y = c.includes('n') ? drag.y + drag.h - b.h : drag.y;
     if (b.kind === 'text') b.data = {...b.data, size: Math.round(clamp(b.h * .62, 14, 160))}, node(b).style.setProperty('--fs', b.data.size + 'px');
     place(b); Sync.live(b, true); return; }
-  if (drag.kind === 'pen') { const last = drag.pts[drag.pts.length - 1]; if (Math.hypot(p.x - last.x, p.y - last.y) * S.view.k > 1.5) { drag.pts.push(p); drawDraft(); } return; }
+  if (drag.kind === 'pen') { const last = drag.pts[drag.pts.length - 1]; if (Math.hypot(p.x - last.x, p.y - last.y) * S.view.k > 1.5) { drag.pts.push(p); drawDraft(); Sync.pen(drag); } return; }
   if (drag.kind === 'arrow') { drag.to = p; drawDraft(); return; }
   if (drag.kind === 'bend') {
     const b = S.blocks.get(drag.id); if (!b) return;
@@ -3046,12 +3256,14 @@ board.addEventListener('pointerup', ev => {
     if (d.moved) {
       const steps = d.items.map(i => ({before: i.before, after: snap(i.b)}));
       d.items.forEach(i => put(i.b, {soon: true}));
-      steps.push(...regrowBoxes(d.items.map(i => i.b.id)));     // a box takes in what was put in it
+      const grew = regrowBoxes(d.items.map(i => i.b.id));     // a box takes in what was put in it
+      steps.push(...grew, ...pushApart(grew.map(g => g.after.id), d.items.map(i => i.b.id)));
       record(steps);
       sfx('tap', .6);
     }
   }
-  if (d.kind === 'resize') { delete board.dataset.rz; const b = S.blocks.get(d.id); record([{before: d.before, after: snap(b)}]); put(b, {soon: true}); }
+  if (d.kind === 'resize') { delete board.dataset.rz; const b = S.blocks.get(d.id); put(b, {soon: true});
+    record([{before: d.before, after: snap(b)}, ...pushApart([b.id])]); }
   if (d.kind === 'make') {
     setTool('select');
     const q = d.at || d.p;
@@ -3064,6 +3276,7 @@ board.addEventListener('pointerup', ev => {
     toBack([b.id]);
     setTimeout(() => startEdit(b.id), 10);
   }
+  if (d.kind === 'pen') Sync.pen(d, true);
   const penXs = d.kind === 'pen' ? d.pts.map(p => p.x) : [], penYs = d.kind === 'pen' ? d.pts.map(p => p.y) : [];
   const scribble = d.kind === 'pen' && d.pts.length > 2
     && Math.max(Math.max(...penXs) - Math.min(...penXs), Math.max(...penYs) - Math.min(...penYs)) * S.view.k > 6;
@@ -3080,7 +3293,7 @@ board.addEventListener('pointerup', ev => {
   if (d.kind === 'arrow') {
     const t = document.elementsFromPoint(ev.clientX, ev.clientY).find(e => e.classList?.contains('ol-b'));
     const to = t?.dataset.id;
-    if (to && to !== d.from) { add('arrow', 0, 0, {from: d.from, to}, {size: [0, 0], centre: false}); setTool('select'); }
+    if (to && to !== d.from) { join(d.from, to); setTool('select'); }
     else if (d.to) toast('Let go on another block to join them');
   }
 });
@@ -3178,6 +3391,10 @@ addEventListener('keydown', ev => {
   if (ev.key === 'F7') { ev.preventDefault(); Writing.open(S.sel.size ? [...S.sel] : null); return; }
   if (!typing && (ev.key === 'm' || ev.key === 'M') && !ev.ctrlKey && !ev.metaKey) {
     ev.preventDefault(); showMap(!mapOn); return; }
+  const inBlock = typing && ev.target.closest('.ol-b'), kb = inBlock && S.blocks.get(inBlock.dataset.id);
+  if ((ev.ctrlKey || ev.metaKey) && kb && CAN_SIZE.includes(kb.kind) && ['+', '=', '-', '_'].includes(ev.key)) {
+    ev.preventDefault(); const by = ev.key === '-' || ev.key === '_' ? 1 / 1.2 : 1.2;
+    change(kb.id, x => { x.data = {...x.data, ...sizePatch(x, Math.round(clamp(baseSize(x) * by, 9, 160)))}; }); return; }
   if ((ev.ctrlKey || ev.metaKey) && !typing && S.sel.size) {
     const k = ev.key.toLowerCase();
     const dress_ = fn => { ev.preventDefault();
@@ -3264,7 +3481,8 @@ function landRows(out, extra) {
   return out;
 }
 function duplicate(ids, off) {
-  landRows(copyRows(withAllInside(ids).map(id => S.blocks.get(id)).filter(Boolean), {x: off, y: off}));
+  const out = copyRows(withAllInside(ids).map(id => S.blocks.get(id)).filter(Boolean), {x: off, y: off});
+  landRows(out, () => pushApart([], out.map(b => b.id)));
 }
 // A box is copied with what is in it, and with the lines running between them.
 function withAllInside(ids) {
@@ -3299,7 +3517,7 @@ function pasteRows(rows, p) {
   const x1 = Math.max(...solid.map(b => (b.x || 0) + (b.w || 0))), y1 = Math.max(...solid.map(b => (b.y || 0) + (b.h || 0)));
   const at = p || centre();
   const out = copyRows(list, {x: at.x - (x0 + x1) / 2, y: at.y - (y0 + y1) / 2});
-  landRows(out, () => regrowBoxes(out.map(b => b.id)));
+  landRows(out, () => { const ids = out.map(b => b.id), grew = regrowBoxes(ids); return [...grew, ...pushApart(grew.map(g => g.after.id), ids)]; });
   return out.filter(b => b.kind !== 'arrow').length;
 }
 
@@ -3375,6 +3593,53 @@ function placeCursors() {
 }
 setInterval(placeCursors, 3000);
 function peerOn(id) { for (const p of S.peers.values()) if (p.editing === id) return p; return null; }
+// Someone else has hold of this block: typing in it, or dragging or resizing it right now (their
+// last word on it is under a second and a half old, so a dropped connection never holds it for long).
+function bothIn() {
+  if (!S.editing || !S.me) return;
+  const mine = S.editSince || 0;
+  for (const q of S.peers.values()) {
+    if (q.editing !== S.editing) continue;
+    const theirs = q.since || 0;
+    if (theirs < mine || (theirs === mine && String(q.uid) < String(S.me.id))) {
+      const b = S.blocks.get(S.editing); stopEdit();
+      toast(`${q.name || 'Someone'} started on this one first`);
+      if (b && (b.kind === 'code' || b.kind === 'proj')) IDE.open(b, true, q);
+      return;
+    }
+  }
+}
+function heldBy(id) {
+  const t = Date.now();
+  for (const p of S.peers.values()) if (p.editing === id || (p.hold && p.hold.includes(id) && t - p.holdAt < 1500)) return p;
+  return null;
+}
+// what I have hold of, for the others
+const myHold = () => [...new Set([...(drag && drag.items ? drag.items.map(i => i.b.id) : []), ...(drag && drag.kind === 'resize' ? [drag.id] : []), ...(S.editing ? [S.editing] : [])])];
+// Someone else's stroke, drawn as it comes in. It sits on the board itself, so it moves and zooms with
+// everything else; once they let go it fades out, as the finished drawing arrives in its place.
+const inkLayer = (() => { const ns = 'http://www.w3.org/2000/svg', g = document.createElementNS(ns, 'svg');
+  g.setAttribute('class', 'ol-peerink'); world.appendChild(g); return g; })();
+const peerStrokes = new Map();
+function peerInk(uid, k) {
+  if (!k || typeof k.id !== 'string' || !Array.isArray(k.pts)) return;
+  const key = uid + ' ' + k.id;
+  let st = peerStrokes.get(key);
+  if (!st) {
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('vector-effect', 'non-scaling-stroke'); inkLayer.appendChild(path);
+    st = {path, pts: []}; peerStrokes.set(key, st);
+  }
+  const peer = S.peers.get(uid) || S.members.get(uid) || {};
+  st.path.style.stroke = themed(k.c) || personColor(peer.color) || '';
+  const fresh = k.pts.filter(q => Array.isArray(q) && isFinite(q[0]) && isFinite(q[1])).map(q => ({x: +q[0], y: +q[1]}));
+  const tail = st.pts[st.pts.length - 1];
+  st.pts.push(...(tail && fresh[0] && fresh[0].x === tail.x && fresh[0].y === tail.y ? fresh.slice(1) : fresh));
+  if (st.pts.length > 4000) st.pts = st.pts.slice(-4000);
+  st.path.setAttribute('d', st.pts.map((q, i) => (i ? 'L' : 'M') + q.x + ',' + q.y).join(' '));
+  clearTimeout(st.t);
+  st.t = setTimeout(() => { st.path.classList.add('gone'); setTimeout(() => { st.path.remove(); peerStrokes.delete(key); }, 400); }, k.done ? 700 : 5000);
+}
 function markPeers() {
   S.nodes.forEach((d, id) => { const p = peerOn(id); d.classList.toggle('peer', !!p);
     if (p) { d.dataset.who = (p.name || 'Someone') + ' is typing'; d.style.setProperty('--pc', personColor(p.color)); } });
@@ -3663,19 +3928,31 @@ const Sync = {
     Sync.tick();
   },
   cursor(p) { if (S.mode !== 'live' || !chan) return; Sync.cur = {x: Math.round(p.x), y: Math.round(p.y)}; Sync.tick(); },
+  // the stroke you are drawing, a few points at a time, so the others see it go down as you draw
+  pen(d, done) {
+    if (S.mode !== 'live' || !chan || !d || d.kind !== 'pen') return;
+    if (!d.sid) { d.sid = Math.random().toString(36).slice(2, 9); d.sent = 0; }
+    const pts = d.pts.slice(Math.max(0, d.sent - 1)).map(q => [Math.round(q.x * 10) / 10, Math.round(q.y * 10) / 10]);
+    d.sent = d.pts.length;
+    const was = Sync.ink && Sync.ink.id === d.sid ? Sync.ink.pts.slice(0, -1) : [];
+    Sync.ink = {id: d.sid, pts: [...was, ...pts].slice(-400), c: S.ink === 'auto' ? null : S.ink, done: !!done};
+    Sync.tick();
+  },
+  ink: null,
   out: new Map(), cur: null,
   tick: throttle(() => {
-    if (S.mode !== 'live' || !chan || (!Sync.out.size && !Sync.cur)) return;
+    if (S.mode !== 'live' || !chan || (!Sync.out.size && !Sync.cur && !Sync.ink)) return;
     const items = [...Sync.out.values()].map(o => {
       if (o.p) return o;
       const b = S.blocks.get(o.id); return b ? {id: b.id, block: b} : null;
     }).filter(Boolean);
-    const payload = {uid: S.me.id, items};
+    const payload = {uid: S.me.id, items, hold: myHold()};
     if (Sync.cur) payload.cur = Sync.cur;
+    if (Sync.ink) { payload.ink = Sync.ink; Sync.ink = null; }
     Sync.out.clear(); Sync.cur = null;
     chan.send({type: 'broadcast', event: 'tick', payload});
   }, 80),
-  presence() { if (S.mode === 'live' && chan) chan.track({uid: S.me.id, name: S.me.name, color: S.me.color, editing: S.editing}); },
+  presence() { if (S.mode === 'live' && chan) chan.track({uid: S.me.id, name: S.me.name, color: S.me.color, editing: S.editing, since: S.editing ? S.editSince || 0 : 0}); },
 };
 // whatever gets moved live is held separately per block so a slow save never jumps it back
 function incoming(row) {
@@ -3775,6 +4052,9 @@ async function openGroup(g) {
     .on('broadcast', {event: 'tick'}, ({payload: p}) => {
       if (!p || !p.uid) return;
       (p.items || []).forEach(liveIn);
+      if (Array.isArray(p.hold)) { const peer = S.peers.get(p.uid) || {uid: p.uid, ...(S.members.get(p.uid) || {})};
+        peer.hold = p.hold.filter(x => typeof x === 'string').slice(0, 200); peer.holdAt = Date.now(); S.peers.set(p.uid, peer); }
+      if (p.ink) peerInk(p.uid, p.ink);
       if (p.cur) { const peer = S.peers.get(p.uid) || {uid: p.uid, ...(S.members.get(p.uid) || {})};
         peer.cur = {x: +p.cur.x, y: +p.cur.y}; peer.seen = Date.now(); S.peers.set(p.uid, peer); cursorsSoon(); }
     })
@@ -3795,8 +4075,9 @@ async function openGroup(g) {
     .on('presence', {event: 'sync'}, () => {
       const st = chan.presenceState(), seen = new Set();
       Object.values(st).forEach(list => list.forEach(p => { if (!p.uid || p.uid === S.me.id) return; seen.add(p.uid);
-        const old = S.peers.get(p.uid) || {}; S.peers.set(p.uid, {...old, uid: p.uid, name: p.name, color: p.color, editing: p.editing, seen: old.seen || Date.now()}); }));
+        const old = S.peers.get(p.uid) || {}; S.peers.set(p.uid, {...old, uid: p.uid, name: p.name, color: p.color, editing: p.editing, since: +p.since || 0, seen: old.seen || Date.now()}); }));
       [...S.peers.keys()].forEach(id => seen.has(id) || S.peers.delete(id));
+      bothIn();
       markPeers(); drawPeople(); placeCursors(); })
     .subscribe(status => {
       if (status === 'SUBSCRIBED') { setState('live'); Sync.presence(); if (chan._wasDown) load(); chan._wasDown = false; }
@@ -4634,12 +4915,21 @@ function stopLink() {
   linkFrom = null; board.classList.remove('linking'); draft.setAttribute('d', '');
 }
 // true when the click was used up making the line
+// Whether a line already runs between these two, either way round.
+function joined(a, b) {
+  return [...S.blocks.values()].some(x => x.kind === 'arrow' && !x.deleted
+    && ((x.data?.from === a && x.data?.to === b) || (x.data?.from === b && x.data?.to === a)));
+}
+function join(from, to) {
+  if (joined(from, to)) { toast('Those two are already joined'); sfx('off'); return null; }
+  return add('arrow', 0, 0, {from, to}, {size: [0, 0], centre: false});
+}
 function linkClick(id) {
   if (!linkFrom) return false;
   const from = linkFrom;
   stopLink();
   if (!id || id === from) { toast('Nothing joined'); return !!id; }
-  add('arrow', 0, 0, {from, to: id}, {size: [0, 0], centre: false});
+  join(from, id);
   return true;
 }
 board.addEventListener('pointermove', ev => {
@@ -5456,6 +5746,7 @@ function tidyInside(shape) {
   });
   const grew = growToFit(shape);
   if (grew) steps.push(grew);
+  steps.push(...pushApart([shape.id]));
   record(steps);
   toast('Tidied ' + list.length + (list.length === 1 ? ' thing' : ' things'));
   sfx('done', 1.2);
@@ -5622,7 +5913,7 @@ nav && nav.addEventListener('click', () => setTimeout(() => { start(); R.focus({
 if (document.querySelector('#online.on')) start();
 new MutationObserver(() => { if (document.querySelector('#online.on')) start(); }).observe(document.getElementById('online'), {attributes: true, attributeFilter: ['class']});
 window.bbWriting = Writing;
-window.bbOnline = {S, IDE, run, add, fit, placeCode, codeFiles, select, autoCmd, start, useLocal, incoming, sniff, guessLang, clean, paint, place, put, drawLinks, startEdit, tidy, dropLayout, Writing,
+window.bbOnline = {S, IDE, join, heldBy, peerInk, Sync, feedersOf, outStart, outText, outDone, run, add, fit, placeCode, codeFiles, select, autoCmd, start, useLocal, incoming, sniff, guessLang, clean, paint, place, put, drawLinks, startEdit, tidy, dropLayout, Writing,
   Clip, copySel, pasteRows, duplicate, toFront, toBack, stackOrder, outputsOf, feederOf, outRun, outBig, outShow, boardRun, remove,
   REL, relOf, lineText, linkPath, chainFrom, numberChain, clearSteps, goTo, editLabel, linesOn, inTheWay,
   view: v => { S.view = v; applyView(); }};

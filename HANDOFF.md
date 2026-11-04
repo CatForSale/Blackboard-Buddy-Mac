@@ -1926,3 +1926,95 @@ sources in a scratch folder to check it still packages - the app folder, the `bb
 were not touched, because the session working on the board owns this evening's build.
 `output/dashboard.html` is rebuilt, which is what the suites were driven against. Sources are
 re-hidden. Nothing committed, nothing pushed.
+
+## Round 38: fixes before 1.3.0, any language in dots, playable outputs, one person per block
+
+**Fixes from the last session.**
+- **Update "Later" no longer blocks updating for good.** It holds off the automatic prompt for that run only (`sessionStorage.updLater`). Settings > Check for updates clears it and always asks.
+- **Closing the window really exits.** `leave_for_good()` ends the running `_TERMS` processes and then calls `os._exit(0)`, with an 8 s backstop on `window.events.closed`. A copy that is stuck with no window is ended after 20 s, and the new copy takes over (`_end_stuck_copies`).
+- **Self-heal marker** lives in `LOCALAPPDATA/BlackboardBuddy/unblocked-<crc32 of path>-<size>-<mtime>`, so a moved or updated copy unblocks its files again.
+- **Check for updates** treats a 404 from the releases repo as "up to date", not "couldn't check".
+
+**Any writing system in the pixel style.**
+- DotGothic16 (Google Fonts) is the pixel font with Japanese. It sits after Doto in `--dotf` and `--mono`.
+- `window.bbDotGrid(text)` draws text at 16 px in the pixel font. If that font lacks the letters, it falls back to one that has them (Malgun Gothic, YaHei, Nirmala, Leelawadee, Segoe). It then reads each pixel back as a dot grid.
+- The intro uses `bbDotGrid` for any name that is not A-Z. The big heading does too (`dotHeading`): it draws a `.h1-dots` canvas over the real text, which stays for copying and screen readers, and it is redrawn on theme and width changes.
+- Tested with Japanese, Korean, Chinese, Russian, Arabic, Thai, Hindi and English at 1180 px and 400 px (`langs_test`).
+
+**Code text size.** A-, size and A+ in the editor's status bar (`--ide-fs`); Ctrl+wheel and Ctrl+0 work too. Output panes follow the size. On the board, Ctrl +/- while typing in a code block resizes that block.
+
+**Groups (boxes) never half-overlap.** `pushApart(fixed, prefer)` runs after a drop, a resize, a paste, a duplicate and a tidy.
+- A box partly over another one moves aside to the nearest clear side, 24 px off, with everything in it.
+- What was just moved gives way. A box that grew to take something in, a locked box, and a box another person is holding all stay put.
+- One box inside another is still fine. `inside()` no longer lets a box "hold" one its own size or bigger: dropping one box on another used to make each grow around the other.
+- **Undo now walks a step list backwards**, since one action can move a block twice (dragged, then shoved).
+
+**Lines.** `join(from, to)` refuses a second line between the same two blocks, whichever way round.
+
+**One output, several code blocks.** `feedersOf(output)` lists every code block joined to it, top to bottom.
+- With more than one, each block's result is kept in `data.parts[srcId]`, and the text shows them under a `── name ──` heading each, so one run doesn't wipe out another.
+- Run on the output runs them all, and Stop stops whichever are running.
+
+**Outputs you can play.**
+- **A page in an output block keeps running when the block is redrawn**: moved, renamed, or changed by a groupmate. `keptPage()` leaves the `.ol-outb` and its frame in place, keyed on `data.at` plus the html, so only a new Run restarts it. Before this, every repaint rebuilt the frame and a game went back to the start.
+- **New windows and tabs open as a pop-up inside the output.** `popShim` is copied into every page `webPage()` builds. It covers `window.open`, links and forms with a `target`, links to other `.html` files of the same project, and outside links (with a "open in your browser" button that goes through `open_inside`).
+- **The pop-up is a stand-in window, not a real one.** Nested sandboxed frames each get their own locked-off origin, so the two can't touch each other directly. What works:
+  - `document.write`/`open`/`close`
+  - `body.innerHTML`
+  - `location` / `location.href`
+  - `close()`, `closed` and `focus`
+  - `postMessage` both ways (`opener.postMessage` from the pop-up comes back as a `message` event on the page)
+  - pop-ups reused by name
+  - the pop-up's page title
+- The pop-ups can be dragged and resized, and several can be open at once. Inside a pop-up, `getElementById` on the stand-in document does **not** work, by design.
+- The editor previews take forms now (`allow-forms`). No frame has `allow-same-origin`, because code on a group board must never reach the app.
+
+**Online: one person per block.**
+- Every tick now carries `hold`: what you are dragging, resizing or typing in. `heldBy(id)` is someone else's hold, if it is under 1.5 s old, or their presence `editing`.
+- Someone else can't drag, resize, delete or start typing in a block you hold. They get a toast saying who has it.
+- Presence also carries `since`. If two people start on one block at the same moment, both apps pick the same winner (earlier `since`, then lower user id), and the other backs off. For code, the one who backs off gets the read-only view.
+
+**Online: the pen, live.**
+- While you draw, `Sync.pen` sends the new points with each tick (`ink: {id, pts, c, done}`).
+- Others see the stroke grow on a `.ol-peerink` SVG inside the board, so it pans and zooms with everything else.
+- It fades out once the finished ink block arrives.
+
+**Other fixes the old tests found.**
+- **Mouse Back did nothing**, because a notebook panel with `role=dialog` in a hidden tab counted as "open". `overlay()` now only counts things on screen.
+- **Badge tooltips** near the screen edge slide back onto it (`fitTips`), so phone width no longer scrolls sideways.
+- A followed (shared) dashboard sets `html.following` from the page as well, so Grades stays hidden.
+
+**Testing.** New suites, all passing:
+- `langs_test` 41
+- `apart_test` 11
+- `multiout_test` 6
+- `play_probe` 18
+- `twoppl_test` 15
+- `codesize_test`, `later_test`, `intro_test`
+
+Fixed and passing again: the old `mouse_test`, `share_ui_test`, `study_test` and `rows_test`.
+
+`out_test`, `lines_test`, `group_test` and the other suites named in Round 37 sit in other sessions' folders. They were not run here.
+
+## Round 39: the Update button never finished
+
+Checked by installing 1.2.2 in a test folder and clicking Update now, with 1.3.0 live on GitHub.
+- The download and unzip worked, and the app closed. Then nothing happened: `update.bat` never ran, and there was no `update.log`.
+- Running the same `update.bat` by hand worked: the files were copied in and the app reopened. So only the launch was broken.
+- Reproduced in a tiny windowed PyInstaller exe (scratchpad `frz/harness.py`). With the old launch (`CREATE_NO_WINDOW | DETACHED_PROCESS`, plus `timeout`), the script leaves no trace. With the new launch it runs to the end.
+
+Fixes in app.py:
+- New constant `HELPER = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, used for both helper scripts: update (`install_update`) and uninstall. Not DETACHED.
+- The update Popen now also passes `close_fds` and DEVNULL for stdin, stdout and stderr.
+- `timeout /t` is replaced by `ping -n N 127.0.0.1 >nul`, because `timeout` needs a console.
+- The bat writes a first line, "waiting for the old version to close", to update.log, so a launch that fails is visible.
+- `taskkill` lost `/T`. The update script is a child of the app, so `/T` killed the script along with the app.
+
+**Every copy at 1.3.0 or older still has the broken launch.** It can download an update but not install it, so each of those copies needs one manual install of the first release that has this fix. After that, updates work on their own.
+
+The full app was not clicked through again after the fix; only the harness and the hand-run bat were.
+
+**Released as 1.3.1** (VERSION = "1.3.1"): https://github.com/CatForSale/blackboard-buddy-releases/releases/tag/v1.3.1
+- Asset `Blackboard-Buddy-1.3.1.zip`, 74,824,031 bytes.
+- `gh release create` hit a GitHub 502 after the upload and left a draft. Published it with `gh release edit v1.3.1 --draft=false --latest`.
+- The first real check of the fixed button will be updating a 1.3.1 copy to the next release.
