@@ -173,8 +173,13 @@ def check_update():
         return None
     req = urllib.request.Request(f"https://api.github.com/repos/{main.UPDATE_REPO}/releases/latest",
                                  headers={"User-Agent": "BlackboardBuddy", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        rel = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rel = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:          # no release published yet, so nothing newer than this
+            return None
+        raise
     zips = [a for a in rel.get("assets", []) if a["name"].lower().endswith(".zip")
             and ("mac" in a["name"].lower()) == (sys.platform == "darwin")]
     if not zips or _version(rel.get("tag_name", "")) <= _version(main.VERSION):
@@ -787,7 +792,13 @@ class Api:
             return {"error": "Updates aren't set up for this copy."}
         try:
             return check_update() or {}
-        except Exception:
+        except urllib.error.HTTPError as e:
+            main.log_quiet(f"Update check: GitHub said {e.code}")
+            if e.code in (403, 429):
+                return {"error": "GitHub is busy right now. Try again in an hour."}
+            return {"error": f"GitHub couldn't answer ({e.code}). Try again later."}
+        except Exception as e:
+            main.log_quiet(f"Update check failed: {e!r}")
             return {"error": "Couldn't check. Are you online?"}
 
     def install_update(self):
