@@ -171,6 +171,11 @@ def display_name(snapshot):
     return os.getenv("USER_NAME") or snapshot["me"].get("name", "")
 
 
+def plain_english(text):
+    """True when every letter is one the dotted heading font can actually draw."""
+    return all(ord(c) < 128 for c in text or "")
+
+
 def following():
     """Whose shared notes this app shows instead of its own Blackboard sync, or None."""
     f = load_json(SETTINGS, {}).get("follow")
@@ -1133,6 +1138,7 @@ html.no-anim .wctl button::before{transition:none} html.no-anim .wctl svg{transi
 .acct{position:fixed;top:18px;left:18px;z-index:10;width:40px;height:40px;border-radius:50%;border:0;cursor:pointer;
  align-items:center;justify-content:center;padding:0;color:var(--text)}
 .av{font:800 18px/1 var(--dotf);text-transform:uppercase}
+html.intl .av,html.intl .pc-av{font-family:"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif;text-transform:none}
 .ask{position:fixed;right:22px;bottom:22px;z-index:10;border:0;border-radius:999px;padding:0 16px 0 13px;height:46px;gap:8px;
  align-items:center;cursor:pointer;color:var(--text);font:11.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;
  transition:transform .5s var(--bounce)}
@@ -1800,12 +1806,12 @@ document.querySelectorAll('.sheet .x').forEach(b => b.onclick = closeSheets);
 addEventListener('keydown', ev => { if (ev.key === 'Escape') closeSheets(); });
 
 const A = document.querySelector('[data-sheet=acct]');
-A.querySelector('.av').textContent = (BB.name || '?')[0].toUpperCase();
+A.querySelector('.av').textContent = firstLetter(BB.name).toUpperCase();
 A.querySelector('.a-name').textContent = BB.name || 'Student';
 A.querySelector('.a-user').textContent = [BB.user, BB.programme].filter(Boolean).join(' · ');
 A.querySelector('.a-sync').textContent = BB.synced;
 A.querySelector('.a-spend').textContent = '$' + Number(BB.spend || 0).toFixed(2);
-document.querySelector('.acct .av').textContent = ((BB.profile && BB.profile.avatar) || BB.name || '?')[0].toUpperCase();
+document.querySelector('.acct .av').textContent = firstLetter((BB.profile && BB.profile.avatar) || BB.name).toUpperCase();
 const SY = A.querySelector('.s-sync'), NP = A.querySelector('.s-notes'), NPV = A.querySelector('.s-notes-v');
 SY.value = String(BB.settings.sync_hours); NP.value = BB.settings.notes_per_sync; NPV.textContent = NP.value;
 const saveSettings = () => window.pywebview && pywebview.api.save_settings(
@@ -1823,7 +1829,7 @@ const PC_PATTERNS = {none: '', dots: 'radial-gradient(rgba(255,255,255,.3) 1.2px
   grid: 'linear-gradient(rgba(255,255,255,.16) 1px,transparent 1px) 0 0/16px 16px,linear-gradient(90deg,rgba(255,255,255,.16) 1px,transparent 1px) 0 0/16px 16px',
   stripes: 'repeating-linear-gradient(45deg,rgba(255,255,255,.14) 0 6px,transparent 6px 14px)'};
 const PC_ACCENTS = ['#d71921', '#ff8a00', '#f5c400', '#2cb67d', '#00b4d8', '#4361ee', '#7f5af0', '#f72585', '#f2f2f2', '#111111'];
-const PC_FONTS = {dot: ['Dot', 'var(--dotf)'], sans: ['Clean', '"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif'],
+const PC_FONTS = {dot: ['Dot', 'var(--dotf)'], sans: ['Clean', '"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif'],
   serif: ['Serif', 'Georgia,"Times New Roman",serif'], mono: ['Code', '"Cascadia Code",Consolas,monospace'],
   round: ['Round', '"Arial Rounded MT Bold","Segoe UI",sans-serif']};
 const PC_EFFECTS = {none: 'None', glow: 'Glow', shimmer: 'Shimmer', ring: 'Spinning ring', float: 'Float'};
@@ -1840,11 +1846,15 @@ function dressAvatar(el, p) {
 const bannerOf = p => p.banner === 'image' && p.bannerImg ? `center/cover no-repeat url("${p.bannerImg}")`
   : p.banner === 'custom' ? `linear-gradient(135deg,${p.g1},${p.g2})` : (PC_BANNERS[p.banner] || PC_BANNERS.aurora);
 const PCARD = A.querySelector('.pcard'), PCE = A.querySelector('.pc-edit');
+function english(t) { return !/[^\x00-\x7F]/.test(t || ''); }
+// the first letter, counted properly: "[0]" cuts some letters in half
+function firstLetter(t) { return [...String(t || '?')][0] || '?'; }
 function paintCard(p) {
   PCARD.querySelector('.pc-ban').style.background = [PC_PATTERNS[p.pattern], bannerOf(p)].filter(Boolean).join(',');
   dressAvatar(PCARD.querySelector('.pc-av'), p);
   const nm = PCARD.querySelector('.pc-name'); nm.textContent = p.name || 'Your name';
   nm.style.fontFamily = (PC_FONTS[p.font] || PC_FONTS.dot)[1]; nm.dataset.font = p.font;
+  nm.classList.toggle('intl-name', !english(p.name));
   PCARD.querySelector('.pc-tag').textContent = p.tag || '';
   PCARD.querySelector('.pc-meta').textContent = p.course || '';
   PCARD.querySelector('.pc-badges').replaceChildren(...(p.badges || []).map(t => { const s = document.createElement('span'); s.textContent = t; return s; }));
@@ -1854,7 +1864,10 @@ function paintCard(p) {
 }
 function applyProfile(p) {
   document.querySelectorAll('.acct .av, .who .av').forEach(el => dressAvatar(el, p));
-  A.querySelector('.a-name').textContent = p.name || 'Student';
+  const an = A.querySelector('.a-name');
+  an.textContent = p.name || 'Student';
+  an.classList.toggle('intl-name', !english(p.name));
+  document.documentElement.classList.toggle('intl', !english(p.name));
 }
 [['.pc-in-name', 'name'], ['.pc-in-tag', 'tag'], ['.pc-in-course', 'course'], ['.pc-in-av', 'avatar']].forEach(([cls, key]) => {
   const i = PCE.querySelector(cls); i.value = PC[key] || ''; i.oninput = () => { PC[key] = i.value; paintCard(PC); }; });
@@ -3039,6 +3052,26 @@ _SKIP_ANS = re.compile(r"^who\b|module leader|\btutors?\b|https?://|check with|p
 
 _SKIP_TABLE = {"name", "section", "level", "item", "column", "field", "customer", "channel", "module", "task", "due",
                "date", "week", "when", "deadline", "contact", "email", "role", "who", "time", "session", "room", "file"}
+# rows of a form or template ("Name: Check Balance"): the label alone means nothing as a question
+_FIELD_ROW = {"name", "id", "description", "actor", "actors", "primary actor", "secondary actors", "type", "value", "notes",
+              "note", "purpose", "goal", "trigger", "precondition", "preconditions", "postcondition", "postconditions",
+              "main flow", "basic flow", "alternative flow", "alternate flow", "steps", "input", "inputs", "output",
+              "outputs", "result", "status", "owner", "priority", "version", "author", "summary", "scope", "level",
+              "stakeholders", "assumptions", "extensions", "frequency", "example", "examples", "other"}
+# questions about running the module rather than its subject
+_ADMIN_Q = re.compile(r"worksheet|examiner|catch.?up|you should already|lab format|\bschedule'?s?\b|deadline|hand(ed)? in|submi(t|ssion)|attendance|timetable|handbook|"
+                      r"\b(lecture|lab|seminar|workshop) (room|time|slot)|module (leader|team|code|page)|this week\b|"
+                      r"^(is|are|do|does|should|can|will|must) (there|you|we|i|students?)\b", re.I)
+# a definition that leans on a sentence it was cut from ("added to that sum")
+_LEANS = re.compile(r"\b(that|these|those) (sum|value|number|step|one|method|result|list|data|line|output)s?\b|"
+                    r"\b(above|below|previous|following|earlier)\b", re.I)
+# A line that opens by pointing back at the sentence before it - "It identifies the ___",
+# "They are used for ___" - says nothing on a card of its own, where there is no sentence before.
+_POINTS_BACK = re.compile(
+    r"^\W*(it|they|them|he|she|its|their|such|here|there)\b|"
+    r"^\W*(this|that|these|those)\s+(is|are|was|were|can|could|will|would|has|have|had|does|do|"
+    r"means|shows|gives|identifies|includes|allows|helps|makes|lets|provides|describes|covers|"
+    r"works|happens|lets|tells|takes|uses)\b", re.I)
 
 
 def _plain(t):
@@ -3060,20 +3093,25 @@ def note_week(n):
 
 
 def make_cards(notes, mod_key, modules, this_year=()):
-    out = []
+    out, everywhere = [], set()           # one card per question in a module, however many notes repeat it
     for n in notes:
+        if re.search(r"examiner|handbook|contacts?\b|welcome|timetable|announcement|module information|"
+                     r"introduction to the programme", n["title"], re.I):
+            continue                      # notes about who runs the module, not what it teaches
         wk, cur = note_week(n), n["course"] in this_year
         text = re.sub(r"```.*?```", "", n.get("md") or "", flags=re.S)
         text = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith(">"))
         key, note = mod_key(n["course"]), n.get("topic") or n["title"]
         seen, cards = set(), []
 
-        def add(kind, q, a, ask):
+        def add(kind, q, a, ask, idq=None):
             q, a = _plain(q), _plain(a)
-            if len(q) < 3 or len(a) < 6 or len(a) > 900 or q.lower() in seen or _SKIP_ANS.search(q + " " + a):
+            same = (n["course"], re.sub(r"\W+", "", q.lower()))
+            if len(q) < 3 or len(a) < 6 or len(a) > 900 or q.lower() in seen or same in everywhere \
+                    or _SKIP_ANS.search(q + " " + a) or _ADMIN_Q.search(q) or _POINTS_BACK.match(q):
                 return
-            seen.add(q.lower())
-            cid = hashlib.sha1(f"{n['course']}|{kind}|{q}".encode()).hexdigest()[:12]
+            seen.add(q.lower()); everywhere.add(same)
+            cid = hashlib.sha1(f"{n['course']}|{kind}|{_plain(idq) if idq else q}".encode()).hexdigest()[:12]   # same id as before, so progress stays
             cards.append({"id": cid, "key": key, "mod": modules.get(key, ""), "note": note, "title": n["title"],
                           "kind": kind, "ask": ask, "q": q, "a": a, "wk": wk, "cur": cur})
 
@@ -3092,9 +3130,13 @@ def make_cards(notes, mod_key, modules, this_year=()):
             if pts:
                 add("idea", head, "\n".join("- " + p for p in pts) if len(pts) > 1 else pts[0], "Explain")
         # definitions: "A **scalar** is a single number"
-        for m in re.finditer(r"\*\*([^*\n]{2,50})\*\*\s+(is|are|means|refers to|describes|stands for)\s+([^\n]{8,260}?)(?:\.(?:\s|$)|\n|$)", text):
-            term = m.group(1).strip(" :")
-            add("define", term, f"**{term}** {m.group(2)} {m.group(3).strip()}.", "Define")
+        for m in re.finditer(r"(?:\b(A|An|The|a|an|the)\s+)?\*\*([^*\n]{2,50})\*\*\s+(is|are|means|refers to|describes|stands for)\s+([^\n]{8,260}?)(?:(?<!e\.g)(?<!i\.e)(?<!etc)(?<!vs)(?<!approx)\.(?:\s|$)|\n|$)", text):   # e.g. and i.e. don't end it
+            term, rest = m.group(2).strip(" :"), m.group(4).strip()
+            if _LEANS.search(rest):
+                continue
+            art = (m.group(1) or "").capitalize()
+            title = term[0].upper() + term[1:]
+            add("define", title, f"{art + ' ' if art else ''}**{term if art else title}** {m.group(3)} {rest}.", "Define", idq=term)
         # tables: first column asks, the rest answers
         for block in re.findall(r"((?:^\|.*\|\s*$\n?){3,})", text, re.M):
             rows = [[c.strip() for c in r.strip().strip("|").split("|")] for r in block.strip().splitlines()]
@@ -3105,15 +3147,18 @@ def make_cards(notes, mod_key, modules, this_year=()):
             if (h0 in _SKIP_TABLE or "\\" in h0 or "named" in h0 or not re.match(r"[a-z]", h0)):
                 continue                       # contact lists, number grids, ticks-and-crosses, deadlines
             for r in rows[2:20]:
-                if len(r) >= 2 and r[0] and not re.fullmatch(r"[\d\s.%£$-]+", r[0]):
+                if len(r) >= 2 and r[0] and not re.fullmatch(r"[\d\s.%£$-]+", r[0]) \
+                        and re.sub(r"[*_`:]", "", r[0]).strip().lower() not in _FIELD_ROW:
                     ans = "\n".join(f"- {h}: {c}" for h, c in zip(head[1:], r[1:]) if c) if len(head) > 2 else r[1]
                     add("table", f"{r[0]}", ans, head[0] or "Recall")
         # fill the gap: a sentence with one bold term
         gaps = 0
-        for sent in re.split(r"(?<=[.!?])\s+|\n", text):
+        for sent in re.split(r"(?<=[.!?])(?<!e\.g\.)(?<!i\.e\.)\s+|\n", text):
             b = re.findall(r"\*\*([^*\n]{3,40})\*\*", sent)
             s = sent.strip(" -*")
-            if len(b) == 1 and 50 <= len(s) <= 240 and not s.startswith(("#", "|")) and gaps < 6 \
+            left = len(re.sub(r"\*\*[^*]*\*\*", " ", s).split())    # the words still there once the gap is cut
+            if len(b) == 1 and 50 <= len(s) <= 240 and left >= 6 and not s.startswith(("#", "|")) \
+                    and not s.endswith(":") and gaps < 6 and not _POINTS_BACK.match(s) \
                     and not re.search(r"\b(a|an|the|of|for|to|and|in|on|with|by)$", b[0].strip(), re.I):
                 q = s.replace(f"**{b[0]}**", "_____", 1)
                 if "_____" in q:
@@ -3223,12 +3268,25 @@ STUDY_HTML = """
 .st-qbar i{display:block;height:100%;border-radius:2px;background:linear-gradient(90deg,#3b82f6,#2fb36b);transition:width .7s cubic-bezier(.2,.9,.3,1)}
 .st-bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(66px,1fr));gap:10px 6px;margin-top:12px}
 .st-badge{display:grid;justify-items:center;gap:5px;text-align:center;cursor:default}
-.st-badge b{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;font:800 11px var(--mono);border:1.5px dashed var(--line);color:var(--muted);transition:transform .25s cubic-bezier(.3,1.6,.5,1)}
+.st-badge > b{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;font:800 11px var(--mono);border:1.5px dashed var(--line);color:var(--muted);transition:transform .25s cubic-bezier(.3,1.6,.5,1)}
 .st-badge small{font:9.5px/1.25 var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
-.st-badge.got b{border:0;color:#5a3a00;background:linear-gradient(135deg,#ffe08a,#f5a524);box-shadow:0 4px 14px -4px rgba(245,165,36,.6)}
+.st-badge.got > b{border:0;color:#5a3a00;background:linear-gradient(135deg,#ffe08a,#f5a524);box-shadow:0 4px 14px -4px rgba(245,165,36,.6)}
 .st-badge.got small{color:var(--text)}
-.st-badge:hover b{transform:translateY(-2px) rotate(-8deg) scale(1.06)}
-.st-badge.just b{animation:st-spin .8s cubic-bezier(.2,.9,.3,1.3)}
+.st-badge:hover > b{transform:translateY(-2px) rotate(-8deg) scale(1.06)}
+.st-badge.just > b{animation:st-spin .8s cubic-bezier(.2,.9,.3,1.3)}
+/* hover (or tab to) a badge and it says what it is for and how far along you are */
+.st-badge{position:relative}
+.st-btip{position:absolute;top:calc(100% + 8px);left:50%;transform:translate(-50%,-4px);width:208px;
+ display:grid;gap:6px;padding:10px 12px;border-radius:12px;background:var(--glass-strong);color:var(--text);
+ backdrop-filter:blur(22px) saturate(140%);-webkit-backdrop-filter:blur(22px) saturate(140%);
+ border:1px solid var(--rim);font:11px/1.45 var(--mono);text-align:left;text-transform:none;
+ letter-spacing:0;z-index:20;opacity:0;visibility:hidden;pointer-events:none;
+ transition:opacity .16s,transform .16s;box-shadow:0 14px 34px -14px rgba(0,0,0,.45)}
+.st-btip .nm{font-weight:700;font-size:12px;letter-spacing:.02em}
+.st-btip u{text-decoration:none;color:var(--muted)}
+.st-btip-bar{display:block;height:3px;border-radius:999px;background:var(--line)}
+.st-btip-bar u{display:block;height:100%;border-radius:999px;background:var(--muted)}
+.st-badge:hover .st-btip,.st-badge:focus-visible .st-btip{opacity:1;visibility:visible;transform:translate(-50%,0)}
 .st-cshead{margin-top:16px} .st-cs{margin-top:8px}
 .st-cs i.csw{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px;border:1px solid var(--line)}
 .csw.plain{background:var(--inset)} .csw.ocean{background:linear-gradient(135deg,#3b82f6,#2fb36b)} .csw.sunset{background:linear-gradient(135deg,#f5a524,#e5484d)} .csw.aurora{background:linear-gradient(135deg,#a78bfa,#f472b6,#2fb36b)}
@@ -3319,6 +3377,8 @@ STUDY_HTML = """
 .st-tile.ok{border-color:#2fb36b;background:rgba(47,179,107,.18);animation:st-good .35s}
 .st-tile.bad{border-color:#e5484d;animation:st-shake .4s}
 .st-tile.gone{opacity:0;transform:scale(.85);pointer-events:none}
+.st-tile[hidden]{display:none}
+.st-topic{font-size:13px;color:var(--muted);margin:-4px 0 12px} .st-topic b{color:var(--text);font-weight:600}
 /* Type it */
 .st-typebox{display:flex;gap:8px;flex-wrap:wrap}
 .st-in{flex:1;min-width:180px;border:1px solid var(--line);border-radius:12px;padding:11px 14px;background:var(--inset);color:var(--text);font-family:inherit;font-size:16px;font-weight:600;outline:none;transition:border-color .2s,box-shadow .2s}
@@ -3426,7 +3486,13 @@ STUDY_JS = r"""
   ST.best ||= {}; ST.blurts ||= {}; ST.xp ||= 0; ST.badges ||= {}; ST.flags ||= {}; ST.style ||= 'plain';
   const DAY = 864e5, MIN = 6e4, dayKey = d => (d || new Date()).toLocaleDateString('en-CA');
   let saveT = 0;
-  const save = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { pywebview.api.study_save(ST); } catch (_) {} }, 400); };
+  let painting = false, pending = 0;
+  // one repaint per frame, however many things ask for it, and never from inside a repaint
+  function refresh() {
+    if (painting || pending) return;
+    pending = requestAnimationFrame(() => { pending = 0; stats(); });
+  }
+  const save = () => { refresh(); clearTimeout(saveT); saveT = setTimeout(() => { try { pywebview.api.study_save(ST); } catch (_) {} }, 400); };
   window.addEventListener('beforeunload', () => { try { pywebview.api.study_save(ST); } catch (_) {} });
   const today = () => (ST.days[dayKey()] ||= {rev: 0, right: 0, mins: 0});
   const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]);
@@ -3458,6 +3524,7 @@ STUDY_JS = r"""
     const L = lvlOf(ST.xp);
     if (L.l > before) setTimeout(() => { const un = STYLES.find(x => x[2] === L.l + 1);
       toast(`Level up! Level ${L.l + 1} · ${LEVELS[Math.min(L.l, LEVELS.length - 1)]}` + (un ? ` · ${un[1]} cards unlocked` : '')); confetti(); sfx('done'); }, 300);
+    refresh();
   }
   function float(el, text) {
     if (calm() || !el || !el.isConnected) return;
@@ -3691,7 +3758,7 @@ STUDY_JS = r"""
   // ---- quiz: pick the right answer out of four
   // a definition's option leaves out its own term, or the answer would give itself away
   const opt = o => { if (o.kind !== 'define') return o.a;
-    const t = o.a.replace(/^\*\*[^*]+\*\*\s+(is|are|means|refers to|describes|stands for)\s+/i, ''); return t.charAt(0).toUpperCase() + t.slice(1); };
+    const t = o.a.replace(/^(?:(?:A|An|The)\s+)?\*\*[^*]+\*\*\s+(is|are|means|refers to|describes|stands for)\s+/i, ''); return t.charAt(0).toUpperCase() + t.slice(1); };
   function drawQuiz() {
     const Q = quiz, c = Q.list[Q.at];
     if (!Q.list.length) return empty('No cards to quiz on here.', [['Learn new', 'new']]);
@@ -3726,12 +3793,23 @@ STUDY_JS = r"""
   function nextQ() { quiz.at++; quiz.picked = null; quiz.opts = null; drawQuiz(); }
 
   // ---- Match: six terms, six meanings, against the clock
+  // Terms only (a short name, never a whole question), all from one topic so they belong together.
+  // A topic with too few is topped up from the same module and week, then the same module.
+  const matchable = c => (c.kind === 'define' || (c.kind === 'table' && c.ask !== 'Question')) && !c.q.includes('?')
+    && c.q.length <= 40 && c.q.split(/\s+/).length <= 6 && opt(c).length <= 120 && !c.a.includes('\n')
+    && !/\b(it|this|that|they|these|those|its)\b/i.test(c.q);
   function startMatch() {
-    const seen = new Set();
-    const pairs = shuffle(pool().filter(c => (c.kind === 'define' || c.kind === 'table') && c.q.length <= 50 && opt(c).length <= 120 && !c.a.includes('\n')
-        && !/\b(it|this|that|they|these|those|its)\b/i.test(c.q)))
-      .filter(c => { const k = c.q.toLowerCase(), v = opt(c).toLowerCase(); if (seen.has(k) || seen.has(v)) return false; seen.add(k); seen.add(v); return true; }).slice(0, 6);
-    game = {pairs, L: shuffle(pairs.slice()), R: shuffle(pairs.slice()), sel: null, left: pairs.length, miss: 0, t0: 0, timer: 0};
+    const all = shuffle(pool().filter(matchable)), by = {};
+    all.forEach(c => (by[c.key + '|' + c.note] ||= []).push(c));
+    const topics = Object.values(by).sort((a, b) => Math.min(6, b.length) - Math.min(6, a.length));
+    const best = topics.filter(t => Math.min(6, t.length) === Math.min(6, (topics[0] || []).length));
+    const main = best[Math.floor(Math.random() * best.length)] || [], c0 = main[0];
+    const near = c0 ? [...main, ...all.filter(c => c.key === c0.key && c.wk === c0.wk), ...all.filter(c => c.key === c0.key), ...all] : [];
+    const seen = new Set(), pairs = near.filter(c => { const k = c.q.toLowerCase(), v = opt(c).toLowerCase();
+      if (seen.has(c.id) || seen.has(k) || seen.has(v)) return false; seen.add(c.id); seen.add(k); seen.add(v); return true; }).slice(0, 6);
+    const notes = [...new Set(pairs.map(c => c.note))];
+    game = {pairs, L: shuffle(pairs.slice()), R: shuffle(pairs.slice()), sel: null, left: pairs.length, miss: 0, t0: 0, timer: 0,
+      topic: notes.length === 1 ? notes[0] : c0 ? c0.note + ' and more from ' + (c0.mod || 'this module') : ''};
   }
   function drawMatch() {
     const G = game;
@@ -3739,6 +3817,7 @@ STUDY_JS = r"""
     const best = ST.best[mod + '|' + wk];
     const tile = (c, side, i) => `<button class="st-tile ${side}" style="--i:${i}" data-id="${c.id}" data-side="${side}">${side === 'q' ? fmt(c.q) : fmt(short(opt(c)))}</button>`;
     S.innerHTML = `<div class="st-meta"><span>Match each term to its meaning${best ? ' · best ' + best + 's' : ''}</span><span><span class="st-mt">0.0s</span> · <span class="st-mm">0 misses</span></span></div>`
+      + (G.topic ? `<div class="st-topic">Topic · <b>${esc(G.topic)}</b></div>` : '')
       + `<div class="st-match"><div class="st-col">${G.L.map((c, i) => tile(c, 'q', i)).join('')}</div><div class="st-col">${G.R.map((c, i) => tile(c, 'a', i + 1)).join('')}</div></div>`;
     S.querySelectorAll('.st-tile').forEach(b => b.onclick = () => tapTile(b));
   }
@@ -3754,6 +3833,7 @@ STUDY_JS = r"""
     if (a.dataset.id === b.dataset.id) {
       [a, b].forEach(x => x.classList.add('ok'));
       setTimeout(() => [a, b].forEach(x => x.classList.add('gone')), calm() ? 0 : 380);
+      setTimeout(() => [a, b].forEach(x => x.hidden = true), calm() ? 0 : 700);   // the rest close up, no holes
       G.left--; sfx('open', .5); gain(5, b);
       const t = today(); t.rev++; t.right++; save(); stats();
       if (!G.left) {
@@ -3950,28 +4030,46 @@ STUDY_JS = r"""
   const weekStar = () => { const per = new Map();
     CARDS.forEach(c => { if (!c.wk) return; const k = c.key + '|' + c.wk, r = per.get(k) || {n: 0, l: 0}; r.n++; if (st(c) && st(c).ivl >= 21) r.l++; per.set(k, r); });
     return [...per.values()].some(r => r.n >= 5 && r.l / r.n >= .8); };
+  // id, the mark on it, its name, what to do, and how far along you are - [done, needed].
+  // Counting rather than a yes/no is what makes a badge make sense before you have it.
+  const most = (o, f) => Math.max(0, ...Object.values(o).map(f));
   const BADGES = [
-    ['first', '1', 'First card', 'Review your first card', () => Object.keys(ST.cards).length >= 1],
-    ['c100', '100', 'Century', 'Study 100 different cards', () => Object.keys(ST.cards).length >= 100],
-    ['learnt', '25', 'Locked in', 'Learn 25 cards for good (a 3-week gap)', () => CARDS.filter(c => st(c) && st(c).ivl >= 21).length >= 25],
-    ['s3', '3d', 'On a roll', 'Study 3 days in a row', () => streak() >= 3],
-    ['s7', '7d', 'Week warrior', 'Study 7 days in a row', () => streak() >= 7],
-    ['goal7', '7×', 'Goal getter', 'Hit your daily goal on 7 days', () => Object.values(ST.days).filter(d => (d.rev || 0) >= ST.goal).length >= 7],
-    ['perfect', '10', 'Perfect', 'Get every question right in a quiz', () => !!ST.flags.perfect],
-    ['fast', '20s', 'Quick match', 'Finish a Match in under 20 seconds', () => Object.values(ST.best).some(t => t < 20)],
-    ['blurt', '80%', 'Total recall', 'Score 80% or more in a Blurt', () => Object.values(ST.blurts).some(b => b.pc >= 80)],
-    ['focus', '4×', 'Deep focus', 'Finish 4 focus rounds in one day', () => Object.values(ST.days).some(d => (d.rounds || 0) >= 4)],
-    ['star', '★', 'Week mastered', "Learn 80% of a week's cards", weekStar],
-    ['lv6', 'L6', 'Scholar', 'Reach level 6', () => lvlOf(ST.xp).l >= 5],
+    ['first', '1', 'First card', 'Review your first card', () => [Object.keys(ST.cards).length, 1]],
+    ['c100', '100', 'Century', 'Study 100 different cards', () => [Object.keys(ST.cards).length, 100]],
+    ['learnt', '25', 'Locked in', 'Learn 25 cards for good - each one answered well enough to not come back for 3 weeks',
+      () => [CARDS.filter(c => st(c) && st(c).ivl >= 21).length, 25]],
+    ['s3', '3d', 'On a roll', 'Study on 3 days in a row', () => [streak(), 3]],
+    ['s7', '7d', 'Week warrior', 'Study on 7 days in a row', () => [streak(), 7]],
+    ['goal7', '7×', 'Goal getter', 'Hit your daily goal on 7 days (they need not be in a row)',
+      () => [Object.values(ST.days).filter(d => (d.rev || 0) >= ST.goal).length, 7]],
+    ['perfect', '10', 'Perfect', 'Get every question right in one quiz of 5 or more',
+      () => [ST.flags.perfect ? 1 : 0, 1]],
+    ['fast', '20s', 'Quick match', 'Finish a Match in under 20 seconds',
+      () => [Object.values(ST.best).some(t => t < 20) ? 1 : 0, 1]],
+    ['blurt', '80%', 'Total recall', 'Score 80% or more in a Blurt - write out a note from memory',
+      () => [Math.min(80, Math.round(most(ST.blurts, b => b.pc || 0))), 80]],
+    ['focus', '4×', 'Deep focus', 'Finish 4 focus rounds in one day with the timer',
+      () => [most(ST.days, d => d.rounds || 0), 4]],
+    ['star', '★', 'Week mastered', "Learn 80% of one week's cards, out of 5 or more",
+      () => [weekStar() ? 1 : 0, 1]],
+    ['lv6', 'L6', 'Scholar', 'Reach level 6 by earning XP', () => [lvlOf(ST.xp).l + 1, 6]],
   ];
+  const howFar = how => { try { const [v, n] = how(); return [Math.max(0, v || 0), n]; } catch (_) { return [0, 1]; } };
   function badges() {
-    const fresh = BADGES.filter(([id, , , , ok]) => !ST.badges[id] && ok()).map(b => b[0]);
+    const fresh = BADGES.filter(([id, , , , how]) => { const [v, n] = howFar(how); return !ST.badges[id] && v >= n; }).map(b => b[0]);
     fresh.forEach((id, i) => { ST.badges[id] = Date.now(); const name = BADGES.find(b => b[0] === id)[2];
       if (booted) setTimeout(() => { toast('Badge unlocked: ' + name); confetti(); sfx('done'); }, 800 + i * 1000); });
     if (fresh.length) save();
-    $('.st-bgrid').innerHTML = BADGES.map(([id, g, name, how]) => { const got = ST.badges[id];
-      return `<span class="st-badge${got ? ' got' : ''}${booted && fresh.includes(id) ? ' just' : ''}" title="${esc(name)}: ${esc(how)}${got ? '. Earned ' + new Date(got).toLocaleDateString(undefined, {day: 'numeric', month: 'short'}) : ''}">`
-        + `<b>${g}</b><small>${esc(name)}</small></span>`; }).join('');
+    $('.st-bgrid').innerHTML = BADGES.map(([id, g, name, what, how]) => {
+      const got = ST.badges[id], [v, n] = howFar(how);
+      const when = got ? 'Earned ' + new Date(got).toLocaleDateString(undefined, {day: 'numeric', month: 'short'})
+        : n > 1 ? Math.min(v, n) + ' of ' + n + ' so far' : 'Not yet';
+      const bar = got || n <= 1 ? '' : `<i class="st-btip-bar"><u style="width:${Math.round(100 * Math.min(1, v / n))}%"></u></i>`;
+      return `<span class="st-badge${got ? ' got' : ''}${booted && fresh.includes(id) ? ' just' : ''}" tabindex="0">`
+        + `<b>${g}</b><small>${esc(name)}</small>`
+        + `<span class="st-btip" role="tooltip"><span class="nm">${esc(name)}</span>`
+        + `<span>${esc(what)}</span>${bar}<u>${esc(when)}</u></span></span>`;
+    }).join('');
     $('.st-bcount').textContent = Object.keys(ST.badges).length + ' / ' + BADGES.length;
   }
   const STYLES = [['plain', 'Plain', 1], ['ocean', 'Ocean', 3], ['sunset', 'Sunset', 5], ['aurora', 'Aurora', 8]];
@@ -3988,6 +4086,10 @@ STUDY_JS = r"""
   // ---- numbers at the top, the level bar, and the last 14 days
   let prevRev = null;
   function stats() {
+    painting = true;
+    try { paintStats(); } finally { painting = false; }
+  }
+  function paintStats() {
     quests(); badges();
     const t = today(), goal = ST.goal, ring = $('.st-stats .st-ring');
     setNum($('.st-goal-n'), t.rev); $('.st-goal-of').textContent = 'of ' + goal;
@@ -4597,7 +4699,7 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
     n_current = sum(1 for c in snapshot["courses"] if c.get("current", True))
     n_past = len(snapshot["courses"]) - n_current
 
-    page = f"""<!doctype html><html lang="en" class="{'following' if following() else 'locked' if not signed_in() else ''}{' mac' if IS_MAC else ''}"><head><meta charset="utf-8">
+    page = f"""<!doctype html><html lang="en" class="{'following' if following() else 'locked' if not signed_in() else ''}{' mac' if IS_MAC else ''}{'' if plain_english(display_name(snapshot)) else ' intl'}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackboard Buddy</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Doto:wght@700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -4670,12 +4772,22 @@ html.intro-on header,html.intro-on main,html.intro-on nav,html.intro-on .theme,h
 @media (max-width:600px){{.count{{flex-direction:column;align-items:flex-start}} .count .what{{text-align:left}} .count .num{{font-size:72px}}}}
 header{{max-width:880px;margin:56px auto 8px;padding:0 20px}}
 header h1{{margin:0;font:800 60px/1 var(--dotf);text-transform:uppercase;letter-spacing:.01em}}
+/* The dotted font only draws the English alphabet, so a name in another writing system came out
+   in a different font beside it. When that happens the whole line uses one plain font, and the
+   spacing and capitals that break joined-up writing are dropped. */
+html.intl header h1,html.intl .mod-title{{font-family:"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif;
+ text-transform:none;letter-spacing:0;font-weight:700}}
+.intl-name{{font-family:"Yu Gothic UI","Microsoft JhengHei UI","Malgun Gothic","Nirmala UI","Leelawadee UI","Segoe UI",system-ui,sans-serif !important;
+ text-transform:none !important;letter-spacing:0 !important;font-weight:700}}
 .sub{{color:var(--muted);margin-top:10px;font:11.5px/1.4 var(--mono);text-transform:uppercase;letter-spacing:.12em}}
 /* floating tab bar */
-nav.glass{{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:10;display:flex;gap:4px;padding:6px;
- border-radius:999px;max-width:calc(100vw - 24px);overflow-x:auto;scrollbar-width:none;
+nav.glass{{position:fixed;left:calc(50% - var(--dockr,178px) / 2);bottom:22px;transform:translateX(-50%);
+ z-index:10;display:flex;gap:4px;padding:6px;max-width:calc(100vw - 24px - var(--dockr,178px));
+ border-radius:999px;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;
  background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(30px);-webkit-backdrop-filter:blur(30px)}}
+nav.glass::-webkit-scrollbar{{display:none}}
 main::after{{content:'';display:block;height:96px}}  /* room so the last lines clear the tab bar */
+@media (max-width:900px){{nav.glass{{--dockr:0px}} main::after{{height:150px}}}}
 nav button{{position:relative;z-index:1;border:0;background:transparent;color:var(--text);padding:9px 16px;border-radius:999px;cursor:pointer;
  font:11.5px/1 var(--mono);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap;transition:color .3s,transform .5s var(--bounce)}}
 nav button:active{{transform:scale(.9)}} nav button.on{{color:var(--text);font-weight:700}}

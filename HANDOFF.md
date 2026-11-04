@@ -1107,11 +1107,13 @@ and `regrowBoxes(ids)` runs at the end of a drag over every box that gained some
 block into a box grows the box round it, and the resize handle will not pull a box in smaller than
 its contents. Tidying uses the same path.
 
-**On GitHub.** The folder is a git repository now, `main`, one commit. `.gitignore` keeps `.env`,
-`data/`, `Notebook/`, `output/`, `_internal/` and the built exe on this laptop - only source goes
-up. `upload.py` commits and pushes in one go, refuses outright if a `.env` ever reaches the staged
-list, and `build_bb9.py` calls it after every build, so a build is an upload. It needs a remote:
-make the repository on GitHub, then `git remote add origin ...` once.
+**On GitHub.** The folder became a git repository in this round, starting on `main`.
+`.gitignore` keeps `.env`, `data/`, `Notebook/`, `output/`, `_internal/` and the built exe on this
+laptop - only source goes up. `upload.py` commits and pushes in one go, refuses outright if a
+`.env` ever reaches the staged list, and `build_bb9.py` calls it after every build, so a build is
+an upload. It takes whichever remote the repository has, `origin` first.
+(Later rounds moved the work onto branch `mac-version` against the remote `mac` -
+`CatForSale/Blackboard-Buddy-Mac`; see Round 32.)
 
 **Testing:** a new suite, `far_test.py` 24/24 - the far-out view (names shown, contents out of the
 way, size on screen, a box still a box), the map (drawn, the frame, clicking to travel, M), the
@@ -1495,3 +1497,279 @@ corner search (including checklists), and boxes sizing themselves both ways. All
 - Tests: `mac_sim_test.py` (scratchpad) runs the Mac branches on Windows with `sys.platform` faked. All Windows
   tests still pass.
 - Built, sources re-hidden, share zip remade and clean.
+
+## Round 32: Mac builds on GitHub, update check
+
+- Source is in a **private** repo, `CatForSale/Blackboard-Buddy-Mac`.
+  - Local branch `mac-version` tracks its `main` (git remote `mac`); the local `main` branch is untouched.
+  - To make the Mac app: Actions > "Mac app" > Run workflow (about 4 min). Each run's Artifacts hold
+    `mac-macos-15` (Apple silicon) and `mac-macos-15-intel`.
+  - Run #1 (322c648) passed. Run #2 (f0bc7a1) includes the update-check fix.
+  - Not yet opened on a real Mac.
+  - The actions warn that Node 20 is deprecated: harmless for now; bump checkout/setup-python/upload-artifact
+    when newer majors are out.
+- **Fix: "Couldn't check. Are you online?"** The releases repo has no *published* release yet (v1.2.0 is still a
+  draft), and GitHub answers 404 then. A 404 now means "You have the latest version". 403/429 say GitHub is busy;
+  other codes are named. Failures are logged.
+- Built, sources re-hidden, share zip remade and clean.
+
+## Round 33: cards that make sense
+
+- **Filtered out** (`make_cards`, main.py):
+  - Notes titled examiner, handbook, contacts, welcome, timetable, announcement, module information or
+    "introduction to the programme" make no cards. (Not `ADMIN_PAGES`: its "team" would drop group-project notes.)
+  - Admin questions (`_ADMIN_Q`): worksheets, examiners, deadlines, submission, attendance, catch up, lab
+    format, schedule, and yes/no logistics like "Is there…" or "Should you…".
+  - Form or template rows (`_FIELD_ROW`): "Name → Check Balance", "Precondition → …".
+  - Definitions that lean on a missing sentence (`_LEANS`): "added to *that* sum", "the above".
+  - Fill-the-gap sentences ending in ":" (they introduce a list).
+  - Repeats: one card per question per module (`everywhere`), however many notes say it.
+- **Kept whole:**
+  - A definition no longer stops at "e.g." / "i.e." / "etc." / "vs" / "approx", and gap sentences don't split there.
+  - Definitions keep their article and a capital ("A **scalar** is…"). The card id still comes from the original
+    term (`idq`), so saved progress carries over.
+- **Match:**
+  - Only short terms: no "?", no Question-table cards, at most 6 words (`matchable`).
+  - All six pairs come from one topic (note), topped up from the same module and week, then the module.
+    "Topic · <note>" shows under the header.
+  - Matched tiles are hidden after 0.7 s, so the rest close up instead of leaving holes.
+- Cards: 595 before, 562 now. Match took 8/8 rounds from a single topic.
+- **Tests:**
+  - `match_test.py` is new.
+  - `fresh.py` makes `output/dashboard-fresh.html`, a copy with no saved progress, for study_test,
+    study_more_test, drop_rewards_test and match_test. Since you started studying, the page carries real progress,
+    which broke their "goal 1" / "XP" checks. Delete that copy after a run.
+  - All 10 tests pass.
+- Watch out: the running app rebuilds `output/dashboard.html` with *its own* code. Test the page only after building
+  and relaunching, or a stale app overwrites it.
+- Mac build #2 (f0bc7a1) passed. The card fixes are not in the Mac repo yet (uncommitted).
+- Built, sources re-hidden, share zip remade and clean, app relaunched.
+
+
+## Round 34: names in any writing system, Study that keeps up, badges that explain themselves
+
+**A name that is not in English.** The headings use `--dotf` ("Doto"), a dotted font that draws the
+English alphabet and nothing else, under `text-transform:uppercase` with letter spacing. A Japanese
+name fell back to whatever font the computer had, so "HI" came out dotted and the name beside it
+smooth - two different hands on one line. Letter spacing and forced capitals also break writing
+that joins up, which would have hurt Burmese, Arabic and the Indic scripts worse than it hurt kana.
+`main.plain_english()` now decides at build time whether every letter is one the dotted font can
+draw, and the page carries `html.intl` when it cannot; `english()` does the same in the browser for
+the profile card, which can change without a rebuild. In that mode the greeting, the module titles,
+the card name and the avatar letter all use one font stack that leads with families covering both
+their own script and Latin - Yu Gothic UI, Microsoft JhengHei UI, Malgun Gothic, Nirmala UI,
+Leelawadee UI - so a single font draws the whole line and "Hi" matches the name. Also fixed:
+`(name || '?')[0]` took one UTF-16 unit, which cuts some letters in half; `firstLetter()` counts
+properly.
+
+**Study keeps up with you.** `gain()` added XP without repainting, so the numbers, the level bar,
+today's challenges and the badges only caught up the next time something else called `stats()`.
+There is now one `refresh()`, which paints at most once a frame however many things ask for it, and
+`stats()` sets a flag while it works so a repaint can never start another (quests award XP and save,
+which would otherwise loop). `gain()` and `save()` both ask for one, which covers every quiz answer,
+Match, Type it, Blurt and focus round.
+
+**Badges that say what to do.** They were a glyph and two words with a `title` attribute - a native
+tooltip that takes a second to appear and says the same thing whether you are nowhere near it or one
+card away. Each badge now carries how far along you are as `[done, needed]` rather than a yes/no,
+and hovering one (or tabbing to it) brings up a card with its name, what to do in a full sentence, a
+bar, and either "4 of 7 so far", "Not yet" or the date you earned it. The card always hangs below
+the badge, so it never covers the panel above. Two of the descriptions were misleading and were
+rewritten: "Locked in" now says what a 3-week gap means, and "Goal getter" says the seven days need
+not be in a row.
+
+**Cards that stand on their own.** A card reading "It identifies the ______." teaches nothing,
+because the sentence it belonged to is not there. `_POINTS_BACK` rejects any question opening with
+it / they / them / he / she / its / their / such / here / there, or with this / that / these / those
+followed straight by a verb - while keeping "This diagram shows ...", which names its own subject.
+It is checked in `add()`, so it covers every kind of card. Gap cards also now need at least six
+words left once the gap is cut, which is what let the short ones through: the old test measured the
+sentence *before* the term was replaced, so a long bold phrase could pass it and leave nothing
+behind.
+
+**README.** Rewritten as a proper front page for the repository.
+
+**Testing:** a new suite in the project folder, `study_test.py` 17/17 - the back-pointer filter on
+real sentences, cards built end to end from a note, the badge cards (present, progress wording,
+bars, hidden until hovered, hanging below), the goal changing today's challenge at once, and the
+repaint plumbing in the built page. The eight board suites pass alongside it.
+
+**Not done in this round:** no build. The board work of the same evening was still open in
+`online.py`, and packaging a half-finished board into the exe would have shipped it. The build, the
+re-hiding of `online.py` and the share zip belong to that round.
+
+## Round 35: a box that stays under its contents, copying between boards, and output blocks
+
+**A pasted box was landing on top of what was pasted with it.** Copying a box and its contents
+and pasting them gave the box a `z` above the blocks inside it, so the box covered them, clicks
+went to the box instead of the note under the mouse, and the board felt broken. The cause was not
+really the paste: `z` was handed out in several places and none of them knew that a box belongs
+behind what it holds. There is now one rule, `stackOrder(list)` - boxes first, the biggest box
+first so that a box inside a box still sits in front of the one around it, then everything else in
+the order it already had - and every place that hands out `z` goes through it: `toBack`, `toFront`
+and the new `landRows` that puts copies on the board. `toFront` also takes a box's contents with
+it now (`withInsides`), which fixes the same bug on a plain drag: picking a box up used to bury
+everything in it, because only the box itself was raised.
+
+**Copy on one board, paste on another.** The copy was kept on the computer's clipboard only, which
+is fragile - anything else you copy in between wipes it, and a refused clipboard left you with
+nothing. `Clip` keeps the copied rows in the page's own storage (`localStorage.olClip`) as well as
+on the system clipboard, so it survives switching board, which is the whole point: offline into a
+group, one group into another, and back. Copying a box takes what is in it and the lines between
+them (`withAllInside`). `copyRows` gives everything a new id, points the lines at the copies, drops
+a line with only one end in the set - it would have nothing to join to - and throws away what
+belonged to the board it came from (`_remote`, `_rev`, `group_id`, `updated_at`), so a group row
+pasted offline is an ordinary block and not half a server row. The board's right-click menu says
+what is waiting: "Paste 2 copied blocks here".
+
+**A new kind of block: output.** It shows what a code block made - printed words, the charts it
+drew, or a whole web page, running in a sandboxed frame. `outShow(b)` works out which from what is
+in it, and you can say which you want ("Show it as..."). Its own menu has: run the code again,
+show me the code it comes from, open it on its own (`.ol-big`, the result filling the board, Escape
+to put it away), copy what is in it, clear it, how tall (short / the usual / tall / fit what is in
+it), wrap long lines, keep what came before so each run adds to the last, and say who ran it. It
+gets everything every other kind gets - a tool in the rail and the key **Y**, a right-click menu,
+the four corner grips, the far-out name (`shortName` is the first line of what it holds), the
+search (`searchable`), a colour of its own on the little map (`MAP_COLOR`, because it is the one
+kind filled by something else), and saving and loading like any block.
+
+**A line is what joins code to an output.** Draw a line from a code block to an output block and
+running the code puts the result in the output; several outputs can hang off one code block, and
+taking the line away pulls them apart. Nothing about the pairing is stored - `outputsOf(id)` and
+`feederOf(id)` read the lines each time - so there is no second thing to keep in step, and a line
+appearing or going away just repaints the outputs (`repaintOutputs`). Every run ends in `finish`,
+whether it ran in the app or on the PC, so `outDone` hangs off that one place and both kinds of run
+feed the outputs; the text also arrives as it is printed (`outText` from `run`'s sink and from
+`bbTerm`), shown but not saved until the run ends. A project whose main file is a page sends the
+page straight to its outputs instead of opening the editor over the board.
+
+**Tests:** a new suite, `out_test.py` 66/66 - the box under its contents on paste, on `toFront` and
+on a real mouse drag; copying between two offline boards and back, with the lines re-pointed and
+the dangling one left out; the output block's tool, menu, looks, search, map and save; and real
+runs through a line, including two outputs off one code block, an error, the line removed, and a
+page. All eight older suites still pass: `vault_test` 51, `ctx_test` 34, `lines_test` 50,
+`board2_test` 21, `write_test` 40, `group_test` 16, `save_test` 18, `far_test` 17.
+
+Two things worth knowing for the next round. The test stub hands `ol_boards` a list of two boards
+so the page falls back to keeping each board in its own storage key - that is the real code path
+when the app is not there, and without it `useLocal(true, 'other')` quietly stays on `main`.
+And piping a suite's output through anything on Windows needs `PYTHONIOENCODING=utf-8`, or the tick
+in a menu label crashes the print, not the test.
+
+**Built**, and `online.py` re-hidden. The push at the end of `build_bb9.py` was **left out on
+purpose**: `upload.py` commits with `git add -A`, and `main.py`, `README.md` and `HANDOFF.md` had
+another evening's unfinished work in them. Nothing is committed and nothing went to GitHub. The
+share zip was not remade either.
+
+### Round 35b: lines that are worth drawing
+
+Min asked for the joining line to have "actual useful stuff" rather than more decoration. It had
+only looks before: arrowheads, curved or right-angled, dashed, thick, a colour, a label through a
+prompt. What it has now, in the order it matters:
+
+**A line means something.** `REL` gives six meanings - just a line, leads to, depends on, blocked
+by, goes with, feeds its result - and picking one sets the look that goes with it (arrowhead,
+dashes, colour) and writes the word in the middle of the line. Your own label, if you wrote one,
+always wins over the word; "Write what it means on the line" turns the word off for a line where
+the look says enough. This is the part that changes how a board reads: a plan with four lines on
+it now says what is waiting on what without anyone labelling every line by hand.
+
+**Writing on a line, where the line is.** Double-click a line and a small box opens over the
+middle of it (`.ol-lbl`, `editLabel`); Enter keeps it, Escape leaves the line alone. The old prompt
+is gone. The writing still sits on a patch of background so the line does not run through it, and
+it is now sized against the zoom (`calc(11px / max(var(--k),.25))`), so it stays readable far out
+instead of shrinking to a smudge.
+
+**Bending a line, and straightening it.** A picked-out line grows a handle in its middle; drag it
+and the line is pulled through where you let go. The bend is kept on the line (`data.bend`), so it
+survives a save and a reload and comes back the same. "Straighten it again" takes it off. A curve
+bends by moving its control point, a right angle by moving where it turns, and a straight line
+gains one corner.
+
+**Which sides it joins.** Each end can be pinned to the top, bottom, left or right of its block
+instead of pointing at the middle ("Which sides it joins..."). Because the point is worked out
+from where the block is now, the choice follows the blocks about as they are dragged - which is the
+whole reason to have it.
+
+**Stepping round what is in the way.** A right-angled line can be asked to go round rather than
+through ("Step round what is in the way"). It tries both shapes - across first, down first - at
+seven turning points each and keeps whichever crosses fewest blocks (`inTheWay`, `cost`). Boxes and
+drawings do not count: they are backgrounds and meant to be crossed. The list of blocks is worked
+out once per draw, not once per line, because `drawLinks` runs every frame of a drag.
+
+**Following the lines.** Hovering a line lights up both blocks it joins. A picked-out block draws
+its own lines a little stronger (`path.ln.near`), which answers "show me just this block's lines"
+without a mode to remember to turn off. The line's menu travels to either end by name ("Go to hand
+it in"), and with a line picked out, Enter walks forwards along it and Shift+Enter back; `goTo`
+centres the block without changing how far in you are zoomed. "Pick out the whole chain" from a
+line, or "Pick out everything joined to this" from a block, walks the lines (`chainFrom`) and
+picks the lot out - one click instead of hunting round the board for the rest of a plan.
+
+**Numbering the steps.** "Number the steps along this chain" starts at whatever has nothing
+pointing into it and walks forwards, putting 1, 2, 3 on the lines; the number is drawn in front of
+whatever the line says, so there is still only one piece of writing per line. "Take the numbers
+off this chain" clears them and leaves your words alone.
+
+**Lines on the little map.** The map drew a scatter of blocks and none of the lines, so it showed
+where things were but not the shape of the plan. It now draws each line between the two block
+centres in the line's own colour, brighter for a picked-out one.
+
+**Far out, a line is still a line.** Strokes were in board units, so at 25% a line was half a
+pixel and all but gone, and its 18px click target went with it. The visible line and its click
+target now use `vector-effect:non-scaling-stroke`, so both keep one weight on screen at every
+zoom. The trade: a line no longer fattens as you zoom in. That is the right way round for a
+connector - it is there to be seen and clicked, not to be part of the drawing.
+
+**The output line is one of these lines.** A line drawn between a code block and an output block
+comes out already meaning "feeds its result" and pointing from the code at the output, whichever
+way round it was drawn (`asFeed`). It bends, carries a label and travels like any other line; there
+is no second kind of line in the code.
+
+**And the result shows in one place.** Min asked that once a code block is joined to an output
+block, the result appear only in the output block. `outBox` now checks for joined outputs first: if
+there are any, the code block's own panel is replaced by one plain line - "Its result goes to the
+output block" - so it never looks broken, and unhooking the line gives the panel straight back.
+`repaintJoins` (was `repaintOutputs`) redraws code and project blocks as well as outputs when a
+line appears or goes, since both ends change. The editor's own Output panel still shows the run:
+that is where you are working on the code, and hiding it there would only get in the way.
+
+**Left out on purpose:**
+- *A real router.* Proper orthogonal pathfinding would have to re-run for every line on every
+  frame of a drag, and on a crowded board it still picks routes a person would not. The scoring
+  loop above fixes the common case - one thing sitting between two blocks - and a hand bend covers
+  the rest, which is the honest division of labour.
+- *Curves stepping round things.* A curve has one control point; going round would mean making it
+  a spline. Only the right-angled form dodges, and the menu only offers it there.
+- *Attaching to a point along a side* rather than the middle of it. The middle is predictable as
+  blocks move; a bend already covers wanting the line somewhere else.
+- *A "show only this block's lines" mode.* A mode you have to turn off again. Drawing the picked
+  block's lines a little stronger says the same thing and needs nothing turned off.
+- *Lines joined to lines, and one line with several ends.* A line is one `from` and one `to`
+  everywhere - the save file, the group server's `blocks` table, the undo steps and every suite.
+  Changing that is its own round, not a feature to bolt on.
+
+**Gotchas worth keeping** (all of these cost real time this round):
+- The board's key handler sits on `window` in the **capture** phase and calls `stopPropagation`,
+  so a listener on an input that lives on the board never sees its own Enter. Keys for such a box
+  have to be dealt with inside that handler. (This is why the corner search works the way it does.)
+- The first press of a double-click on a line takes the pointer for the bend drag, so the
+  browser's own `dblclick` on the line cannot be relied on. The second press is counted in the
+  `pointerdown` instead (`lineTap`, 450 ms).
+- The bend handle sits exactly where a person right-clicks a line, so the menu has to count a
+  `circle` inside `.ol-links` as the line, not only `path.hit`.
+- `vector-effect` set in the stylesheet is not an attribute: a test has to read computed style.
+- The older checks in `lines_test` read `.ol-links > path:not(.hit)`, which means the visible line
+  must stay the first non-hit path in the group. The bend handle is a `circle` for that reason, and
+  the step number goes inside the label text rather than becoming a second `text` element.
+
+**Tests:** `lines_test.py` goes 51 -> 98, all passing: the meanings and their looks, your own words
+winning, writing on a line in place with Enter and Escape, bending and straightening, pinned sides
+following a block as it moves, the dodge measured against the plain line, chains, travel, hovering,
+numbering, the map, far out, and the output line being an ordinary line with the code block's own
+panel appearing and disappearing with it. Every other suite still passes: `out_test` 66,
+`vault_test` 51, `ctx_test` 34, `board2_test` 21, `write_test` 40, `group_test` 16, `save_test` 18,
+`far_test` 17.
+
+**Built**, and `online.py` re-hidden. As in Round 35 the push at the end of `build_bb9.py` is left
+out, because `upload.py` commits everything with `git add -A` and another session's `main.py` and
+`README.md` are still unfinished. Nothing committed, nothing pushed, share zip not remade.

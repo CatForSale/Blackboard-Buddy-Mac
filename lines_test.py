@@ -338,6 +338,294 @@ with sync_playwright() as pw:
         .filter(b => b.kind === 'arrow').map(b => [b.data.form, b.data.ends, b.data.label]))""")
     check("the line settings are part of the block data", "elbow" in saved and "then" in saved, saved[:90])
 
+
+    # ================================================ lines that mean something, bend, and lead somewhere
+    # a board of its own for this part, so nothing above it is in the way
+    pg.evaluate("""() => { const o = bbOnline;
+        [...o.S.blocks.keys()].forEach(id => o.S.blocks.delete(id));
+        document.querySelectorAll('.ol-b').forEach(d => d.remove());
+        o.S.nodes.clear(); o.S.sel.clear(); o.drawLinks(); }""")
+    pg.evaluate("() => bbOnline.view({x: 60, y: 50, k: 1})")
+    pg.wait_for_timeout(250)
+    plan = pg.evaluate("""() => { const o = bbOnline;
+        const mk = (x, y, t) => o.add('note', x, y, {html: t}, {size: [200, 110], centre: false}).id;
+        const a = mk(120, 120, 'read the notes'), b = mk(560, 120, 'do the worksheet'),
+              c = mk(1000, 120, 'hand it in');
+        const l1 = o.add('arrow', 0, 0, {from: a, to: b}, {size: [0, 0], centre: false}).id;
+        const l2 = o.add('arrow', 0, 0, {from: b, to: c}, {size: [0, 0], centre: false}).id;
+        return {a, b, c, l1, l2}; }""")
+    pg.wait_for_timeout(350)
+
+    def line(lid):
+        return pg.evaluate(f"() => bbOnline.S.blocks.get('{lid}').data")
+
+    def line_d():
+        return pg.evaluate("() => document.querySelector('.ol-links > path.ln').getAttribute('d')")
+
+    def says():
+        return pg.evaluate("""() => [...document.querySelectorAll('.ol-links text')].map(t => t.textContent)""")
+
+    # ---- what a line means
+    check("a new line means nothing in particular to begin with",
+          pg.evaluate(f"() => bbOnline.relOf(bbOnline.S.blocks.get('{plan['l1']}'))") == "plain")
+    check("and writes nothing on itself", says() == [], says())
+    pg.evaluate(f"""() => {{ const o = bbOnline;
+        o.S.blocks.get('{plan['l1']}').data = {{...o.S.blocks.get('{plan['l1']}').data,
+          rel: 'depends', ...{{ends: 'to', dash: true, color: '#0a84ff'}}}};
+        o.put(o.S.blocks.get('{plan['l1']}')); }}""")
+    pg.wait_for_timeout(300)
+    check("saying what it means writes the words on it", "depends on" in says(), says())
+    check("and gives it the look that goes with it",
+          line(plan["l1"])["color"] == "#0a84ff" and line(plan["l1"])["ends"] == "to")
+    check("every meaning on offer has a name and a word",
+          pg.evaluate("""() => Object.values(bbOnline.REL).every(r => typeof r.name === 'string' && r.name
+              && typeof r.word === 'string')"""))
+    # your own words win over the meaning
+    pg.evaluate(f"""() => {{ const o = bbOnline, b = o.S.blocks.get('{plan['l1']}');
+        b.data = {{...b.data, label: 'needs first'}}; o.put(b); }}""")
+    pg.wait_for_timeout(300)
+    check("your own words are shown instead of the meaning",
+          "needs first" in says() and "depends on" not in says(), says())
+
+    # ---- writing on a line where the line is
+    ON = """(id) => { const p = [...document.querySelectorAll('.ol-links path.hit')]
+        .find(h => h.dataset.id === id);
+        const pt = p.getPointAtLength(p.getTotalLength() / 2), m = p.getScreenCTM();
+        return [pt.x * m.a + pt.y * m.c + m.e, pt.x * m.b + pt.y * m.d + m.f]; }"""
+    where = pg.evaluate(ON, plan["l2"])
+    pg.mouse.dblclick(where[0], where[1])
+    pg.wait_for_timeout(400)
+    check("double-clicking a line opens a box to write in, on the line",
+          pg.is_visible(".ol-lbl"))
+    box = pg.locator(".ol-lbl").bounding_box()
+    check("and the box really is over the middle of the line",
+          abs(box["x"] + box["width"] / 2 - where[0]) < 40 and abs(box["y"] + box["height"] / 2 - where[1]) < 40,
+          f'{box["x"]:.0f},{box["y"]:.0f} vs {where[0]:.0f},{where[1]:.0f}')
+    pg.keyboard.type("then")
+    pg.keyboard.press("Enter")
+    pg.wait_for_timeout(400)
+    check("what you type lands on the line", line(plan["l2"]).get("label") == "then",
+          line(plan["l2"]).get("label"))
+    check("and the box goes away", pg.is_hidden(".ol-lbl"))
+    pg.mouse.dblclick(where[0], where[1])
+    pg.wait_for_timeout(350)
+    pg.keyboard.press("Control+a")
+    pg.keyboard.type("scrapped")
+    pg.keyboard.press("Escape")
+    pg.wait_for_timeout(350)
+    check("Escape leaves the line as it was", line(plan["l2"]).get("label") == "then",
+          line(plan["l2"]).get("label"))
+
+    # ---- bending a line, and straightening it
+    pg.evaluate(f"() => bbOnline.select(['{plan['l2']}'])")
+    pg.wait_for_timeout(300)
+    check("a picked-out line grows a handle in its middle",
+          pg.evaluate("() => document.querySelectorAll('.ol-links circle').length") == 1)
+    hb = pg.evaluate("""() => { const c = document.querySelector('.ol-links circle');
+        const r = c.getBoundingClientRect(); return {x: r.x + r.width / 2, y: r.y + r.height / 2}; }""")
+    pg.mouse.move(hb["x"], hb["y"])
+    pg.mouse.down()
+    pg.mouse.move(hb["x"] + 30, hb["y"] + 170, steps=12)
+    pg.mouse.up()
+    pg.wait_for_timeout(450)
+    bend = line(plan["l2"]).get("bend")
+    check("dragging the handle bends the line", bool(bend) and isinstance(bend, dict), bend)
+    check("and the bend is kept on the line, so it survives a save",
+          "bend" in pg.evaluate(f"() => JSON.stringify(bbOnline.S.blocks.get('{plan['l2']}').data)"))
+    pg.evaluate(f"""() => {{ const o = bbOnline, b = o.S.blocks.get('{plan['l2']}');
+        b.data = {{...b.data, bend: null}}; o.put(b); }}""")
+    pg.wait_for_timeout(300)
+    check("straightening it takes the bend away", line(plan["l2"]).get("bend") is None)
+
+    # ---- which side each end attaches to
+    pg.evaluate(f"""() => {{ const o = bbOnline, b = o.S.blocks.get('{plan['l1']}');
+        b.data = {{...b.data, form: 'straight', a: 's', b: 'n', bend: null}}; o.put(b); }}""")
+    pg.wait_for_timeout(300)
+    ends = pg.evaluate(f"""() => {{ const o = bbOnline, l = o.S.blocks.get('{plan['l1']}');
+        const p = o.linkPath(o.S.blocks.get(l.data.from), o.S.blocks.get(l.data.to), l.data, []);
+        return p.d; }}""")
+    sides = pg.evaluate(f"""() => {{ const o = bbOnline, a = o.S.blocks.get('{plan['a']}'),
+        c = o.S.blocks.get('{plan['b']}'), l = o.S.blocks.get('{plan['l1']}');
+        const p = o.linkPath(a, c, l.data, []);
+        const m = p.d.match(/M([-\d.]+),([-\d.]+) L([-\d.]+),([-\d.]+)/).slice(1).map(Number);
+        return {{startsBelow: m[1] > a.y + a.h - 1, endsAbove: m[3] < c.y + 1,
+                 startMiddle: Math.abs(m[0] - (a.x + a.w / 2)) < 2}}; }}""")
+    check("an end can be pinned to the bottom of its block", sides["startsBelow"], sides)
+    check("and the other to the top of its block", sides["endsAbove"], sides)
+    check("pinned ends sit in the middle of that side", sides["startMiddle"], sides)
+    moved = pg.evaluate(f"""() => {{ const o = bbOnline, a = o.S.blocks.get('{plan['a']}');
+        a.y += 260; o.put(a);
+        const l = o.S.blocks.get('{plan['l1']}'), c = o.S.blocks.get('{plan['b']}');
+        const p = o.linkPath(a, c, l.data, []);
+        const m = p.d.match(/M([-\d.]+),([-\d.]+)/).slice(1).map(Number);
+        return m[1] > a.y + a.h - 1; }}""")
+    check("and the choice follows the block as it is dragged about", moved)
+    pg.evaluate(f"""() => {{ const o = bbOnline, a = o.S.blocks.get('{plan['a']}');
+        a.y -= 260; o.put(a);
+        const b = o.S.blocks.get('{plan['l1']}'); b.data = {{...b.data, a: null, b: null, form: 'elbow'}}; o.put(b); }}""")
+    pg.wait_for_timeout(300)
+
+    # ---- stepping round what is in the way
+    inway = pg.evaluate("""() => { const o = bbOnline;
+        return o.inTheWay(0, 0, 100, 0, [{id: 'x', kind: 'note', x: 40, y: -10, w: 20, h: 20}], []); }""")
+    check("a block sitting across a run of line is noticed", inway == 1, inway)
+    check("and the blocks at the two ends are not counted",
+          pg.evaluate("""() => bbOnline.inTheWay(0, 0, 100, 0,
+              [{id: 'x', kind: 'note', x: 40, y: -10, w: 20, h: 20}], ['x'])""") == 0)
+    dodged = pg.evaluate(f"""() => {{ const o = bbOnline;
+        // something right between the first two, where the line would normally run
+        const mid = o.add('note', 380, 100, {{html: 'in the way'}}, {{size: [160, 150], centre: false}});
+        const l = o.S.blocks.get('{plan['l1']}');
+        const a = o.S.blocks.get(l.data.from), c = o.S.blocks.get(l.data.to);
+        const solids = [...o.S.blocks.values()].filter(x => !['arrow', 'shape', 'ink'].includes(x.kind));
+        const plain = o.linkPath(a, c, {{...l.data, dodge: false}}, solids);
+        const round_ = o.linkPath(a, c, {{...l.data, dodge: true}}, solids);
+        const cost = d => {{ const n = d.match(/[ML]([-\d.]+),([-\d.]+)/g).map(s =>
+              s.slice(1).split(',').map(Number));
+            let t = 0;
+            for (let i = 1; i < n.length; i++)
+              t += o.inTheWay(n[i-1][0], n[i-1][1], n[i][0], n[i][1], solids, [a.id, c.id]);
+            return t; }};
+        return {{mid: mid.id, plain: cost(plain.d), round: cost(round_.d), d: round_.d}}; }}""")
+    pg.wait_for_timeout(300)
+    check("the usual line runs straight through it", dodged["plain"] > 0, dodged)
+    check("and asked to, the line steps round it instead", dodged["round"] < dodged["plain"], dodged)
+    pg.evaluate(f"""() => {{ const o = bbOnline; o.S.blocks.delete('{dodged['mid']}');
+        document.querySelector('.ol-b[data-id="{dodged['mid']}"]')?.remove();
+        o.S.nodes.delete('{dodged['mid']}'); o.drawLinks(); }}""")
+    pg.wait_for_timeout(200)
+
+    # ---- following the lines
+    check("a block knows which lines are on it",
+          pg.evaluate(f"() => bbOnline.linesOn('{plan['b']}').length") == 2)
+    chain = pg.evaluate(f"() => bbOnline.chainFrom(['{plan['a']}']).length")
+    check("one block picks out the whole chain it belongs to", chain == 5, chain)
+    was = pg.evaluate("() => ({...bbOnline.S.view})")
+    pg.evaluate(f"() => bbOnline.goTo(bbOnline.S.blocks.get('{plan['c']}'))")
+    pg.wait_for_timeout(350)
+    now = pg.evaluate("() => ({...bbOnline.S.view})")
+    check("following a line travels to the block at the other end",
+          abs(now["x"] - was["x"]) + abs(now["y"] - was["y"]) > 40,
+          f'{was["x"]:.0f},{was["y"]:.0f} -> {now["x"]:.0f},{now["y"]:.0f}')
+    check("and does not change how far in you are zoomed", abs(now["k"] - was["k"]) < 1e-9)
+    check("and the block it travelled to is the one picked out",
+          pg.evaluate(f"() => [...bbOnline.S.sel][0] === '{plan['c']}'"))
+
+    # Enter on a picked-out line walks along it
+    pg.evaluate("() => bbOnline.view({x: 60, y: 50, k: 1})")
+    pg.evaluate(f"() => bbOnline.select(['{plan['l1']}'])")
+    pg.wait_for_timeout(250)
+    pg.keyboard.press("Enter")
+    pg.wait_for_timeout(400)
+    check("Enter on a line goes to what it points at",
+          pg.evaluate(f"() => [...bbOnline.S.sel][0] === '{plan['b']}'"),
+          pg.evaluate("() => [...bbOnline.S.sel]"))
+
+    # hovering a line lights both blocks it joins
+    hv = pg.evaluate(ON, plan["l2"])
+    pg.mouse.move(hv[0], hv[1])
+    pg.wait_for_timeout(350)
+    check("hovering a line lights up both blocks it joins",
+          pg.evaluate("() => document.querySelectorAll('.ol-b.lit').length") == 2,
+          pg.evaluate("() => document.querySelectorAll('.ol-b.lit').length"))
+    pg.mouse.move(hv[0], hv[1] - 300)
+    pg.wait_for_timeout(300)
+    check("and they go out again when it leaves",
+          pg.evaluate("() => document.querySelectorAll('.ol-b.lit').length") == 0)
+
+    # the lines of whatever is picked out stand out from the rest
+    pg.evaluate(f"() => bbOnline.select(['{plan['a']}'])")
+    pg.wait_for_timeout(300)
+    check("picking a block out makes its own lines stand out",
+          pg.evaluate("() => document.querySelectorAll('.ol-links path.ln.near').length") == 1,
+          pg.evaluate("() => document.querySelectorAll('.ol-links path.ln.near').length"))
+
+    # ---- numbering the steps
+    k = pg.evaluate(f"() => bbOnline.numberChain('{plan['a']}')")
+    pg.wait_for_timeout(400)
+    check("numbering a chain numbers every line in it", k == 2, k)
+    check("the first step really is the first one",
+          line(plan["l1"])["step"] == 1 and line(plan["l2"])["step"] == 2,
+          [line(plan["l1"]).get("step"), line(plan["l2"]).get("step")])
+    check("and the number is written on the line",
+          any(t.startswith("1.") for t in says()), says())
+    pg.evaluate(f"() => bbOnline.clearSteps('{plan['a']}')")
+    pg.wait_for_timeout(350)
+    check("taking the numbers off leaves the words alone",
+          line(plan["l1"]).get("step") is None and line(plan["l1"]).get("label") == "needs first")
+
+    # ---- far out, and on the little map
+    check("a line keeps one weight on screen however far out you pull",
+          pg.evaluate("""() => getComputedStyle(document.querySelector('.ol-links path.ln'))
+              .vectorEffect === 'non-scaling-stroke'"""))
+    check("and stays as easy to click out there",
+          pg.evaluate("""() => getComputedStyle(document.querySelector('.ol-links path.hit'))
+              .vectorEffect === 'non-scaling-stroke'"""))
+    pg.evaluate("() => bbOnline.view({x: 60, y: 50, k: 0.25})")
+    pg.wait_for_timeout(400)
+    check("the writing on a line is still about the same size far out",
+          pg.evaluate("""() => { const t = document.querySelector('.ol-links text');
+            return t ? Math.round(t.getBoundingClientRect().height) : 0; }""") >= 8,
+          pg.evaluate("""() => { const t = document.querySelector('.ol-links text');
+            return t ? Math.round(t.getBoundingClientRect().height) : 0; }"""))
+    pg.evaluate("() => bbOnline.view({x: 60, y: 50, k: 1})")
+    pg.wait_for_timeout(250)
+
+    if pg.is_hidden(".ol-map"):
+        pg.click(".ol-mapb")
+        pg.wait_for_timeout(500)
+
+    def map_ink():
+        return pg.evaluate("""() => { const c = document.querySelector('.ol-map canvas');
+            const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+            let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n; }""")
+
+    with_lines = map_ink()
+    pg.evaluate("""() => { const o = bbOnline;
+        o.__kept = [...o.S.blocks.values()].filter(b => b.kind === 'arrow');
+        o.__kept.forEach(b => o.S.blocks.delete(b.id));
+        o.drawLinks(); o.view({...o.S.view}); }""")
+    pg.wait_for_timeout(500)
+    without = map_ink()
+    pg.evaluate("""() => { const o = bbOnline;
+        o.__kept.forEach(b => o.S.blocks.set(b.id, b)); o.drawLinks(); o.view({...o.S.view}); }""")
+    pg.wait_for_timeout(400)
+    check("the lines are drawn on the little map too", with_lines > without,
+          f"{with_lines} with, {without} without")
+    pg.keyboard.press("m")
+    pg.wait_for_timeout(300)
+
+    # ---- a line to an output block is one of these lines, not a special case
+    joined = pg.evaluate("""() => { const o = bbOnline;
+        const c = o.add('code', 140, 700, {lang: 'javascript', text: "console.log(1)"},
+                        {size: [320, 160], centre: false});
+        const out = o.add('output', 620, 700, {title: 'Result'}, {size: [300, 160], centre: false});
+        const l = o.add('arrow', 0, 0, {from: out.id, to: c.id}, {size: [0, 0], centre: false});
+        return {code: c.id, out: out.id, line: l.id}; }""")
+    pg.wait_for_timeout(400)
+    jl = line(joined["line"])
+    check("a line drawn to an output block says what it is for", jl.get("rel") == "feeds", jl.get("rel"))
+    check("and points from the code at the output, however it was drawn",
+          jl["from"] == joined["code"] and jl["to"] == joined["out"])
+    check("it has an arrowhead, like any line that leads somewhere", jl["ends"] == "to")
+    check("and it is an ordinary line you can bend and write on",
+          pg.evaluate(f"""() => !!bbOnline.lineText(bbOnline.S.blocks.get('{joined['line']}'))"""))
+
+    # once joined, the result shows in the output block only
+    check("the code block stops showing a result of its own and says where it went",
+          pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-outgone')""")
+          and not pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-out')"""))
+    pg.evaluate(f"""() => {{ const o = bbOnline, c = o.S.blocks.get('{joined['code']}');
+        c.data = {{...c.data, out: {{text: 'one', ok: true, by: 'Me'}}}}; o.put(c); }}""")
+    pg.wait_for_timeout(300)
+    check("even with a result of its own stored, the code block shows none",
+          not pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-out')"""))
+    pg.evaluate(f"() => bbOnline.remove(['{joined['line']}'])")
+    pg.wait_for_timeout(400)
+    check("taking the line away gives the code block its own panel back",
+          pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-out')""")
+          and not pg.evaluate(f"""() => !!document.querySelector('.ol-b[data-id="{joined['code']}"] .ol-outgone')"""))
+
     br.close()
 
 IGNORE = ("drawAccounts", "notes.filter", "lacks the 'allow-same-origin' flag")

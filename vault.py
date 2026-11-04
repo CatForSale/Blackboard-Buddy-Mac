@@ -5,9 +5,14 @@ Notes are plain .md files in one folder (the "vault"), so Obsidian or any editor
 
 import base64
 import hashlib
+import html as html_mod
+import io
 import re
+import time
+import zlib
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 
 import markdown
 
@@ -177,6 +182,1094 @@ def save_image(data_url, filename=""):
     (ROOT / "attachments").mkdir(parents=True, exist_ok=True)
     (ROOT / "attachments" / name).write_bytes(data)
     return {"path": f"attachments/{name}"}
+
+
+# ---------------------------------------------------------------- copies kept, in case of a bad edit
+# The board already does this (board_backup in app.py): one file is always the newest copy, and dated
+# copies are kept a few minutes apart from each other, so a day of typing does not turn into a
+# thousand near-identical files. A note's copies live in ".backups" inside the Notebook folder - the
+# dot keeps it out of the notes list and out of Obsidian's way, the same as ".trash".
+BACKUP_GAP = 300          # seconds a dated copy of one note has to be apart from the last
+BACKUPS_KEPT = 20         # how many dated copies of one note to keep
+
+
+def _flat(name):
+    """'Module/Week 1' -> 'Module~Week 1', so every note's copies sit in one flat folder."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "~", str(name or "note")).strip(" .")[:70] or "note"
+
+
+def saved_at(name):
+    """When this note's file was last written, in milliseconds, or 0 if it never was.
+
+    The page compares this against the copy it keeps in the browser, so the newer of the two wins
+    when the notebook is opened again."""
+    try:
+        return int(note_path(name).stat().st_mtime * 1000)
+    except (OSError, ValueError):
+        return 0
+
+
+def backup(name, text, every=BACKUP_GAP):
+    """Keeps a copy of a note on this computer, so a bad edit can still be undone tomorrow."""
+    if not name:
+        return False
+    folder = ROOT / ".backups"
+    folder.mkdir(parents=True, exist_ok=True)
+    who = _flat(name)
+    (folder / f"{who}-latest.md").write_text(text or "", encoding="utf-8")
+    kept = sorted(folder.glob(f"{who}-20*.md"))
+    try:
+        gap = time.time() - kept[-1].stat().st_mtime if kept else None
+    except OSError:
+        gap = None
+    if gap is None or gap >= float(every or 0):
+        (folder / f"{who}-{datetime.now():%Y%m%d-%H%M%S}.md").write_text(text or "", encoding="utf-8")
+        for old in sorted(folder.glob(f"{who}-20*.md"))[:-BACKUPS_KEPT]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def backups(name):
+    """What copies of this note are on the computer, newest first."""
+    folder = ROOT / ".backups"
+    out = []
+    for f in sorted(folder.glob(f"{_flat(name)}-*.md"), reverse=True):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        body = f.read_text(encoding="utf-8", errors="replace")
+        out.append({"file": f.name, "when": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                    "words": len(body.split()), "latest": f.name.endswith("-latest.md")})
+    return out[:40]
+
+
+def backup_read(file):
+    """One of those copies, by the name backups() gave."""
+    folder = (ROOT / ".backups").resolve()
+    f = (folder / Path(str(file or "")).name).resolve()
+    if f.parent != folder or not f.is_file():      # never step outside the copies folder
+        return None
+    return f.read_text(encoding="utf-8", errors="replace")
+
+
+# ================================================================ taking a note out, and bringing one in
+# Each format is listed with what it cannot carry, so the menu can say so before anything is written.
+EXPORTS = [
+    {"id": "docx", "name": "Word document", "ext": ".docx",
+     "loses": "Headings, bold, italic, lists, tables, quotes, code and pictures all come across. "
+              "Links to your other notes become plain text, because Word has no idea where your notebook is."},
+    {"id": "pdf", "name": "PDF", "ext": ".pdf",
+     "loses": "A PDF is a finished page - nobody can edit it again, including you. It uses the printer's "
+              "own lettering, so anything outside the Western European alphabets comes out as question marks."},
+    {"id": "md", "name": "Markdown", "ext": ".md",
+     "loses": "Nothing at all. This is exactly how the note is already stored on your computer."},
+    {"id": "txt", "name": "Plain text", "ext": ".txt",
+     "loses": "Only the words survive: no bold, no headings, no tables, no pictures."},
+]
+IMPORTS = [
+    {"id": "docx", "name": "Word document", "ext": ".docx",
+     "loses": "Headings, bold, italic, underline, lists, tables, quotes and links come in. "
+              "Colours, fonts, page layout, text boxes and pictures do not."},
+    {"id": "pdf", "name": "PDF", "ext": ".pdf",
+     "loses": "Only the words. A PDF holds no idea of what was a heading or a list, so everything "
+              "arrives as ordinary paragraphs for you to tidy up."},
+    {"id": "md", "name": "Markdown", "ext": ".md", "loses": "Nothing. It is already the right kind of file."},
+    {"id": "txt", "name": "Plain text", "ext": ".txt", "loses": "Nothing - there was no formatting to lose."},
+    {"id": "rtf", "name": "Rich text", "ext": ".rtf",
+     "loses": "Bold, italic, underline, headings and lists come in. Tables, colours and pictures do not."},
+]
+IMPORT_EXT = {"docx": "docx", "doc": "docx", "pdf": "pdf", "md": "md", "markdown": "md",
+              "txt": "txt", "text": "txt", "rtf": "rtf"}
+
+
+# ---- one reading of a note that both the Word writer and the PDF writer work from
+_FENCE = re.compile(r"^\s{0,3}(```+|~~~+)\s*(\S*)\s*$")
+_HEAD = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+_BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_NUMBER = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
+_BOX = re.compile(r"^\[([ xX])\]\s*(.*)$")
+_QUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
+_RULE = re.compile(r"^\s{0,3}([-*_])\s*(\1\s*){2,}$")
+_ROW = re.compile(r"^\s*\|(.*)\|\s*$")
+_SEP = re.compile(r"^\s*\|[\s:|-]*\|\s*$")
+_ONLY_IMG = re.compile(r"^\s*!\[([^\]]*)\]\(\s*([^)\s]+)[^)]*\)\s*$")
+
+_PIECE = re.compile(r"""
+    (?P<esc>\\[\\`*_\[\]#>~=|+.()!-])
+  | (?P<ticks>`+)
+  | (?P<img>!\[(?P<ialt>[^\]]*)\]\(\s*(?P<isrc>[^)\s]+)[^)]*\))
+  | (?P<wiki>\[\[(?P<wname>[^\]|#\n]+)(?P<whead>\#[^\]|\n]*)?(?:\|(?P<walias>[^\]\n]*))?\]\])
+  | (?P<link>\[(?P<ltext>[^\]\n]*)\]\(\s*(?P<lhref>[^)\s]+)[^)]*\))
+  | (?P<auto><(?P<aurl>(?:https?://|mailto:)[^>\s]+)>)
+  | (?P<utag></?u>)
+  | (?P<strike>~~)
+  | (?P<mark>==)
+  | (?P<bold>\*\*)
+  | (?P<ital>\*)
+  | (?P<ubold>__)
+  | (?P<uital>_)
+""", re.X)
+
+
+def _marker(text, start, end, opening, underscore):
+    """Whether a *, **, _ or __ here really switches bold or italic on or off.
+
+    Markdown only counts a marker that hugs the words it is wrapping: "2 * 3" is a times sign, not
+    the start of italics, and a snake_case_word keeps its underscores. Anything that fails this
+    goes into the note as the plain characters it is.
+    """
+    before = text[start - 1] if start else " "
+    after = text[end] if end < len(text) else " "
+    hugs = (after.strip() != "") if opening else (before.strip() != "")
+    return hugs and not (underscore and before.isalnum() and after.isalnum())
+
+
+def runs(line):
+    """A line of Markdown as pieces of text, each carrying its own bold / italic / link / picture."""
+    out, buf, i = [], [], 0
+    on = {"b": False, "i": False, "u": False, "s": False, "mk": False}
+
+    def flush():
+        if buf:
+            out.append({"t": "".join(buf), "code": False, "href": "", **on})
+            del buf[:]
+
+    def piece(**kw):
+        flush()
+        out.append({"t": "", "code": False, "href": "", **on, **kw})
+
+    while i < len(line):
+        m = _PIECE.search(line, i)
+        if not m:
+            buf.append(line[i:])
+            break
+        buf.append(line[i:m.start()])
+        i = m.end()
+        g = m.lastgroup
+        if m.group("esc"):
+            buf.append(m.group("esc")[1])
+        elif m.group("ticks"):
+            close = line.find(m.group("ticks"), i)
+            if close < 0:
+                buf.append(m.group("ticks"))
+            else:
+                piece(t=line[i:close].strip(), code=True)
+                i = close + len(m.group("ticks"))
+        elif m.group("img"):
+            piece(t=m.group("ialt"), img=unquote(m.group("isrc")))
+        elif m.group("wiki"):
+            piece(t=(m.group("walias") or m.group("wname") + (m.group("whead") or "")).strip())
+        elif m.group("link"):
+            for r in runs(m.group("ltext")) or [{"t": m.group("lhref"), "code": False, "href": "", **on}]:
+                flush()
+                out.append({**r, "href": m.group("lhref"), **{k: on[k] or r.get(k) for k in on}})
+        elif m.group("auto"):
+            piece(t=m.group("aurl"), href=m.group("aurl"))
+        elif m.group("utag"):
+            flush()
+            on["u"] = not m.group("utag").startswith("</")
+        else:
+            key = {"strike": "s", "mark": "mk", "bold": "b", "ital": "i", "ubold": "b", "uital": "i"}[g]
+            if _marker(line, m.start(), m.end(), not on[key], g in ("ubold", "uital")):
+                flush()
+                on[key] = not on[key]
+            else:
+                buf.append(m.group(g))
+    flush()
+    for r in out:
+        r["t"] = html_mod.unescape(r["t"])
+    return [r for r in out if r["t"] or r.get("img")]
+
+
+def outline(text):
+    """A note as a flat list of blocks, ready to be written out as Word or as a PDF."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        fence = _FENCE.match(line)
+        if fence:
+            body, i = [], i + 1
+            while i < len(lines) and not _FENCE.match(lines[i]):
+                body.append(lines[i])
+                i += 1
+            out.append({"k": "code", "lang": fence.group(2), "text": "\n".join(body)})
+            i += 1
+            continue
+        if not line.strip():
+            i += 1
+            continue
+        if _RULE.match(line):
+            out.append({"k": "hr"})
+            i += 1
+            continue
+        pic = _ONLY_IMG.match(line)
+        if pic:
+            out.append({"k": "img", "alt": pic.group(1), "path": unquote(pic.group(2))})
+            i += 1
+            continue
+        head = _HEAD.match(line)
+        if head:
+            out.append({"k": "h", "level": len(head.group(1)), "runs": runs(head.group(2))})
+            i += 1
+            continue
+        if _QUOTE.match(line):
+            body = []
+            while i < len(lines) and _QUOTE.match(lines[i]):
+                body.append(_QUOTE.match(lines[i]).group(1))
+                i += 1
+            out.append({"k": "quote", "blocks": outline("\n".join(body))})
+            continue
+        row = _ROW.match(line)
+        if row and i + 1 < len(lines) and _SEP.match(lines[i + 1]) and "-" in lines[i + 1]:
+            rows = []
+            while i < len(lines) and _ROW.match(lines[i]):
+                cells = re.split(r"(?<!\\)\|", _ROW.match(lines[i]).group(1))
+                rows.append([runs(c.replace("\\|", "|").strip()) for c in cells])
+                i += 1
+            head_row = rows[0]
+            out.append({"k": "table", "head": head_row, "rows": rows[2:]})
+            continue
+        if _BULLET.match(line) or _NUMBER.match(line):
+            items, ordered = [], bool(_NUMBER.match(line))
+            while i < len(lines):
+                m = _BULLET.match(lines[i]) or _NUMBER.match(lines[i])
+                if not m:
+                    if items and re.match(r"^\s{2,}\S", lines[i]):
+                        items[-1]["runs"] += [{"t": " ", "code": False, "href": "", "b": False, "i": False,
+                                               "u": False, "s": False, "mk": False}] + runs(lines[i].strip())
+                        i += 1
+                        continue
+                    break
+                body = m.group(m.lastindex)
+                box = _BOX.match(body)
+                items.append({"level": len(m.group(1).replace("\t", "    ")) // 4,
+                              "box": None if not box else box.group(1) != " ",
+                              "runs": runs(box.group(2) if box else body)})
+                i += 1
+            out.append({"k": "list", "ordered": ordered, "items": items})
+            continue
+        body = [line]
+        i += 1
+        while i < len(lines) and lines[i].strip() and not (
+                _HEAD.match(lines[i]) or _QUOTE.match(lines[i]) or _FENCE.match(lines[i]) or _RULE.match(lines[i])
+                or _BULLET.match(lines[i]) or _NUMBER.match(lines[i]) or _ROW.match(lines[i])):
+            body.append(lines[i])
+            i += 1
+        out.append({"k": "p", "runs": runs("\n".join(body))})
+    return out
+
+
+# ---- out as plain text
+def to_text(text):
+    def flat(rs):
+        return "".join(r["t"] for r in rs)
+
+    def walk(blocks, pad=""):
+        got = []
+        for b in blocks:
+            if b["k"] == "h":
+                got += [pad + flat(b["runs"]), pad + "-" * min(60, len(flat(b["runs"]))), ""]
+            elif b["k"] == "p":
+                got += [pad + flat(b["runs"]), ""]
+            elif b["k"] == "list":
+                n = 0
+                for it in b["items"]:
+                    n += 1
+                    lead = f"{n}. " if b["ordered"] else "- "
+                    if it["box"] is not None:
+                        lead += "[x] " if it["box"] else "[ ] "
+                    got.append(pad + "    " * it["level"] + lead + flat(it["runs"]))
+                got.append("")
+            elif b["k"] == "quote":
+                for line in walk(b["blocks"]):
+                    got += [(pad + "    " + l) if l.strip() else "" for l in line.split("\n")]
+            elif b["k"] == "code":
+                got += [pad + "    " + l for l in b["text"].split("\n")] + [""]
+            elif b["k"] == "hr":
+                got += [pad + "-" * 60, ""]
+            elif b["k"] == "img":
+                got += [pad + f"[picture: {b['alt'] or b['path']}]", ""]
+            elif b["k"] == "table":
+                grid = [[flat(c) for c in r] for r in [b["head"]] + b["rows"]]
+                wide = [max((len(r[c]) for r in grid if c < len(r)), default=0) for c in range(len(grid[0]))]
+                for n, r in enumerate(grid):
+                    got.append(pad + "  ".join((r[c] if c < len(r) else "").ljust(wide[c]) for c in range(len(wide))).rstrip())
+                    if n == 0:
+                        got.append(pad + "  ".join("-" * w for w in wide))
+                got.append("")
+        return got
+
+    return "\n".join(walk(outline(text))).strip() + "\n"
+
+
+# ---- out as a Word document
+_DOCX_SIZES = {1: 22, 2: 17, 3: 14, 4: 12.5, 5: 11.5, 6: 11}
+
+
+def _docx_link(para, url):
+    """A real Word hyperlink, so the link is still clickable and still there if the file comes back."""
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.text.run import Run
+    link = OxmlElement("w:hyperlink")
+    link.set(qn("r:id"), para.part.relate_to(url, RT.HYPERLINK, is_external=True))
+    para._p.append(link)
+    run = OxmlElement("w:r")
+    link.append(run)
+    return Run(run, para)
+
+
+def _docx_runs(para, rs, mono=False):
+    from docx.enum.text import WD_COLOR_INDEX
+    from docx.shared import Inches, Pt, RGBColor
+    for r in rs:
+        if r.get("img"):
+            pic = ROOT / r["img"]
+            if pic.is_file():
+                try:
+                    para.add_run().add_picture(str(pic), width=Inches(5.8))
+                    continue
+                except Exception:
+                    pass
+            para.add_run(f"[picture: {r['t'] or r['img']}]")
+            continue
+        # a line break inside a paragraph has to be a real Word break, or it is read back as a space
+        for i, part in enumerate((r["t"] or "").split("\n")):
+            if i:
+                para.add_run().add_break()
+            run = _docx_link(para, r["href"]) if r.get("href") else para.add_run()
+            run.text = part
+            run.bold = bool(r.get("b")) or None
+            run.italic = bool(r.get("i")) or None
+            run.underline = bool(r.get("u")) or bool(r.get("href")) or None
+            if r.get("s"):
+                run.font.strike = True
+            if r.get("mk"):
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            if r.get("code") or mono:
+                run.font.name = "Consolas"
+                run.font.size = Pt(10)
+            if r.get("href"):
+                run.font.color.rgb = RGBColor(0x1A, 0x53, 0xA8)
+
+
+def to_docx(title, text):
+    """The note as a .docx. Word has no idea where your notebook is, so [[note links]] go in as text."""
+    import docx
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor
+
+    doc = docx.Document()
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(11)
+    read = outline(text)
+    # the note's own first heading is its title; only add one when it hasn't got one
+    if not (read and read[0]["k"] == "h" and read[0]["level"] == 1):
+        head = doc.add_paragraph(title, style=_docx_style(doc, "Title", None))
+        if head.style.name == "Normal":
+            head.runs[0].bold = True
+            head.runs[0].font.size = Pt(26)
+
+    def walk(blocks, quoted=False):
+        for b in blocks:
+            if b["k"] == "h":
+                style = _docx_style(doc, f"Heading {b['level']}", None)
+                p = doc.add_paragraph(style=style)
+                p.paragraph_format.space_before = Pt(14)
+                p.paragraph_format.space_after = Pt(4)
+                _docx_runs(p, b["runs"])
+                if p.style.name == "Normal":        # no heading styles in this template: do it by hand
+                    for r in p.runs:
+                        r.bold = True
+                        r.font.size = Pt(_DOCX_SIZES[b["level"]])
+            elif b["k"] == "p":
+                p = doc.add_paragraph()
+                if quoted:
+                    p.paragraph_format.left_indent = Pt(24)
+                _docx_runs(p, b["runs"])
+            elif b["k"] == "list":
+                for n, it in enumerate(b["items"], 1):
+                    style = _docx_style(doc, "List Number" if b["ordered"] else "List Bullet", None)
+                    p = doc.add_paragraph(style=style)
+                    if p.style.name == "Normal":
+                        p.add_run(f"{n}. " if b["ordered"] else "\u2022 ")
+                    p.paragraph_format.left_indent = Pt(24 + 24 * it["level"])
+                    if it["box"] is not None:
+                        p.add_run("\u2612 " if it["box"] else "\u2610 ")
+                    _docx_runs(p, it["runs"])
+            elif b["k"] == "quote":
+                walk(b["blocks"], True)
+                for p in doc.paragraphs[-max(1, len(b["blocks"])):]:
+                    style = _docx_style(doc, "Quote", None)
+                    if style and p.style.name == "Normal":
+                        p.style = style
+            elif b["k"] == "code":
+                p = doc.add_paragraph()
+                p.paragraph_format.left_indent = Pt(18)
+                _docx_runs(p, [{"t": b["text"], "code": True, "href": ""}], mono=True)
+            elif b["k"] == "hr":
+                p = doc.add_paragraph()
+                p.paragraph_format.space_before = Pt(6)
+                _docx_rule(p)
+            elif b["k"] == "img":
+                p = doc.add_paragraph()
+                _docx_runs(p, [{"t": b["alt"], "img": b["path"]}])
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif b["k"] == "table":
+                grid = [b["head"]] + b["rows"]
+                cols = max(len(r) for r in grid)
+                t = doc.add_table(rows=len(grid), cols=cols)
+                grid_style = _docx_style(doc, "Table Grid", None)
+                if grid_style:
+                    t.style = grid_style
+                for y, row in enumerate(grid):
+                    for x in range(cols):
+                        cellp = t.cell(y, x).paragraphs[0]
+                        _docx_runs(cellp, row[x] if x < len(row) else [])
+                        if y == 0:
+                            for r in cellp.runs:
+                                r.bold = True
+                doc.add_paragraph()
+
+    walk(read)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _docx_style(doc, want, fallback):
+    """The named Word style if this template has one, otherwise the fallback."""
+    try:
+        doc.styles[want]
+        return want
+    except KeyError:
+        return fallback
+
+
+def _docx_rule(para):
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    pPr = para._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    for k, v in (("w:val", "single"), ("w:sz", "6"), ("w:space", "1"), ("w:color", "999999")):
+        bottom.set(qn(k), v)
+    borders.append(bottom)
+    pPr.append(borders)
+
+
+# ---- out as a PDF, written here rather than with a library, so the build stays small
+# Widths of the two built-in fonts the PDF uses, for characters 32 to 126, in thousandths of the text
+# size. Without them there is no way to know where a line of text has to break.
+_W_PLAIN = ("278 278 355 556 556 889 667 191 333 333 389 584 278 333 278 278 556 556 556 556 556 556 556 556 "
+            "556 556 278 278 584 584 584 556 1015 667 667 722 722 667 611 778 722 278 500 667 556 833 722 778 "
+            "667 778 722 667 611 722 667 944 667 667 611 278 278 278 469 556 333 556 556 500 556 556 278 556 "
+            "556 222 222 500 222 833 556 556 556 556 333 500 278 556 500 722 500 500 500 334 260 334 584")
+_W_BOLD = ("278 333 474 556 556 889 722 238 333 333 389 584 278 333 278 278 556 556 556 556 556 556 556 556 "
+           "556 556 333 333 584 584 584 611 975 722 722 722 722 667 611 778 722 278 556 722 611 833 722 778 "
+           "667 778 722 667 611 722 667 944 667 667 611 333 278 333 584 556 333 556 611 556 611 556 333 611 "
+           "611 278 278 556 278 889 611 611 611 611 389 556 333 611 556 778 556 556 500 389 280 389 584")
+_WIDTHS = {"plain": [int(x) for x in _W_PLAIN.split()], "bold": [int(x) for x in _W_BOLD.split()]}
+# the six built-in fonts the writer picks between
+_PDF_FONTS = {"plain": "Helvetica", "bold": "Helvetica-Bold", "ital": "Helvetica-Oblique",
+              "bi": "Helvetica-BoldOblique", "mono": "Courier", "monob": "Courier-Bold"}
+_FONT_KEY = {"plain": "plain", "ital": "plain", "bold": "bold", "bi": "bold"}
+PAGE_W, PAGE_H, MARGIN = 595.28, 841.89, 56.0
+
+
+def _pdf_font(r, mono=False):
+    if r.get("code") or mono:
+        return "monob" if r.get("b") else "mono"
+    return "bi" if r.get("b") and r.get("i") else "bold" if r.get("b") else "ital" if r.get("i") else "plain"
+
+
+def _pdf_width(s, font, size):
+    if font in ("mono", "monob"):
+        return len(s) * 0.6 * size
+    table = _WIDTHS[_FONT_KEY[font]]
+    total = 0
+    for ch in s:
+        c = ord(ch)
+        total += table[c - 32] if 32 <= c <= 126 else 556
+    return total * size / 1000.0
+
+
+def _pdf_text(s):
+    """Text as the PDF wants it: the printer's own Western European set, escaped."""
+    raw = (s or "").encode("cp1252", "replace")
+    return raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+
+class _Pdf:
+    """A very small PDF writer: pages of text, rules, boxes and pictures, nothing more."""
+
+    def __init__(self):
+        self.pages, self.ops, self.links, self.images = [], [], [], {}
+        self.y = PAGE_H - MARGIN
+        self.left, self.right = MARGIN, PAGE_W - MARGIN
+
+    def room(self, need):
+        if self.y - need < MARGIN:
+            self.page_break()
+
+    def page_break(self):
+        self.pages.append({"ops": self.ops, "links": self.links})
+        self.ops, self.links = [], []
+        self.y = PAGE_H - MARGIN
+
+    def text(self, x, s, font, size, grey=0.0):
+        """font is one of the keys in _PDF_FONTS - the name the page's resources give it."""
+        if not s:
+            return
+        self.ops.append(f"BT /{font} {size:.2f} Tf {grey:.2f} g {x:.2f} {self.y:.2f} Td "
+                        f"({_pdf_text(s).decode('latin-1')}) Tj ET")
+
+    def rule(self, y, x0=None, x1=None, width=0.6, grey=0.72):
+        self.ops.append(f"{grey:.2f} G {width} w {x0 or self.left:.2f} {y:.2f} m {x1 or self.right:.2f} {y:.2f} l S")
+
+    def box(self, x0, y0, x1, y1, grey=0.955):
+        self.ops.append(f"{grey:.3f} g {x0:.2f} {y0:.2f} {x1 - x0:.2f} {y1 - y0:.2f} re f")
+
+    def picture(self, path, maxw):
+        from PIL import Image
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            if im.width > 1400:
+                im = im.resize((1400, max(1, round(im.height * 1400 / im.width))))
+            key = f"Im{len(self.images)}"
+            self.images[key] = (im.width, im.height, zlib.compress(im.tobytes(), 6))
+            w = min(maxw, im.width * 0.75)
+            h = w * im.height / im.width
+        if h > PAGE_H - 2 * MARGIN:
+            w, h = w * (PAGE_H - 2 * MARGIN) / h, PAGE_H - 2 * MARGIN
+        self.room(h + 8)
+        self.y -= h
+        self.ops.append(f"q {w:.2f} 0 0 {h:.2f} {self.left:.2f} {self.y:.2f} cm /{key} Do Q")
+        self.y -= 10
+
+    def wrap(self, rs, size, left, right, leading, mono=False, grey=0.0):
+        """Lays a paragraph's pieces out across as many lines as it takes."""
+        words = []
+        for r in rs:
+            if r.get("img"):
+                words.append({"t": f"[picture: {r['t'] or r['img']}]", "f": "ital", "r": r})
+                continue
+            for bit in re.split(r"(\s+)", r["t"].replace("\n", " ")):
+                if bit:
+                    words.append({"t": bit, "f": _pdf_font(r, mono), "r": r, "space": not bit.strip()})
+        line, used = [], 0.0
+        while words:
+            w = words.pop(0)
+            wide = _pdf_width(w["t"], w["f"], size)
+            if used + wide > right - left and line:
+                self._line(line, size, left, leading, grey)
+                line, used = [], 0.0
+                if w.get("space"):
+                    continue
+            line.append(dict(w, w=wide))
+            used += wide
+        if line:
+            self._line(line, size, left, leading, grey)
+
+    def _line(self, line, size, left, leading, grey):
+        while line and line[-1].get("space"):
+            line.pop()
+        self.room(leading)
+        self.y -= leading * 0.78
+        x = left
+        for w in line:
+            r = w["r"]
+            if r.get("mk"):
+                self.box(x - 1, self.y - 2, x + w["w"] + 1, self.y + size * 0.78, 0.98)
+            self.text(x, w["t"], w["f"], size, 0.18 if r.get("href") else grey)
+            if r.get("u") or r.get("href"):
+                self.rule(self.y - 1.6, x, x + w["w"], 0.55, 0.18 if r.get("href") else grey)
+            if r.get("s"):
+                self.rule(self.y + size * 0.26, x, x + w["w"], 0.55, grey)
+            if r.get("href"):
+                self.links.append((x, self.y - 2, x + w["w"], self.y + size * 0.8, r["href"]))
+            x += w["w"]
+        self.y -= leading * 0.22
+
+    def out(self):
+        self.page_break()
+        pages = [p for p in self.pages if p["ops"]] or [{"ops": [], "links": []}]
+        objs, page_ids = [], []
+        first = 3 + len(_PDF_FONTS) + len(self.images)
+        for n in range(len(pages)):
+            page_ids.append(first + n * 2)
+        objs.append(f"<< /Type /Catalog /Pages 2 0 R >>")
+        objs.append("<< /Type /Pages /Kids [" + " ".join(f"{i} 0 R" for i in page_ids)
+                    + f"] /Count {len(pages)} >>")
+        for key, name in _PDF_FONTS.items():
+            objs.append(f"<< /Type /Font /Subtype /Type1 /BaseFont /{name} /Encoding /WinAnsiEncoding >>")
+        img_ids = {}
+        for key, (w, h, data) in self.images.items():
+            img_ids[key] = len(objs) + 1
+            objs.append((f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB "
+                         f"/BitsPerComponent 8 /Filter /FlateDecode /Length {len(data)} >>", data))
+        res = ("<< /Font << " + " ".join(f"/{k} {3 + i} 0 R" for i, k in enumerate(_PDF_FONTS)) + " >>"
+               + (" /XObject << " + " ".join(f"/{k} {v} 0 R" for k, v in img_ids.items()) + " >>" if img_ids else "")
+               + " >>")
+        for n, p in enumerate(pages):
+            annots = ""
+            if p["links"]:
+                annots = " /Annots [" + " ".join(
+                    f"<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [{a:.2f} {b:.2f} {c:.2f} {d:.2f}] "
+                    f"/A << /S /URI /URI ({_pdf_text(u).decode('latin-1')}) >> >>" for a, b, c, d, u in p["links"]) + "]"
+            objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W:.2f} {PAGE_H:.2f}] "
+                        f"/Resources {res} /Contents {page_ids[n] + 1} 0 R{annots} >>")
+            body = "\n".join(p["ops"]).encode("latin-1", "replace")
+            objs.append((f"<< /Length {len(body)} >>", body))
+        buf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for n, o in enumerate(objs, 1):
+            offsets.append(len(buf))
+            head, data = o if isinstance(o, tuple) else (o, None)
+            buf += f"{n} 0 obj\n{head}\n".encode("latin-1")
+            if data is not None:
+                buf += b"stream\n" + data + b"\nendstream\n"
+            buf += b"endobj\n"
+        start = len(buf)
+        buf += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+        for off in offsets:
+            buf += f"{off:010d} 00000 n \n".encode()
+        buf += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n").encode()
+        return bytes(buf)
+
+
+_PDF_H = {1: (21, 1.28), 2: (16, 1.3), 3: (13.5, 1.33), 4: (12, 1.35), 5: (11.5, 1.4), 6: (11, 1.4)}
+
+
+def to_pdf(title, text):
+    """The note as a PDF. Written by hand so the app does not have to carry a PDF library."""
+    pdf = _Pdf()
+    pdf.y -= 8
+    pdf.wrap([{"t": title, "b": True, "code": False, "href": ""}], 24, pdf.left, pdf.right, 30)
+    pdf.y -= 10
+
+    def walk(blocks, left, quoted=False):
+        for b in blocks:
+            if b["k"] == "h":
+                size, lead = _PDF_H[b["level"]]
+                pdf.y -= 12
+                pdf.room(size * lead + 6)
+                pdf.wrap([dict(r, b=True) for r in b["runs"]], size, left, pdf.right, size * lead)
+                pdf.y -= 3
+            elif b["k"] == "p":
+                pdf.wrap(b["runs"], 11, left, pdf.right, 16.5)
+                pdf.y -= 6
+            elif b["k"] == "list":
+                for n, it in enumerate(b["items"], 1):
+                    pad = left + 16 + 18 * it["level"]
+                    lead = f"{n}." if b["ordered"] else "\u2022"
+                    if it["box"] is not None:
+                        lead = "[x]" if it["box"] else "[  ]"
+                    top = pdf.y
+                    pdf.wrap(it["runs"], 11, pad + 16, pdf.right, 16.5)
+                    back, pdf.y = pdf.y, top
+                    if back < top:                      # the bullet sits on the item's first line
+                        pdf.y -= 16.5 * 0.78
+                        pdf.text(pad, lead, "plain", 11)
+                        pdf.y -= 16.5 * 0.22
+                    pdf.y = back
+                pdf.y -= 6
+            elif b["k"] == "quote":
+                top = pdf.y
+                walk(b["blocks"], left + 22, True)
+                pdf.rule(pdf.y + 4, left + 8, left + 8)   # a zero-length line is no line; drawn below instead
+                pdf.ops.append(f"0.55 G 2 w {left + 10:.2f} {top - 2:.2f} m {left + 10:.2f} {max(pdf.y + 4, MARGIN):.2f} l S")
+            elif b["k"] == "code":
+                lines = b["text"].split("\n")
+                pdf.room(min(len(lines), 3) * 14 + 10)
+                top = pdf.y
+                pdf.y -= 6
+                for l in lines:
+                    pdf.wrap([{"t": l or " ", "code": True, "href": "", "b": False, "i": False}],
+                             9.5, left + 10, pdf.right - 6, 13.6, mono=True, grey=0.12)
+                pdf.y -= 6
+                pdf.ops.insert(0, f"0.955 g {left:.2f} {pdf.y:.2f} {pdf.right - left:.2f} {top - pdf.y:.2f} re f")
+                pdf.y -= 8
+            elif b["k"] == "hr":
+                pdf.room(18)
+                pdf.y -= 9
+                pdf.rule(pdf.y, left)
+                pdf.y -= 9
+            elif b["k"] == "img":
+                pic = ROOT / b["path"]
+                if pic.is_file():
+                    try:
+                        pdf.picture(pic, pdf.right - left)
+                        continue
+                    except Exception:
+                        pass
+                pdf.wrap([{"t": f"[picture: {b['alt'] or b['path']}]", "i": True, "code": False, "href": ""}],
+                         10, left, pdf.right, 15)
+            elif b["k"] == "table":
+                _pdf_table(pdf, b, left)
+        return
+
+    walk(outline(text), pdf.left)
+    return pdf.out()
+
+
+def _pdf_table(pdf, b, left):
+    grid = [b["head"]] + b["rows"]
+    cols = max(len(r) for r in grid)
+    want = [max((_pdf_width("".join(p["t"] for p in (r[c] if c < len(r) else [])), "plain", 10) + 16
+                 for r in grid), default=40) for c in range(cols)]
+    room = pdf.right - left
+    scale = min(1.0, room / max(1.0, sum(want)))
+    wide = [w * scale for w in want] if sum(want) > room else [w + (room - sum(want)) / cols for w in want]
+    for y, row in enumerate(grid):
+        heights, top = [], pdf.y
+        pdf.room(26)
+        top = pdf.y
+        x, low = left, pdf.y
+        for c in range(cols):
+            pdf.y = top
+            rs = row[c] if c < len(row) else []
+            if y == 0:
+                rs = [dict(r, b=True) for r in rs]
+            pdf.y -= 4
+            pdf.wrap(rs or [{"t": " ", "code": False, "href": ""}], 10, x + 6, x + wide[c] - 6, 14.5)
+            pdf.y -= 4
+            low = min(low, pdf.y)
+            x += wide[c]
+        pdf.y = low
+        x = left
+        for c in range(cols + 1):
+            pdf.ops.append(f"0.72 G 0.5 w {x:.2f} {top:.2f} m {x:.2f} {low:.2f} l S")
+            if c < cols:
+                x += wide[c]
+        pdf.rule(top, left, x, 0.5)
+        pdf.rule(low, left, x, 0.5)
+    pdf.y -= 10
+
+
+EXPORT_WRITERS = {
+    "md": lambda title, text: (text or "").encode("utf-8"),
+    "txt": lambda title, text: to_text(text).encode("utf-8"),
+    "docx": lambda title, text: to_docx(title, text),
+    "pdf": lambda title, text: to_pdf(title, text),
+}
+
+
+def to_file(title, text, fmt):
+    """The note, written out in one of the formats EXPORTS lists."""
+    write = EXPORT_WRITERS.get(fmt)
+    if not write:
+        return None
+    return write(title or "Note", text or "")
+
+
+# ---- and back in again
+def _md_escape(s):
+    return re.sub(r"([\\`*_\[\]])", r"\\\1", s or "")
+
+
+def _md_runs(bits):
+    """Pieces of text with bold / italic / underline flags, written back out as Markdown."""
+    out = []
+    for b in bits:
+        t = b.get("t", "")
+        if not t.strip():
+            out.append(t)
+            continue
+        lead, body, tail = re.match(r"^(\s*)(.*?)(\s*)$", t, re.S).groups()
+        if b.get("code"):
+            body = "`" + body.replace("`", "") + "`"
+        else:
+            body = _md_escape(body)
+            if b.get("mk"):
+                body = f"=={body}=="
+            if b.get("u"):
+                body = f"<u>{body}</u>"
+            if b.get("s"):
+                body = f"~~{body}~~"
+            if b.get("i"):
+                body = f"*{body}*"
+            if b.get("b"):
+                body = f"**{body}**"
+        if b.get("href"):
+            body = f"[{body}]({b['href']})"
+        out.append(lead + body + tail)
+    return re.sub(r"[ \t]+", " ", "".join(out)).strip()
+
+
+def from_docx(path):
+    """A Word document as Markdown: headings, bold, italic, underline, lists, tables, quotes, links."""
+    import docx
+    from docx.oxml.ns import qn
+    doc = docx.Document(str(path))
+    out, kinds, lost = [], [], set()
+
+    def bits_of(p):
+        bits = []
+        for node in p._p.iterchildren():
+            if node.tag == qn("w:hyperlink"):
+                href = ""
+                rid = node.get(qn("r:id"))
+                if rid:
+                    try:
+                        href = p.part.rels[rid].target_ref
+                    except KeyError:
+                        href = ""
+                for r in node.findall(qn("w:r")):
+                    bits.append(_docx_bit(r, href))
+            elif node.tag == qn("w:r"):
+                bits.append(_docx_bit(node, ""))
+        if p._p.findall(".//" + qn("w:drawing")) or p._p.findall(".//" + qn("w:pict")):
+            lost.add("pictures")
+        return [b for b in bits if b["t"]]
+
+    def para(p):
+        style = (p.style.name or "") if p.style is not None else ""
+        bits = bits_of(p)
+        if not "".join(b["t"] for b in bits).strip():
+            return "", ""
+        m = re.match(r"(?:Heading|Title|Subtitle)\s*(\d)?", style)
+        if m:
+            level = int(m.group(1) or (1 if style == "Title" else 2))
+            return "h", "#" * min(4, level) + " " + re.sub(r"[*_`=]", "", _md_runs(bits))
+        written = [b for b in bits if b["t"].strip()]
+        if written and all(b.get("code") for b in written):
+            return "code", "```\n" + "".join(b["t"] for b in bits).strip("\n") + "\n```"
+        text = _md_runs(bits)
+        if "Quote" in style:
+            return "quote", "\n".join("> " + l for l in text.split("\n"))
+        numbered = p._p.find(qn("w:pPr") + "/" + qn("w:numPr")) is not None
+        if numbered or style.startswith("List"):
+            ordered = style.startswith("List Number")
+            lead = "1. " if ordered else "- "
+            indent = p.paragraph_format.left_indent
+            depth = max(0, min(3, int(indent.pt // 24) - 1)) if indent else 0
+            box = re.match(r"^[\u2610\u2611\u2612\u25a1\u2713]\s*", text)
+            if box:
+                text = text[box.end():]
+                lead += "[x] " if box.group(0)[0] in "\u2611\u2612\u2713" else "[ ] "
+            return ("li-ol" if ordered else "li-ul"), "    " * depth + lead + text
+        return "p", text
+
+    def table(t):
+        rows = [[" ".join(_md_runs(bits_of(p)) for p in c.paragraphs).replace("|", "\\|").strip() or " "
+                 for c in row.cells] for row in t.rows]
+        if not rows:
+            return ""
+        w = max(len(r) for r in rows)
+        for r in rows:
+            r += [" "] * (w - len(r))
+        # a Markdown table's top row is already the heading, so it doesn't need bolding as well
+        head = [re.sub(r"\*\*(.+?)\*\*", r"\1", c) for c in rows[0]] if len(rows) > 1 else [" "] * w
+        body = rows[1:] if len(rows) > 1 else rows
+        return "\n".join(["| " + " | ".join(head) + " |", "| " + " | ".join(["---"] * w) + " |"]
+                         + ["| " + " | ".join(r) + " |" for r in body])
+
+    paras = {p._p: p for p in doc.paragraphs}
+    tables = {t._tbl: t for t in doc.tables}
+    for node in doc.element.body.iterchildren():
+        if node in paras:
+            kind, line = para(paras[node])
+            if line:
+                out.append(line)
+                kinds.append(kind)
+        elif node in tables:
+            got = table(tables[node])
+            if got:
+                out.append(got)
+                kinds.append("table")
+    lost.add("colours, fonts and page layout")
+    # list items and quote lines belong together; everything else gets a blank line between
+    body = "".join(("" if i == 0 else "\n" if k in ("li-ol", "li-ul", "quote") and kinds[i - 1] == k else "\n\n") + l
+                   for i, (k, l) in enumerate(zip(kinds, out)))
+    return {"text": re.sub(r"\n{3,}", "\n\n", body).strip() + "\n", "lost": sorted(lost)}
+
+
+_MONO = {"consolas", "courier new", "courier", "lucida console", "menlo", "monaco", "cascadia mono"}
+
+
+def _docx_bit(r, href):
+    from docx.oxml.ns import qn
+    pr = r.find(qn("w:rPr"))
+
+    def on(tag):
+        if pr is None:
+            return False
+        el = pr.find(qn("w:" + tag))
+        return el is not None and el.get(qn("w:val")) not in ("0", "false", "none")
+
+    fonts = pr.find(qn("w:rFonts")) if pr is not None else None
+    name = ((fonts.get(qn("w:ascii")) if fonts is not None else "") or "")
+    hl = pr.find(qn("w:highlight")) if pr is not None else None
+    text = "".join(t.text or "" for t in r.findall(qn("w:t")))
+    text += "\n" if r.find(qn("w:br")) is not None else ""
+    text += "\t" if r.find(qn("w:tab")) is not None else ""
+    return {"t": text, "b": on("b"), "i": on("i"), "u": on("u") and not href, "s": on("strike"), "href": href,
+            "code": name.lower() in _MONO, "font": name,
+            "mk": hl is not None and (hl.get(qn("w:val")) or "none") != "none"}
+
+
+def from_pdf(path):
+    """A PDF as Markdown. A PDF only really holds words and where they sit on the page, so
+    everything comes back as ordinary paragraphs."""
+    import pypdf
+    reader = pypdf.PdfReader(str(path))
+    pages = []
+    for page in reader.pages:
+        got = (page.extract_text() or "").replace("\r", "")
+        # a line ending in a word, followed by a line starting lower case, was one sentence on the page
+        got = re.sub(r"(\w[,;]?)\n(?=[a-z])", r"\1 ", got)
+        pages.append("\n\n".join(p.strip() for p in re.split(r"\n\s*\n", got) if p.strip()))
+    text = "\n\n".join(p for p in pages if p)
+    return {"text": (text.strip() + "\n") if text.strip() else "",
+            "lost": ["headings, lists and tables", "bold, italic and colours", "pictures"]}
+
+
+_RTF_UNI = {"ldblquote": "\u201c", "rdblquote": "\u201d", "lquote": "\u2018", "rquote": "\u2019",
+            "emdash": "\u2014", "endash": "\u2013", "bullet": "\u2022", "tab": "\t", "line": "\n",
+            "nbsp": "\u00a0", "~": "\u00a0", "-": "", "_": "-"}
+_RTF_SKIP = {"fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "themedata", "colorschememapping",
+             "latentstyles", "datastore", "generator", "listtable", "listoverridetable", "xmlnstbl", "filetbl"}
+
+
+def from_rtf(path):
+    """Rich text as Markdown. A small reader of its own: bold, italic, underline, headings, lists."""
+    src = Path(path).read_bytes().decode("cp1252", "replace")
+    i, n = 0, len(src)
+    stack, st = [], {"b": False, "i": False, "u": False, "skip": False, "size": 0, "level": 0, "bullet": ""}
+    paras, bits, lost = [], [], set()
+
+    def end_para():
+        text = _md_runs(bits)
+        del bits[:]
+        if not text.strip():
+            paras.append("")
+            return
+        if st["bullet"]:
+            paras.append("    " * st["level"] + st["bullet"] + text)
+        elif st["size"] >= 32:
+            paras.append("# " + re.sub(r"[*_`]", "", text))
+        elif st["size"] >= 26:
+            paras.append("## " + re.sub(r"[*_`]", "", text))
+        elif st["size"] >= 23:
+            paras.append("### " + re.sub(r"[*_`]", "", text))
+        else:
+            paras.append(text)
+        st["bullet"] = ""
+
+    def put(s):
+        if not st["skip"] and s:
+            bits.append({"t": s, "b": st["b"], "i": st["i"], "u": st["u"], "code": False, "href": ""})
+
+    while i < n:
+        c = src[i]
+        if c == "{":
+            stack.append(dict(st))
+            i += 1
+        elif c == "}":
+            if stack:
+                st = stack.pop()
+            i += 1
+        elif c == "\\":
+            m = re.match(r"\\([a-zA-Z]+)(-?\d+)? ?|\\(')([0-9a-fA-F]{2})|\\(.)", src[i:])
+            if not m:
+                i += 1
+                continue
+            i += m.end()
+            word, arg = m.group(1), m.group(2)
+            if m.group(3):
+                put(bytes([int(m.group(4), 16)]).decode("cp1252", "replace"))
+                continue
+            if m.group(5):
+                put(_RTF_UNI.get(m.group(5), m.group(5)))
+                continue
+            if word in _RTF_SKIP:
+                st["skip"] = True
+                if word == "pict":
+                    lost.add("pictures")
+                continue
+            if word == "par" or word == "pard":
+                if word == "par":
+                    end_para()
+                if word == "pard":
+                    st["level"], st["size"], st["bullet"] = 0, 0, ""
+                continue
+            if word == "u" and arg:
+                put(chr(int(arg) % 65536))
+                if i < n and src[i] not in "{}\\":      # the plain stand-in that follows it
+                    i += 1
+                continue
+            if word in ("b", "i", "ul", "ulnone", "plain"):
+                if word == "plain":
+                    st["b"] = st["i"] = st["u"] = False
+                elif word == "ulnone":
+                    st["u"] = False
+                else:
+                    st[{"b": "b", "i": "i", "ul": "u"}[word]] = arg != "0"
+                continue
+            if word == "fs" and arg:
+                st["size"] = int(arg)
+                continue
+            if word in ("outlinelevel", "ilvl") and arg:
+                st["level"] = max(0, min(3, int(arg)))
+                continue
+            if word in ("pntext", "listtext"):
+                st["skip"] = True
+                st["bullet"] = "- "
+                continue
+            if word in _RTF_UNI:
+                put(_RTF_UNI[word])
+            continue
+        else:
+            j = i
+            while j < n and src[j] not in "{}\\":
+                j += 1
+            put(src[i:j].replace("\n", "").replace("\r", ""))
+            i = j
+    end_para()
+    lost.add("tables and colours")
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(paras)).strip()
+    return {"text": (text + "\n") if text else "", "lost": sorted(lost)}
+
+
+def from_file(path):
+    """Brings a file in from the computer and hands back Markdown, plus what the format could not carry."""
+    path = Path(path)
+    kind = IMPORT_EXT.get(path.suffix.lower().lstrip("."))
+    if not kind:
+        return {"error": f"“{path.suffix}” files can't be brought in. "
+                         "Word, PDF, Markdown, plain text and rich text can."}
+    try:
+        if kind == "docx":
+            got = from_docx(path)
+        elif kind == "pdf":
+            got = from_pdf(path)
+        elif kind == "rtf":
+            got = from_rtf(path)
+        else:
+            raw = path.read_bytes()
+            for enc in ("utf-8-sig", "utf-16", "cp1252"):
+                try:
+                    got = {"text": raw.decode(enc), "lost": []}
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                got = {"text": raw.decode("utf-8", "replace"), "lost": []}
+            got["text"] = got["text"].replace("\r\n", "\n").replace("\r", "\n")
+    except Exception as e:
+        return {"error": f"Couldn't read that file: {e}"}
+    if not (got.get("text") or "").strip():
+        return {"error": "There was no text in that file to bring in."}
+    got["name"] = re.sub(r"\s+", " ", path.stem).strip()[:80] or "Imported note"
+    got["kind"] = kind
+    return got
 
 
 BLOCK_START = re.compile(r"\s*([-*+]\s|\d+\.\s|>|\|)")

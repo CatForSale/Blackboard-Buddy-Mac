@@ -1,45 +1,198 @@
-# Blackboard Buddy
+<div align="center">
 
-Your UWE Blackboard in one clean app: this week's plan, timetable, deadlines,
-announcements, AI assignment plans, AI study notes and grades.
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+·  ███  ███ 
+·  █  █ █  █   B L A C K B O A R D
+·  ███  ███
+·  █  █ █  █   B U D D Y
+·  ███  ███
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
 
-## Open it
+### Your whole degree. One window.
 
-Double-click **Blackboard Buddy.exe**. Tip: right-click it → **Pin to Start** or
-**Send to → Desktop (create shortcut)**.
+A desktop app that reads your university Blackboard,
+writes your notes, and gets you to actually revise them.
 
-- It checks Blackboard quietly in the background whenever it's been more than 6 hours.
-- Press **↻** (top right) to check now. A bubble at the top shows what it's doing.
-- **◐** changes the background.
-- If Microsoft needs you to sign in again, a sign-in window pops up. Sign in, and it carries on.
+`Windows` · `macOS` · `v1.2.0`
 
-Keyboard: `1`–`7` or the arrow keys switch tabs.
+</div>
 
-## Files
+---
 
-| What | Where |
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   01 — WHY
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+Blackboard knows everything about your course and tells you none of it.
+Deadlines sit three clicks deep. Lecture slides pile up unread.
+Nothing connects to anything.
+
+This app signs in, reads all of it, and gives it back to you as
+one page you'd actually want to open.
+
+<br>
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   02 — WHAT IT DOES
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+### This week
+
+Everything due, everything new, in the order it matters.
+Open it in the morning and you know what today is.
+
+### Notes that write themselves
+
+New lecture material becomes a study note, in plain English,
+in your words rather than the slide's.
+Assignments become a plan with dates on it.
+
+### Study
+
+Your notes turn into cards. Cards turn into revision.
+
+| | |
 |---|---|
-| Study notes and assignment plans | `output\notes`, `output\plans` (Markdown, opens in any editor) |
-| Calendar of deadlines | Deadlines tab → "Add to calendar" |
-| Your Claude API key and settings | `.env` (keep it private) |
+| **Spaced repetition** | Cards come back exactly when you're about to forget them |
+| **Quiz** | Multiple choice, against the clock |
+| **Match** | Six pairs, best time per week |
+| **Type it** | Write the term. Near enough counts |
+| **Blurt** | Empty the page from memory, then see what you missed |
+| **Focus** | 25 on, 5 off, and it keeps count |
 
-Don't delete the `_internal` folder; the app needs it.
+XP, levels, daily challenges and twelve badges, because a streak
+is a better reason to open an app than guilt is.
 
-## Cost
+### The board
 
-Each refresh only pays for new material. Same-day refreshes with nothing new are free.
-Check your balance at platform.claude.com → Billing.
+An infinite canvas. Notes, sticky notes, checklists, code that runs,
+terminal output, pictures, links, drawing, and boxes to hold it all.
+Works on its own, or shared with your group in real time.
 
-## Settings (`.env`)
+### Notebook
 
-`LOOKAHEAD_DAYS`, `NOTES_DAYS`, `NOTES_PER_RUN`, `PLANS_PER_RUN`, `AI_EFFORT`.
+A vault for everything that isn't Blackboard's.
+Markdown, folders, search, and a map of how your notes link up.
 
-## Privacy
+<br>
 
-Your sign-in is stored only on this PC (in `%LOCALAPPDATA%\BlackboardBuddy`). Course
-material is sent only to the Claude API to make notes. Your password is never stored.
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   03 — GETTING IT RUNNING
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
 
-## For developers
+Double-click **Blackboard Buddy.exe**. That's the install.
 
-Source files are hidden in this folder (`app.py`, `main.py`, `blackboard.py`, `ai.py`).
-Rebuild with `pip install -r requirements.txt` then PyInstaller (`--windowed --icon icon.ico app.py`).
+On first run it asks for three things: your name, your university's
+Blackboard address, and a Claude API key from
+[console.anthropic.com](https://console.anthropic.com).
+
+Then it signs you in through your own browser — the app never sees
+your password — and reads your modules.
+
+```
+↻          check Blackboard now
+◐          light or dark
+1 – 7      jump between tabs
+```
+
+It checks on its own every few hours. You can set that to anything
+from 15 minutes to once a week.
+
+<br>
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   04 — WHERE YOUR THINGS LIVE
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+| | |
+|---|---|
+| Notes and plans | `output/notes`, `output/plans` — Markdown, open them anywhere |
+| Boards, cards, profile | `data/` |
+| Backups | `data/backups` — kept automatically, twenty deep |
+| Your key and settings | `.env` — never leaves this computer |
+| The app itself | `_internal/` — leave it alone |
+
+<br>
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   05 — PRIVACY
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+Your sign-in stays on this computer.
+Your password is never stored, never typed into this app.
+Course material goes to the Claude API to be turned into notes,
+and nowhere else. No account, no telemetry, no server of ours.
+
+<br>
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   06 — COST
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+A refresh only pays for material it hasn't read before.
+Nothing new means nothing spent.
+`AI_EFFORT` in `.env` trades money for depth: `low`, `medium`, `high`.
+
+<br>
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+   07 — SPECIFICATION
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+| | |
+|---|---|
+| Language | Python 3.12+ |
+| Window | pywebview — WebView2 on Windows, WebKit on macOS |
+| Interface | HTML, CSS and JavaScript generated from Python. No build step |
+| Intelligence | Claude, via the Anthropic API |
+| Shared boards | Supabase — realtime, row-level security |
+| Packaging | PyInstaller |
+| Platforms | Windows 10/11, macOS 13+ (Apple silicon and Intel) |
+
+```
+pip install -r requirements.txt
+python app.py              # run it
+python build_bb9.py        # build and install it, Windows
+python build_mac.py        # build it, macOS only
+```
+
+Source files ship hidden on disk. Un-hide one before editing:
+
+```python
+import ctypes; ctypes.windll.kernel32.SetFileAttributesW("main.py", 0x80)
+```
+
+`HANDOFF.md` is the long version — every round of work, what changed and why.
+
+<br>
+
+<div align="center">
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+Built for a Computer Science degree at UWE Bristol,
+then built properly.
+
+```
+· · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+</div>

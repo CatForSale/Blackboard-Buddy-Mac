@@ -268,6 +268,8 @@ TOOLS = [
     ("code", "Code (C)", '<path d="M8.5 7L3.5 12l5 5M15.5 7l5 5-5 5"/>'),
     ("proj", "Code project: files, run, like a mini VS Code (K)", '<path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2h8.5A1.5 1.5 0 0121 8.5v9a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 17.5z"/><path d="M10 11l-2 2 2 2M14 11l2 2-2 2"/>'),
     ("term", "Terminal output (R)", '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M7 10l3 2.5L7 15M12.5 15.5H17"/>'),
+    ("output", "Output: what a code block prints, draws or opens \u00b7 join it to code with a line (Y)",
+     '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 9h17M7 13h6M7 16.5h9"/>'),
     ("todo", "Checklist (L)", '<path d="M4 6.5l1.8 1.8L9 5M4 13.5l1.8 1.8L9 12M12.5 7h7.5M12.5 14h7.5M4 19.5h16"/>'),
     ("image", "Picture (I)", '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16l-5-5L5 19.5"/>'),
     ("link", "Link (U)", '<path d="M10 14a4.5 4.5 0 006.4 0l3-3a4.5 4.5 0 00-6.4-6.4l-1 1M14 10a4.5 4.5 0 00-6.4 0l-3 3a4.5 4.5 0 006.4 6.4l1-1"/>'),
@@ -334,6 +336,11 @@ ON_HTML = f"""
   <div class="ol-fixf"><label><input type="checkbox" class="ol-fixauto"> Fix typos as I type</label>
    <button class="ol-fixall">Fix everything</button></div>
  </div>
+ <div class="ol-big" hidden>
+  <div class="ol-bigh"><b></b><button class="ol-bigx ghost" aria-label="Close">✕</button></div>
+  <div class="ol-bigb"></div>
+ </div>
+ <input class="ol-lbl" hidden maxlength="60" aria-label="What the line says">
  <div class="ol-ctx glass"></div>
  <div class="ol-gate"><div class="ol-card glass"></div></div>
  <div class="ol-toast"></div>
@@ -360,11 +367,29 @@ main:has(#online.on)::after{height:0}
 .ol-links path.hit{stroke:transparent;stroke-width:18}
 .ol-links marker path{fill:var(--text);fill:context-stroke;stroke:none;pointer-events:none}
 .ol-links path.sel{stroke:var(--sel)}
-/* a word written on the line, on a patch of background so the line doesn't run through it */
-.ol-links text{fill:var(--text);font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;
- text-anchor:middle;dominant-baseline:middle;pointer-events:none}
+/* A line is a joining line whatever the zoom, so it keeps one weight on screen instead of
+   thinning to nothing when you pull far out - and stays as easy to click out there. */
+.ol-links path.ln,.ol-links path.hit{vector-effect:non-scaling-stroke}
+/* the line belonging to whatever is picked out stands a little clearer than the rest */
+.ol-links path.near{stroke-width:3}
+/* a word written on the line, on a patch of background so the line doesn't run through it.
+   It is sized against the zoom, so it stays readable about 11px far out as well as close in. */
+.ol-links text{fill:var(--text);font:11px var(--mono);font-size:calc(11px / max(var(--k,1), .25));
+ letter-spacing:.06em;text-transform:uppercase;text-anchor:middle;dominant-baseline:middle;pointer-events:none}
 .ol-links rect{fill:var(--bg);pointer-events:none}
 .ol-links text.sel,.ol-links path.sel+rect+text{fill:var(--sel)}
+/* the handle in the middle of a picked-out line: drag it to bend the line */
+.ol-links circle{fill:var(--bg);stroke:var(--sel);stroke-width:2;pointer-events:all;cursor:grab;
+ vector-effect:non-scaling-stroke}
+/* both blocks a line joins light up while the mouse is on it, so you can see what it joins */
+.ol-b.lit{outline-color:var(--sel)}
+/* writing a line's label where the label is */
+.ol-lbl{position:absolute;z-index:40;transform:translate(-50%,-50%);border:1px solid var(--sel);
+ background:var(--bg);color:var(--text);border-radius:8px;padding:4px 8px;min-width:110px;
+ font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;text-align:center;outline:none}
+/* a code block that sends its result to an output block says so where its own result used to be */
+.ol-outgone{flex:none;padding:7px 14px;border-top:1px solid var(--line);background:var(--inset);
+ font:9.5px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
 
 /* a box or circle drawn behind everything, to group things or point them out. Only its rim and
    its name take clicks, so whatever sits inside it stays usable. */
@@ -756,6 +781,27 @@ html.no-anim .ol-fmtpop.on{animation:none}
  white-space:pre-wrap;background:var(--inset);position:relative;scrollbar-width:thin}
 .ol-out::before{content:attr(data-by);position:absolute;top:5px;left:14px;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
 .ol-out.bad{color:var(--red)} .ol-out.busy{color:var(--muted);animation:blink 1s steps(2) infinite}
+/* the output block: whatever the code it is joined to made - words, a picture or a whole page */
+.ol-b[data-kind=output]{background:var(--blk)}
+.ol-outb{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px;padding:10px 14px;
+ background:var(--inset);scrollbar-width:thin}
+.ol-outb pre{margin:0;font:12.5px/1.6 var(--mono);font-size:var(--fs2,12.5px);white-space:pre;tab-size:4}
+.ol-outb.wrap pre{white-space:pre-wrap;word-break:break-word}
+.ol-outb.bad pre{color:var(--red)}
+.ol-outb img{max-width:100%;border-radius:8px;background:#fff}
+.ol-outb iframe{flex:1;min-height:140px;width:100%;border:0;border-radius:8px;background:#fff}
+.ol-outb .ol-outw{margin:0;color:var(--muted);font:12px var(--mono);animation:blink 1s steps(2) infinite}
+.ol-outb .ol-outn{margin:0;color:var(--muted);font:12px/1.5 var(--mono)}
+.ol-outby{flex:none;padding:5px 14px;border-top:1px solid var(--line);font:9.5px var(--mono);letter-spacing:.1em;
+ text-transform:uppercase;color:var(--muted)}
+.ol-big{position:absolute;inset:0;z-index:70;display:flex;flex-direction:column;background:var(--bg)}
+.ol-bigh{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);
+ font:11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.ol-bigh b{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.ol-bigb{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:14px}
+.ol-bigb pre{margin:0;font:13px/1.6 var(--mono);white-space:pre-wrap;word-break:break-word}
+.ol-bigb img{max-width:100%;border-radius:10px;background:#fff}
+.ol-bigb iframe{flex:1;min-height:300px;width:100%;border:0;border-radius:10px;background:#fff}
 .ol-proj{flex:1;min-height:0;display:grid;grid-template-columns:minmax(120px,32%) 1fr}
 .ol-pfiles{list-style:none;margin:0;padding:8px 6px;border-right:1px solid var(--line);overflow:auto;font-size:13px;scrollbar-width:thin}
 .ol-pfiles li{display:flex;align-items:center;gap:7px;padding:3px 6px;border-radius:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -908,7 +954,7 @@ const PAPER = ['#fff4b8', '#ffd9d9', '#ffd0e8', '#d9ecff', '#cde8f5', '#dcf5dc',
                '#f3f3f3', '#e2e2e2', '#3a3a3a', '#1c1c1c'];
 const INKS = ['auto', '#d71921', '#0a84ff', '#2f9e5b'];
 const LANGS = ['auto', 'python', 'javascript', 'typescript', 'java', 'c', 'cpp', 'csharp', 'kotlin', 'html', 'css', 'sql', 'bash', 'powershell', 'json', 'plaintext'];
-const SIZES = {note: [280, 180], sticky: [200, 180], text: [360, 70], code: [460, 260], proj: [560, 340], term: [500, 240], todo: [300, 220], image: [320, 220], link: [300, 86], shape: [400, 280]};
+const SIZES = {note: [280, 180], sticky: [200, 180], text: [360, 70], code: [460, 260], proj: [560, 340], term: [500, 240], todo: [300, 220], image: [320, 220], link: [300, 86], shape: [400, 280], output: [440, 260]};
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx'.replace(/x/g, () => (Math.random() * 16 | 0).toString(16)));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const now = () => new Date().toISOString();
@@ -1151,6 +1197,35 @@ function paint(b) {
       const x = li.appendChild(h('button', 'x', '×')); x.dataset.del = i; x.title = 'Remove'; });
     add(h('button', 'ol-add', '+ Add item')).dataset.act = 'additem';
   }
+  else if (b.kind === 'output') {
+    const head = add(h('div', 'ol-h'));
+    head.appendChild(h('span', 'ol-t', D.title || 'Output'));
+    const from = feederOf(b.id), busy = !!from && running.has(from);
+    if (from) { const r = head.appendChild(h('button', 'run' + (busy ? ' stop' : ''), busy ? '■ Stop' : '▶ Run'));
+      r.dataset.act = 'orun'; r.title = 'Run the code this is joined to again'; }
+    const op = head.appendChild(h('button', '', 'Open')); op.dataset.act = 'obig'; op.title = 'Open the result on its own';
+    const cp = head.appendChild(h('button', '', 'Copy')); cp.dataset.act = 'ocopy'; cp.title = 'Copy what is in it';
+    const cl = head.appendChild(h('button', '', 'Clear')); cl.dataset.act = 'oclear'; cl.title = 'Empty it';
+    const body = add(h('div', 'ol-outb' + (D.wrap === false ? '' : ' wrap') + (D.ok === false ? ' bad' : '')));
+    const show = outShow(b);
+    if (busy) body.appendChild(h('p', 'ol-outw', 'Running…'));
+    if (show === 'web' && D.html) {
+      const f = document.createElement('iframe');
+      f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+      f.srcdoc = D.html;                                 // srcdoc first, then into the page, or it stays white
+      body.appendChild(f);
+    } else {
+      const pics = (D.imgs || []).filter(s => okImg(s)).slice(-6);
+      if (show !== 'image' || !pics.length) {
+        const pre = body.appendChild(h('pre'));
+        pre.textContent = (D.text || '').replace(/\s+$/, '');
+        if (!pre.textContent && !pics.length && !busy) { pre.remove();
+          body.appendChild(h('p', 'ol-outn', from ? 'Nothing yet — press Run' : 'Draw a line from a code block to this one, then run the code')); }
+      }
+      pics.forEach(s => { const i = body.appendChild(h('img')); i.src = s; i.alt = 'Picture'; });
+    }
+    if (D.stamp !== false && D.by) add(h('div', 'ol-outby', `${D.ok === false ? 'Error' : 'Ran'} · ${D.by}`));
+  }
   else if (b.kind === 'image') { const img = add(h('img')); img.alt = D.alt || 'Picture'; img.src = okImg(D.src); img.draggable = false; }
   else if (b.kind === 'link') {
     const box = add(h('div', 'ol-lnk')), u = okUrl(D.url);
@@ -1173,6 +1248,14 @@ function runButtons(head, b) {
   const o = head.appendChild(h('button', '', 'Open')); o.dataset.act = 'ide'; o.title = 'Open in the code editor';
 }
 function outBox(add, b) {
+  // joined to an output block? then that is the only place the result shows. Say where it went,
+  // so a code block with nothing underneath it never looks broken.
+  const sent = outputsOf(b.id);
+  if (sent.length) {
+    add(h('div', 'ol-outgone', sent.length > 1
+      ? `Its result goes to ${sent.length} output blocks` : 'Its result goes to the output block'));
+    return;
+  }
   const out = b.data.out; if (!out && !running.has(b.id)) return;
   const o = add(h('pre', 'ol-out' + (out && !out.ok ? ' bad' : '')));
   if (running.has(b.id)) { o.textContent = 'Running…'; o.classList.add('busy'); return; }
@@ -1180,30 +1263,311 @@ function outBox(add, b) {
   o.textContent = (lines.length > 8 ? '…\n' : '') + lines.slice(-8).join('\n') || '(no output)';
   o.dataset.by = `${out.ok ? 'Ran' : 'Error'} · ${out.by || ''}`;
 }
+// ---------------------------------------------------------------- output blocks
+// An output block shows what a code block made. What joins the two is simply a line between
+// them: run the code and the result lands in every output hanging off it, and taking the line
+// away pulls them apart again. Nothing is stored about the pairing, so a line is the whole of it.
+const otherEnd = (a, id) => { const D = a.data || {}; return D.from === id ? D.to : D.to === id ? D.from : null; };
+function joinedTo(id, kinds) {
+  const out = [];
+  S.blocks.forEach(a => {
+    if (a.kind !== 'arrow') return;
+    const b = S.blocks.get(otherEnd(a, id));
+    if (b && kinds.includes(b.kind)) out.push(b);
+  });
+  return out;
+}
+const outputsOf = id => joinedTo(id, ['output']);
+// every line with one end on this block
+const linesOn = id => [...S.blocks.values()].filter(a => a.kind === 'arrow'
+  && (a.data?.from === id || a.data?.to === id)
+  && S.blocks.has(a.data.from) && S.blocks.has(a.data.to));
+const feederOf = id => (joinedTo(id, ['code', 'proj'])[0] || {}).id || null;
+// A line appearing or going away changes what an output block holds and whether a code block
+// still shows a result of its own, so both kinds are redrawn.
+const repaintJoins = () => S.blocks.forEach(b => {
+  if (['output', 'code', 'proj'].includes(b.kind) && S.editing !== b.id) paint(b);
+});
+// What is in there decides how it is shown, unless you have said which you want.
+function outShow(b) {
+  const D = b.data || {}, want = D.show || 'auto';
+  if (want !== 'auto') return want;
+  if (D.html) return 'web';
+  if ((D.imgs || []).length && !(D.text || '').trim()) return 'image';
+  return 'text';
+}
+// what was in an output before this run, for the ones set to add each run to the last
+const outWas = new Map();
+function outStart(id) {
+  outputsOf(id).forEach(o => {
+    const keep = o.data.add === true ? (o.data.text || '') : '';
+    outWas.set(o.id, keep);
+    o.data = {...o.data, text: keep, imgs: o.data.add === true ? (o.data.imgs || []) : [], html: '', ok: true, src: id};
+    if (S.editing !== o.id) paint(o);
+  });
+}
+// while it runs: shown as it arrives, not saved - the end of the run is what gets written down
+function outText(id, s) {
+  outputsOf(id).forEach(o => {
+    o.data = {...o.data, text: ((o.data.text || '') + s).slice(-20000)};
+    if (S.editing !== o.id) paint(o);
+  });
+}
+function outImage(id, src) {
+  outputsOf(id).forEach(o => {
+    o.data = {...o.data, imgs: [...(o.data.imgs || []), src].slice(-12)};
+    if (S.editing !== o.id) paint(o);
+  });
+}
+// A page is a result as much as printed words are, so it goes in the same place.
+function outWeb(id, html) {
+  const outs = outputsOf(id); if (!outs.length) return false;
+  outs.forEach(o => { o.data = {...o.data, html, text: '', imgs: [], ok: true, src: id,
+                                by: S.me ? S.me.name : meName(), at: now()};
+    put(o, {soon: true}); });
+  return true;
+}
+function outDone(id, out) {
+  outputsOf(id).forEach(o => {
+    const text = (outWas.get(o.id) || '') + (out.text || '');
+    outWas.delete(o.id);
+    o.data = {...o.data, text: text.length > 20000 ? '…\n' + text.slice(-20000) : text, html: '',
+              ok: out.ok !== false, src: id, by: out.by || (S.me ? S.me.name : meName()), at: out.at || now()};
+    if (S.editing === o.id) paint(o); else put(o, {soon: true});
+  });
+}
+function outClear(b) {
+  change(b.id, x => { x.data = {...x.data, text: '', imgs: [], html: '', ok: true, by: '', at: ''}; });
+}
+function outRun(b) {
+  const from = feederOf(b.id);
+  if (!from) return toast('Draw a line from a code block to this one first (press A on the code block)');
+  const code = S.blocks.get(from); if (!code) return;
+  if (running.has(from)) { running.get(from)(); return; }
+  boardRun(code);
+}
+// The result on its own, filling the board: a page you can really use, a picture big enough to
+// look at, or output with room to scroll.
+function outBig(b) {
+  const D = b.data || {}, body = $('.ol-bigb');
+  $('.ol-bigh b').textContent = D.title || 'Output';
+  body.replaceChildren();
+  if (outShow(b) === 'web' && D.html) {
+    const f = document.createElement('iframe');
+    f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+    f.srcdoc = D.html; body.appendChild(f);
+  } else {
+    (D.imgs || []).filter(s => okImg(s)).forEach(s => { const i = body.appendChild(h('img')); i.src = s; i.alt = 'Picture'; });
+    if ((D.text || '').trim()) body.appendChild(h('pre', '', D.text));
+  }
+  if (!body.childNodes.length) body.appendChild(h('p', '', 'Nothing in there yet'));
+  $('.ol-big').hidden = false;
+}
+const bigOpen = () => !$('.ol-big').hidden;
+function closeBig() { $('.ol-big').hidden = true; $('.ol-bigb').replaceChildren(); }
+$('.ol-bigx').onclick = closeBig;
+// How tall it should be: the three usual heights, or exactly what is in it right now.
+function outTallMenu(b, at) {
+  const set = hh => change(b.id, x => { x.h = Math.round(hh); });
+  const items = [{head: 'how tall'},
+    {label: 'Short', go: () => set(170)},
+    {label: 'The usual', go: () => set(260)},
+    {label: 'Tall', go: () => set(460)},
+    {rule: 1},
+    {label: 'Fit what is in it', go: () => {
+      const d = S.nodes.get(b.id), body = d && d.querySelector('.ol-outb');
+      if (!body) return;
+      set(clamp(b.h + (body.scrollHeight - body.clientHeight), 90, 2000));
+    }}];
+  ctxBuild(items); ctxOpen(at ? at.x : innerWidth / 2, at ? at.y : 120, true);
+}
+function outShowMenu(b, at) {
+  const D = b.data || {}, want = D.show || 'auto';
+  const tick = k => (want === k ? '✓  ' : '    ');
+  const set = k => change(b.id, x => { x.data = {...x.data, show: k}; });
+  const items = [{head: 'show it as'},
+    {label: tick('auto') + 'Whatever it is', go: () => set('auto')},
+    {label: tick('text') + 'Words', go: () => set('text')},
+    {label: tick('image') + 'A picture', go: () => set('image')},
+    {label: tick('web') + 'A web page', go: () => set('web')}];
+  ctxBuild(items); ctxOpen(at ? at.x : innerWidth / 2, at ? at.y : 120, true);
+}
+
+// ---------------------------------------------------------------- following the lines
+// Everything you can reach from here by walking lines, and the lines themselves. One click to
+// pick out a whole plan instead of hunting round the board for the rest of it.
+function chainFrom(ids) {
+  const seen = new Set(ids.filter(Boolean)), lines = new Set();
+  for (let pass = 0; pass < 200; pass++) {
+    let grew = false;
+    S.blocks.forEach(a => {
+      if (a.kind !== 'arrow') return;
+      const f = a.data?.from, t = a.data?.to;
+      if (!f || !t || !(seen.has(f) || seen.has(t))) return;
+      if (!lines.has(a.id)) { lines.add(a.id); grew = true; }
+      if (!seen.has(f)) { seen.add(f); grew = true; }
+      if (!seen.has(t)) { seen.add(t); grew = true; }
+    });
+    if (!grew) break;
+  }
+  return [...seen, ...lines];
+}
+// Centre the board on a block without changing how far in you are zoomed: following a line
+// should not also move the ground under your feet.
+function goTo(b) {
+  if (!b) return;
+  S.view.x = board.clientWidth / 2 - (b.x + b.w / 2) * S.view.k;
+  S.view.y = board.clientHeight / 2 - (b.y + b.h / 2) * S.view.k;
+  applyView(); select([b.id]); sfx('tap', .6);
+}
+// Number the lines along a chain, so the order of the steps reads at a glance. It starts at
+// whatever has nothing pointing into it and walks forwards from there.
+function numberChain(id) {
+  const ids = chainFrom([id]);
+  const lines = ids.map(i => S.blocks.get(i)).filter(x => x && x.kind === 'arrow');
+  const blocks = ids.map(i => S.blocks.get(i)).filter(x => x && x.kind !== 'arrow');
+  if (!lines.length) return 0;
+  const into = new Set(lines.map(l => l.data.to));
+  let front = blocks.filter(x => !into.has(x.id)).map(x => x.id);
+  if (!front.length) front = [blocks[0].id];           // a ring has no beginning: start anywhere
+  const seen = new Set(front), steps = [];
+  let k = 0;
+  for (let pass = 0; pass < 200 && front.length; pass++) {
+    const next = [];
+    front.forEach(from => lines.filter(l => l.data.from === from).forEach(l => {
+      const before = snap(l);
+      l.data = {...l.data, step: ++k};
+      steps.push({before, after: snap(l)});
+      put(l, {soon: true});
+      if (!seen.has(l.data.to)) { seen.add(l.data.to); next.push(l.data.to); }
+    }));
+    front = next;
+  }
+  // a line the walk never reached (a side branch pointing backwards) still gets a number
+  lines.forEach(l => { if (l.data.step == null) { const before = snap(l); l.data = {...l.data, step: ++k};
+    steps.push({before, after: snap(l)}); put(l, {soon: true}); } });
+  record(steps);
+  drawLinks();
+  return k;
+}
+function clearSteps(id) {
+  const steps = [];
+  chainFrom([id]).map(i => S.blocks.get(i)).filter(x => x && x.kind === 'arrow' && x.data.step != null)
+    .forEach(l => { const before = snap(l); l.data = {...l.data, step: null};
+      steps.push({before, after: snap(l)}); put(l, {soon: true}); });
+  record(steps); drawLinks();
+}
+
+// Writing on a line, where the line is: a little box over the middle of it.
+let labelFor = null;
+function editLabel(b) {
+  const el = $('.ol-lbl'), at = labelAt.get(b.id);
+  if (!at) return;
+  const v = S.view, r = board.getBoundingClientRect(), br = R.getBoundingClientRect();
+  labelFor = b.id;
+  el.value = (b.data.label || '').trim();
+  el.hidden = false;
+  el.style.left = (r.left - br.left + at.x * v.k + v.x) + 'px';
+  el.style.top = (r.top - br.top + at.y * v.k + v.y) + 'px';
+  el.focus(); el.select();
+}
+function closeLabel(keep) {
+  const el = $('.ol-lbl');
+  if (el.hidden) return;
+  const id = labelFor, v = el.value.trim().slice(0, 60);
+  el.hidden = true; labelFor = null;
+  if (!keep || !id) return;
+  const b = S.blocks.get(id); if (!b || (b.data.label || '') === v) return;
+  change(id, x => { x.data = {...x.data, label: v}; });
+}
+$('.ol-lbl').addEventListener('blur', () => closeLabel(true));
+$('.ol-lbl').addEventListener('pointerdown', ev => ev.stopPropagation());
+
 function unpaint(id) { S.nodes.get(id)?.remove(); S.nodes.delete(id); S.sel.delete(id); drawLinks(); fmtSoon(); }
 function paintAll() { S.nodes.forEach((_, id) => { if (!S.blocks.has(id)) unpaint(id); }); S.blocks.forEach(paint); drawLinks(); emptyState(); }
 const emptyState = () => R.classList.toggle('has-blocks', S.blocks.size > 0);
 
-// arrows: a line from the edge of one block to the edge of the other
-function edge(b, tx, ty) {
-  const cx = b.x + b.w / 2, cy = b.y + b.h / 2, dx = tx - cx, dy = ty - cy;
+// arrows: a line from the edge of one block to the edge of the other. A side can be named -
+// top, bottom, left or right - and because it is worked out from where the block is now, that
+// choice follows the block about as it is dragged.
+const SIDES = {n: 'Top', e: 'Right', s: 'Bottom', w: 'Left'};
+function edge(b, tx, ty, side) {
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  if (side === 'n') return {x: cx, y: b.y - 6};
+  if (side === 's') return {x: cx, y: b.y + b.h + 6};
+  if (side === 'w') return {x: b.x - 6, y: cy};
+  if (side === 'e') return {x: b.x + b.w + 6, y: cy};
+  const dx = tx - cx, dy = ty - cy;
   if (!dx && !dy) return {x: cx, y: cy};
   const s = Math.min(Math.abs((b.w / 2 + 6) / (dx || 1e-9)), Math.abs((b.h / 2 + 6) / (dy || 1e-9)));
   return {x: cx + dx * s, y: cy + dy * s};
 }
+// How many blocks a straight run of line passes through. Used to step round things rather than
+// draw through them; the two blocks at the ends don't count, nor do boxes and drawings, which are
+// backgrounds and meant to be crossed.
+function inTheWay(x1, y1, x2, y2, solids, skip) {
+  let hits = 0;
+  const lo = (p, q) => Math.min(p, q), hi = (p, q) => Math.max(p, q);
+  for (const b of solids) {
+    if (skip.includes(b.id)) continue;
+    if (hi(x1, x2) <= b.x - 4 || lo(x1, x2) >= b.x + b.w + 4) continue;
+    if (hi(y1, y2) <= b.y - 4 || lo(y1, y2) >= b.y + b.h + 4) continue;
+    hits++;
+  }
+  return hits;
+}
+const legs = pts => pts.slice(1).map((p, i) => [pts[i], p]);
+const cost = (pts, solids, skip) =>
+  legs(pts).reduce((t, [p, q]) => t + inTheWay(p.x, p.y, q.x, q.y, solids, skip), 0);
+const dOf = pts => pts.map((p, i) => (i ? 'L' : 'M') + p.x + ',' + p.y).join(' ');
+
 // Where a joining line runs, and the point halfway along it for the label.
-function linkPath(a, c, form) {
-  const p1 = edge(a, c.x + c.w / 2, c.y + c.h / 2), p2 = edge(c, a.x + a.w / 2, a.y + a.h / 2);
-  if (form === 'straight') return {d: `M${p1.x},${p1.y} L${p2.x},${p2.y}`, mid: {x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2}};
+function linkPath(a, c, D, solids) {
+  D = D || {};
+  const p1 = edge(a, c.x + c.w / 2, c.y + c.h / 2, D.a), p2 = edge(c, a.x + a.w / 2, a.y + a.h / 2, D.b);
+  const form = D.form || 'curve', q = D.bend;
+  if (form === 'straight') {
+    if (q) return {d: dOf([p1, q, p2]), mid: q};
+    return {d: `M${p1.x},${p1.y} L${p2.x},${p2.y}`, mid: {x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2}};
+  }
   if (form === 'elbow') {
-    // one right-angled turn, along whichever axis the two blocks are further apart on
-    const across = Math.abs(p2.x - p1.x) >= Math.abs(p2.y - p1.y);
-    const k1 = across ? {x: (p1.x + p2.x) / 2, y: p1.y} : {x: p1.x, y: (p1.y + p2.y) / 2};
-    const k2 = across ? {x: (p1.x + p2.x) / 2, y: p2.y} : {x: p2.x, y: (p1.y + p2.y) / 2};
-    return {d: `M${p1.x},${p1.y} L${k1.x},${k1.y} L${k2.x},${k2.y} L${p2.x},${p2.y}`,
-            mid: {x: (k1.x + k2.x) / 2, y: (k1.y + k2.y) / 2}};
+    // one right-angled turn. Which axis it turns on is normally whichever the two blocks are
+    // further apart on, and the turn sits halfway - unless the line has been bent by hand, or
+    // asked to step round what is in the way.
+    const shape = (across, at) => across
+      ? [p1, {x: at, y: p1.y}, {x: at, y: p2.y}, p2]
+      : [p1, {x: p1.x, y: at}, {x: p2.x, y: at}, p2];
+    const wide = Math.abs(p2.x - p1.x) >= Math.abs(p2.y - p1.y);
+    let pts = shape(wide, wide ? (p1.x + p2.x) / 2 : (p1.y + p2.y) / 2);
+    if (q) pts = shape(wide, wide ? q.x : q.y);
+    else if (D.dodge && solids) {
+      // a handful of turning points on each axis, and whichever crosses fewest blocks wins. Not
+      // a proper maze solver: enough for a board where things are spread out, and cheap to run.
+      const skip = [a.id, c.id];
+      let best = null;
+      for (const across of [wide, !wide]) {
+        const lo = across ? Math.min(p1.x, p2.x) : Math.min(p1.y, p2.y);
+        const hi = across ? Math.max(p1.x, p2.x) : Math.max(p1.y, p2.y);
+        const tries = [(lo + hi) / 2, lo + 20, hi - 20, lo - 40, hi + 40,
+                       lo + (hi - lo) * .25, lo + (hi - lo) * .75];
+        for (const at of tries) {
+          const got = shape(across, Math.round(at));
+          const score = cost(got, solids, skip) * 10 + (across === wide ? 0 : 1);
+          if (!best || score < best.score) best = {score, pts: got};
+          if (best.score === 0) break;
+        }
+        if (best && best.score === 0) break;
+      }
+      if (best) pts = best.pts;
+    }
+    return {d: dOf(pts), mid: {x: (pts[1].x + pts[2].x) / 2, y: (pts[1].y + pts[2].y) / 2}};
   }
   const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+  // a bent curve is pulled through the point you dragged it to
+  if (q) {
+    const qx = 2 * q.x - mx, qy = 2 * q.y - my;
+    return {d: `M${p1.x},${p1.y} Q${qx},${qy} ${p2.x},${p2.y}`, mid: q};
+  }
   const bend = Math.min(60, Math.hypot(p2.x - p1.x, p2.y - p1.y) * .12);
   const nx = -(p2.y - p1.y), ny = p2.x - p1.x, nl = Math.hypot(nx, ny) || 1;
   const qx = mx + nx / nl * bend, qy = my + ny / nl * bend;
@@ -1212,13 +1576,19 @@ function linkPath(a, c, form) {
 }
 let linksT = 0;
 function linksSoon() { if (!linksT) linksT = requestAnimationFrame(() => { linksT = 0; drawLinks(); }); }
+const labelAt = new Map();      // line id -> where its label is drawn, for writing on it in place
 function drawLinks() {
   const ns = 'http://www.w3.org/2000/svg';
-  [...links.querySelectorAll(':scope > path, :scope > text, :scope > rect')].forEach(p => p.remove());   // not the arrowhead inside <defs>
+  [...links.querySelectorAll(':scope > path, :scope > text, :scope > rect, :scope > circle')].forEach(p => p.remove());   // not the arrowhead inside <defs>
+  labelAt.clear();
+  // worked out once for the whole draw: stepping round things would otherwise walk every block
+  // again for every line, every frame of a drag
+  const solids = [...S.blocks.values()].filter(x => !['arrow', 'shape', 'ink'].includes(x.kind));
   S.blocks.forEach(b => {
     if (b.kind !== 'arrow') return;
     const a = S.blocks.get(b.data?.from), c = S.blocks.get(b.data?.to); if (!a || !c) return;
-    const D = b.data || {}, {d, mid} = linkPath(a, c, D.form), on = S.sel.has(b.id), col = themed(D.color);
+    const D = b.data || {}, {d, mid} = linkPath(a, c, D, solids), on = S.sel.has(b.id), col = themed(D.color);
+    const near = !on && (S.sel.has(a.id) || S.sel.has(c.id));
     const line = document.createElementNS(ns, 'path');
     line.setAttribute('d', d);
     const ends = D.ends || 'to';
@@ -1226,20 +1596,30 @@ function drawLinks() {
     if (ends === 'from' || ends === 'both') line.setAttribute('marker-start', 'url(#ol-head)');
     if (D.thick) line.style.strokeWidth = '3.6';
     if (D.dash) line.setAttribute('stroke-dasharray', D.thick ? '11 8' : '7 6');
-    if (on) line.setAttribute('class', 'sel'); else if (col) line.style.stroke = col;
+    line.setAttribute('class', 'ln' + (on ? ' sel' : near ? ' near' : ''));
+    if (!on && col) line.style.stroke = col;
     const hit = document.createElementNS(ns, 'path');
     hit.setAttribute('d', d); hit.setAttribute('class', 'hit'); hit.dataset.id = b.id;
     links.append(line, hit);
-    if (D.label) {
+    const say = lineText(b);
+    if (say) {
       const t = document.createElementNS(ns, 'text');
       t.setAttribute('x', mid.x); t.setAttribute('y', mid.y);
-      t.textContent = String(D.label).slice(0, 60);
+      t.textContent = say.slice(0, 66);
       if (on) t.setAttribute('class', 'sel'); else if (col) t.style.fill = col;
       links.appendChild(t);
       const r = t.getBBox(), bg = document.createElementNS(ns, 'rect');   // a patch of background behind it
       bg.setAttribute('x', r.x - 5); bg.setAttribute('y', r.y - 2);
       bg.setAttribute('width', r.width + 10); bg.setAttribute('height', r.height + 4); bg.setAttribute('rx', 6);
       links.insertBefore(bg, t);
+    }
+    labelAt.set(b.id, mid);
+    // the handle that bends it, only on the line that is picked out so the board stays quiet
+    if (on) {
+      const g = document.createElementNS(ns, 'circle');
+      g.setAttribute('cx', mid.x); g.setAttribute('cy', mid.y); g.setAttribute('r', 6 / Math.max(S.view.k, .2));
+      g.dataset.bend = b.id; g.dataset.id = b.id;
+      links.appendChild(g);
     }
   });
 }
@@ -1254,6 +1634,27 @@ function put(b, {send = true, soon = false} = {}) {
   if (S.sel.has(b.id)) fmtSoon();
 }
 function change(id, fn, opts) { const b = S.blocks.get(id); if (!b) return; const before = snap(b); fn(b); record([{before, after: snap(b)}]); put(b, opts); }
+// What a line means, not only how it looks. Picking one of these sets the look that goes with
+// it and writes the word on the line when you have not written your own, so a board says what
+// leads to what and what is waiting on what without anyone having to label every line by hand.
+const REL = {
+  plain:   {name: 'Just a line',      word: '',           ends: 'none', dash: true,  color: null},
+  leads:   {name: 'Leads to',         word: 'leads to',   ends: 'to',   dash: false, color: null},
+  depends: {name: 'Depends on',       word: 'depends on', ends: 'to',   dash: true,  color: '#0a84ff'},
+  blocked: {name: 'Blocked by',       word: 'blocked by', ends: 'to',   dash: false, color: '#d71921'},
+  same:    {name: 'Goes with',        word: 'goes with',  ends: 'none', dash: true,  color: '#2f9e5b'},
+  feeds:   {name: 'Feeds its result', word: 'output',     ends: 'to',   dash: false, color: '#0f9ea0'},
+};
+const relOf = b => REL[(b.data || {}).rel] ? b.data.rel : 'plain';
+// What is written on a line: your own words if you wrote any, otherwise what it means, with the
+// step number in front of it when the chain has been numbered.
+function lineText(b) {
+  const D = b.data || {};
+  const own = (D.label || '').trim();
+  const word = own || (D.relword === false ? '' : REL[relOf(b)].word);
+  if (!word) return D.step ? String(D.step) : '';
+  return (D.step ? D.step + '. ' : '') + word;
+}
 // New lines come out the way the last one you liked was set, if you said so.
 const LINE_DEFAULT = {ends: 'none', form: 'elbow', dash: true, thick: false, color: null};
 const lineLook = () => store.get('olLine', null) || LINE_DEFAULT;
@@ -1261,7 +1662,7 @@ function rememberLine(D) {
   store.set('olLine', {ends: D.ends || 'to', form: D.form || 'curve', dash: !!D.dash, thick: !!D.thick, color: okColor(D.color)});
 }
 function add(kind, x, y, data = {}, opts = {}) {
-  if (kind === 'arrow') data = {...lineLook(), ...data};
+  if (kind === 'arrow') { data = {...lineLook(), ...data}; data = asFeed(data); }
   else data = {...(store.get('olLooks', {})[kind] || {}), ...data};     // the look picked for new ones of this kind
   const [w, hgt] = opts.size || SIZES[kind] || [260, 160];
   const top = Math.max(0, ...[...S.blocks.values()].map(b => b.z || 0)) + 1;
@@ -1269,8 +1670,21 @@ function add(kind, x, y, data = {}, opts = {}) {
   // pasting several things in a row shouldn't pile them exactly on top of each other
   if (opts.centre !== false) for (let i = 0; i < 30 && [...S.blocks.values()].some(o => o.kind !== 'arrow' && Math.abs(o.x - b.x) < 24 && Math.abs(o.y - b.y) < 24); i++) { b.x += 36; b.y += 36; }
   record([{before: null, after: snap(b)}]); put(b); sfx('tap');
+  if (kind === 'arrow') repaintJoins();          // a new line may have joined an output to some code
   return b;
 }
+// A line drawn between a code block and an output block is what joins them, so it comes out
+// already saying so - pointing from the code at the output, however it was drawn.
+function asFeed(data) {
+  const f = S.blocks.get(data.from), t = S.blocks.get(data.to);
+  if (!f || !t || data.rel) return data;
+  const codey = k => k === 'code' || k === 'proj';
+  if (codey(f.kind) && t.kind === 'output') return {...data, rel: 'feeds', ...relLook('feeds')};
+  if (codey(t.kind) && f.kind === 'output') return {...data, from: data.to, to: data.from, rel: 'feeds', ...relLook('feeds')};
+  return data;
+}
+const relLook = r => ({ends: REL[r].ends, dash: REL[r].dash, color: REL[r].color});
+
 function remove(ids) {
   const all = new Set(ids);
   S.blocks.forEach(b => { if (b.kind === 'arrow' && (all.has(b.data?.from) || all.has(b.data?.to))) all.add(b.id); });
@@ -1278,22 +1692,33 @@ function remove(ids) {
   all.forEach(id => { const b = S.blocks.get(id); if (!b) return; steps.push({before: snap(b), after: null});
     S.blocks.delete(id); unpaint(id); Sync.remove(b); });
   record(steps); emptyState(); if (steps.length) sfx('off');
+  if (steps.some(s => s.before && s.before.kind === 'arrow')) repaintJoins();     // a line gone unhooks them
 }
 function undo(redo) {
   const steps = (redo ? future : history).pop(); if (!steps) return;
   (redo ? history : future).push(steps);
   steps.forEach(s => { const want = redo ? s.after : s.before, id = (s.before || s.after).id;
     if (want) put(snap(want)); else { const b = S.blocks.get(id); if (b) { S.blocks.delete(id); unpaint(id); Sync.remove(b); } } });
-  emptyState(); sfx('tab');
+  emptyState(); repaintJoins(); sfx('tab');
 }
 function select(ids, keep) {
   if (!keep) S.sel.clear(); ids.forEach(id => S.sel.add(id));
   S.nodes.forEach((d, id) => d.classList.toggle('sel', S.sel.has(id))); drawLinks(); fmtSoon(true);
 }
+// A box is there to hold other things, so it belongs behind them. Given some blocks, this is
+// the order to stack them in, back to front: the boxes first, the biggest first so that a box
+// inside a box still sits in front of the one around it, then everything else in the order it
+// already had. Every place where z is handed out goes through this.
+function stackOrder(list) {
+  const boxes = list.filter(b => b.kind === 'shape').sort((a, b) => (b.w * b.h) - (a.w * a.h));
+  const rest = list.filter(b => b.kind !== 'shape').sort((a, b) => (a.z || 0) - (b.z || 0));
+  return [...boxes, ...rest];
+}
 // Shapes are meant to sit behind what they group, so they go to the back when made.
 function toBack(ids) {
   let low = Math.min(0, ...[...S.blocks.values()].map(b => b.z || 0));
-  ids.forEach(id => { const b = S.blocks.get(id); if (b) { b.z = --low; place(b); put(b); } });
+  stackOrder(ids.map(id => S.blocks.get(id)).filter(Boolean)).reverse()
+    .forEach(b => { b.z = --low; place(b); put(b); });
 }
 const locked = b => !!(b && b.data && b.data.lock);
 // What sits inside a box. Used so that dragging the box takes its contents along, which is
@@ -1354,12 +1779,18 @@ function withInsides(ids) {
     if (b && b.kind === 'shape') inside(b).forEach(c => out.add(c.id)); });
   return [...out];
 }
-function toFront(ids) { let top = Math.max(0, ...[...S.blocks.values()].map(b => b.z || 0)); ids.forEach(id => { const b = S.blocks.get(id); if (b && b.z !== top) { b.z = ++top; place(b); } }); }
+// Coming to the front brings a box's contents with it, and the box goes underneath them, so
+// picking a box up can never bury what is inside it.
+function toFront(ids) {
+  let top = Math.max(0, ...[...S.blocks.values()].map(b => b.z || 0));
+  stackOrder(withInsides(ids).map(id => S.blocks.get(id)).filter(Boolean))
+    .forEach(b => { b.z = ++top; place(b); });
+}
 
 // ---------------------------------------------------------------- typing inside a block
 let editBefore = null;
 function startEdit(id, at) {
-  const b = S.blocks.get(id); if (!b || ['image', 'ink', 'arrow'].includes(b.kind)) return;
+  const b = S.blocks.get(id); if (!b || ['image', 'ink', 'arrow', 'output'].includes(b.kind)) return;
   if (locked(b)) return toast('That one is locked. Right-click it to unlock.');
   const coding = b.kind === 'code' || b.kind === 'proj';
   const who = peerOn(id);
@@ -1458,6 +1889,8 @@ function shortName(b) {
     return next ? next.t.slice(0, 40) : 'Checklist';
   }
   const line = x => (x || '').split('\n').map(t => t.trim()).find(t => t) || '';
+  if (b.kind === 'output') return line(D.text).slice(0, 34)
+    || (D.html ? 'Web page' : (D.imgs || []).length ? 'Picture' : 'Output');
   if (b.kind === 'code' || b.kind === 'term') return line(blockText(b)).slice(0, 34);
   const words = (blockText(b) || '').replace(/\s+/g, ' ').trim();
   return words ? words.slice(0, 40) : (KIND_NAME[b.kind] || b.kind);
@@ -1619,10 +2052,10 @@ async function run(b, stdin, sink, img) {
     sink && sink(msg + '\n', true); return finish(b.id, {text: msg, ok: false});
   }
   let text = '';
-  const out = (s, err, note) => { if (s === null) { text = ''; sink && sink(null); return; } if (!note) text += s; sink && sink(s, err); };
+  const out = (s, err, note) => { if (s === null) { text = ''; sink && sink(null); return; } if (!note) { text += s; outText(b.id, s); } sink && sink(s, err); };
   running.set(b.id, () => running.stopNow && running.stopNow());
-  paintRun(b.id); IDE.busy(b.id, true); sfx('send');
-  const ok = await runIn(kind, files, main, stdin, out, {img: src => { text += '[chart]\n'; img && img(src); }});
+  paintRun(b.id); outStart(b.id); IDE.busy(b.id, true); sfx('send');
+  const ok = await runIn(kind, files, main, stdin, out, {img: src => { text += '[chart]\n'; outImage(b.id, src); img && img(src); }});
   running.delete(b.id); IDE.busy(b.id, false);
   finish(b.id, {text: text.length > 20000 ? '…\n' + text.slice(-20000) : text, ok});
   sfx(ok ? 'done' : 'error');
@@ -1631,13 +2064,19 @@ async function run(b, stdin, sink, img) {
 function finish(id, out) {
   const b = S.blocks.get(id); if (!b) return;
   out = {...out, by: S.me ? S.me.name : meName(), at: now()};
+  outDone(id, out);
   b.data = {...b.data, out};
   if (peerOn(id)) { paint(b); return; }
   if (S.editing === id) { Sync.live(b); Sync.save(b, true); paint(b); } else put(b, {soon: true});
 }
 const paintRun = id => { const b = S.blocks.get(id); if (b && S.editing !== id) paint(b); };
 function boardRun(b) {
-  if (RUN_EXT[ext(mainFile(b))] === 'html' || whereOf(b) === 'pc') { startEdit(b.id); (IDE.ready || Promise.resolve()).then(() => IDE.go()); return; }
+  const main = mainFile(b);
+  // joined to an output block, a page belongs in there - no need to open the editor at all
+  if (RUN_EXT[ext(main)] === 'html' && outputsOf(b.id).length) {
+    outWeb(b.id, webPage(filesOf(b), main)); sfx('send'); toast('Sent to the output block'); return;
+  }
+  if (RUN_EXT[ext(main)] === 'html' || whereOf(b) === 'pc') { startEdit(b.id); (IDE.ready || Promise.resolve()).then(() => IDE.go()); return; }
   run(b, '', null);
 }
 
@@ -2064,7 +2503,8 @@ const IDE = (() => {
     unmark();
     if (whereOf(blk) === 'pc') return pcRun(runCmd(blk), true);
     const main = mainFile(blk);
-    if (RUN_EXT[ext(main)] === 'html') { panel('view'); outEl.textContent = ''; view(webPage(filesOf(blk), main)); sfx('send'); return; }
+    if (RUN_EXT[ext(main)] === 'html') { const page = webPage(filesOf(blk), main);
+      panel('view'); outEl.textContent = ''; view(page); outWeb(blk.id, page); sfx('send'); return; }
     while (liveBusy) await new Promise(r => setTimeout(r, 100));
     panel('out'); outEl.textContent = '';
     await run(blk, q('.ide-in').value.split(/\s*\|\s*/).join('\n'), (s, err) => { if (b && b.id === blk.id) write(s, err); }, src => { if (b && b.id === blk.id) picture(outEl, src); });
@@ -2097,7 +2537,8 @@ const IDE = (() => {
   // the app sends what the program prints here, a bit at a time, and the exit code at the end
   window.bbTerm = (key, text, code) => {
     const p = procs.get(key); if (!p) return;
-    if (text != null) { const t = noAnsi(text).replace(/\r\n?/g, '\n'); p.text = (p.text + t).slice(-40000); if (b && b.id === key) twrite(t); return; }
+    if (text != null) { const t = noAnsi(text).replace(/\r\n?/g, '\n'); p.text = (p.text + t).slice(-40000);
+      outText(key, t); if (b && b.id === key) twrite(t); return; }
     procs.delete(key); running.delete(key); busy(key, false); el.classList.toggle('pcbusy', !!(b && procs.has(b.id)));
     if (b && b.id === key) twrite(`\n[finished${code ? ', exit code ' + code : ''}]\n`, code ? 'e' : 'n');
     p.done({code, text: p.text});
@@ -2127,6 +2568,7 @@ const IDE = (() => {
     if (!r || r.error) { procs.delete(blk.id); twrite(((r && r.error) || "Couldn't start it") + '\n', 'e'); if (asRun) finish(blk.id, {text: (r && r.error) || '', ok: false}); return; }
     synced.set(blk.id, new Map(files.map(f => [f.n, f.t])));
     running.set(blk.id, () => api().term_stop(blk.id)); busy(blk.id, true); el.classList.add('pcbusy');
+    if (asRun) { outStart(blk.id); paintRun(blk.id); }
     if (asRun) sfx('send');
     q('.ide-tin').focus();
     const end = await done;
@@ -2489,6 +2931,11 @@ board.addEventListener('pointerdown', ev => {
     if (t.dataset.act === 'additem') { ev.preventDefault(); select([id]); addItem(b); return; }
     if (t.dataset.act === 'copy') { ev.preventDefault(); navigator.clipboard.writeText(noAnsi(b.data.text || '')).then(() => toast('Copied')); sfx('tap'); return; }
     if (t.dataset.act === 'run') { ev.preventDefault(); boardRun(b); return; }
+    if (t.dataset.act === 'orun') { ev.preventDefault(); outRun(b); return; }
+    if (t.dataset.act === 'obig') { ev.preventDefault(); outBig(b); return; }
+    if (t.dataset.act === 'ocopy') { ev.preventDefault();
+      navigator.clipboard.writeText(b.data.text || '').then(() => toast('Copied')).catch(() => {}); sfx('tap'); return; }
+    if (t.dataset.act === 'oclear') { ev.preventDefault(); outClear(b); return; }
     if (t.dataset.act === 'ide') { ev.preventDefault(); startEdit(id); return; }
     if (t.dataset.act === 'open') { ev.preventDefault(); const u = okUrl(b.data.url); if (u) (api()?.open_inside ? api().open_inside(u, b.data.title || u) : window.open(u)); return; }
     return;   // the language box
@@ -2572,6 +3019,13 @@ board.addEventListener('pointermove', ev => {
     place(b); Sync.live(b, true); return; }
   if (drag.kind === 'pen') { const last = drag.pts[drag.pts.length - 1]; if (Math.hypot(p.x - last.x, p.y - last.y) * S.view.k > 1.5) { drag.pts.push(p); drawDraft(); } return; }
   if (drag.kind === 'arrow') { drag.to = p; drawDraft(); return; }
+  if (drag.kind === 'bend') {
+    const b = S.blocks.get(drag.id); if (!b) return;
+    if (!drag.moved && Math.hypot(p.x - drag.p.x, p.y - drag.p.y) * S.view.k < 4) return;
+    drag.moved = true;
+    b.data = {...b.data, bend: {x: Math.round(p.x), y: Math.round(p.y)}};
+    drawLinks(); Sync.live(b); return;
+  }
   if (drag.kind === 'make') {
     const v = S.view, x0 = Math.min(drag.p.x, p.x), y0 = Math.min(drag.p.y, p.y);
     Object.assign(marquee.style, {display: 'block', left: x0 * v.k + v.x + 'px', top: y0 * v.k + v.y + 'px',
@@ -2619,6 +3073,10 @@ board.addEventListener('pointerup', ev => {
     const path = d.pts.map((p, i) => (i ? 'L' : 'M') + (p.x - x0).toFixed(1) + ',' + (p.y - y0).toFixed(1)).join(' ');
     add('ink', x0, y0, {d: path, vw: Math.round(w), vh: Math.round(hh), color: S.ink === 'auto' ? null : S.ink, width: 3}, {size: [Math.round(w), Math.round(hh)], centre: false});
   }
+  if (d.kind === 'bend') {
+    if (d.moved) { const b = S.blocks.get(d.id); if (b) { record([{before: d.before, after: snap(b)}]); put(b, {soon: true}); } }
+    return;
+  }
   if (d.kind === 'arrow') {
     const t = document.elementsFromPoint(ev.clientX, ev.clientY).find(e => e.classList?.contains('ol-b'));
     const to = t?.dataset.id;
@@ -2630,12 +3088,46 @@ board.addEventListener('pointerup', ev => {
 board.addEventListener('dblclick', ev => {
   if (S.tool !== 'select') return;
   const under = document.elementsFromPoint(ev.clientX, ev.clientY), top = under[0];
-  if (!top || !board.contains(top) || under.some(e => e.matches?.('.ol-links path.hit'))) return;
+  if (!top || !board.contains(top) || under.some(e => e.matches?.('.ol-links path.hit, .ol-links circle'))) return;
   const blockEl = top.closest('.ol-b');
   if (blockEl) { if (S.editing !== blockEl.dataset.id && !top.closest('button,select,input')) startEdit(blockEl.dataset.id, top); return; }
   const p = toWorld(ev), b = add('note', p.x, p.y, {html: ''}); startEdit(b.id);
 });
-links.addEventListener('pointerdown', ev => { const id = ev.target.dataset.id; if (!id) return; ev.stopPropagation(); if (S.editing) stopEdit(); select([id]); });
+// A line takes clicks on itself: one picks it out, dragging it bends it, and twice opens the
+// box to write in. The handle in the middle does the same, and is there so the dragging can be
+// found at all. The second press is counted here rather than waiting for the browser's own
+// double-click: the first press takes the pointer for the bend, so that event never arrives.
+let lineTap = {id: null, at: 0};
+links.addEventListener('pointerdown', ev => {
+  const id = ev.target.dataset.id; if (!id || ev.button !== 0) return;
+  ev.stopPropagation(); if (S.editing) stopEdit();
+  closeCtx();
+  const b = S.blocks.get(id); if (!b || b.kind !== 'arrow') return;
+  const twice = lineTap.id === id && Date.now() - lineTap.at < 450;
+  lineTap = {id, at: Date.now()};
+  ev.preventDefault();
+  if (twice) { select([id]); editLabel(b); return; }
+  closeLabel(true);
+  select([id]);
+  drag = {kind: 'bend', id, p: toWorld(ev), moved: false, before: snap(b)};
+  board.setPointerCapture(ev.pointerId);
+});
+// Both blocks a line joins light up while the mouse is on it, so what it joins is never a guess.
+links.addEventListener('pointerover', ev => {
+  const id = ev.target.dataset.id; if (!id) return;
+  const b = S.blocks.get(id); if (!b || b.kind !== 'arrow') return;
+  [b.data.from, b.data.to].forEach(i => S.nodes.get(i)?.classList.add('lit'));
+});
+links.addEventListener('pointerout', ev => {
+  const id = ev.target.dataset.id; if (!id) return;
+  S.nodes.forEach(d => d.classList.remove('lit'));
+});
+// Double-click a line to write on it, where it is.
+links.addEventListener('dblclick', ev => {
+  const id = ev.target.dataset.id; if (!id) return;
+  ev.stopPropagation(); ev.preventDefault();
+  const b = S.blocks.get(id); if (b && b.kind === 'arrow') { select([id]); editLabel(b); }
+});
 board.addEventListener('wheel', ev => {
   if (ev.target.closest('.ol-c,.ol-todo,textarea') && S.editing && !ev.ctrlKey) return;   // scroll inside the block being typed in
   ev.preventDefault();
@@ -2669,6 +3161,16 @@ addEventListener('keydown', ev => {
     if (ctxKeys(ev)) ev.stopPropagation();
     return;
   }
+  // The box for writing on a line is dealt with here rather than on the box itself: this
+  // handler catches keys on their way down and stops them, so a listener on the box never sees
+  // its own Enter.
+  if (!$('.ol-lbl').hidden && ev.target === $('.ol-lbl')) {
+    if (ev.key === 'Enter' || ev.key === 'Escape') {
+      ev.preventDefault(); ev.stopPropagation();
+      closeLabel(ev.key === 'Enter'); R.focus({preventScroll: true});
+    }
+    return;
+  }
   if (ev.key !== 'Escape') ev.stopPropagation();
   const typing = ev.target.closest('input,textarea,[contenteditable="true"],[contenteditable="plaintext-only"],select');
   if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'f' && !ev.target.closest('.ol-ide')) {
@@ -2689,7 +3191,9 @@ addEventListener('keydown', ev => {
     if (ev.key === '-' || ev.key === '_')
       return dress_(b => CAN_SIZE.includes(b.kind) ? sizePatch(b, Math.round(clamp(baseSize(b) / 1.2, 9, 160))) : {});
   }
-  if (ev.key === 'Escape') { if (linkFrom) { stopLink(); toast('Stopped'); return; }
+  if (ev.key === 'Escape') { if (!$('.ol-lbl').hidden) { closeLabel(false); return; }
+    if (bigOpen()) { closeBig(); return; }
+    if (linkFrom) { stopLink(); toast('Stopped'); return; }
     if (ctx.classList.contains('on')) { closeCtx(); return; }
     if (S.editing) stopEdit(); else { select([]); setTool('select'); } closeMenu(); return; }
   if (S.editing && S.blocks.get(S.editing)?.kind === 'todo' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); addItem(S.blocks.get(S.editing)); return; }
@@ -2701,29 +3205,102 @@ addEventListener('keydown', ev => {
   if (ctrl && k === 'a') { ev.preventDefault(); select([...S.blocks.keys()]); return; }
   if (ctrl && k === 'k') { ev.preventDefault(); showBoards($('.ol-switch')); return; }
   if (ctrl && k === 'd') { ev.preventDefault(); duplicate([...S.sel], 24); return; }
-  if (ctrl && k === 'c' && S.sel.size) { const list = [...S.sel].map(id => S.blocks.get(id)).filter(Boolean);
-    navigator.clipboard.writeText('bb-online:' + JSON.stringify(list)); toast(`Copied ${list.length} block${list.length > 1 ? 's' : ''}`); return; }
+  if (ctrl && k === 'c' && S.sel.size) { copySel([...S.sel]); return; }
   if (ctrl && (k === '=' || k === '+')) { ev.preventDefault(); zoomAt(S.view.k * 1.2); return; }
   if (ctrl && k === '-') { ev.preventDefault(); zoomAt(S.view.k / 1.2); return; }
   if (ctrl) return;
   if ((ev.key === 'Delete' || ev.key === 'Backspace') && S.sel.size) { ev.preventDefault(); remove([...S.sel]); return; }
-  if (ev.key === 'Enter' && S.sel.size === 1) { ev.preventDefault(); startEdit([...S.sel][0]); return; }
+  if (ev.key === 'Enter' && S.sel.size === 1) {
+    const one = S.blocks.get([...S.sel][0]);
+    // a line has nothing to type in, so Enter travels along it: to what it points at, or with
+    // Shift to where it starts
+    if (one && one.kind === 'arrow') { ev.preventDefault();
+      goTo(S.blocks.get(ev.shiftKey ? one.data.from : one.data.to)); return; }
+    ev.preventDefault(); startEdit([...S.sel][0]); return; }
   if (ev.key === 'F2' && S.sel.size === 1) { ev.preventDefault(); renameBlock(S.blocks.get([...S.sel][0])); return; }
+  if (ev.key === 'F5' && S.sel.size === 1) { const b = S.blocks.get([...S.sel][0]);
+    if (b && b.kind === 'output') { ev.preventDefault(); outRun(b); return; }
+    if (b && (b.kind === 'code' || b.kind === 'proj')) { ev.preventDefault(); boardRun(b); return; } }
   if (ev.key.startsWith('Arrow') && S.sel.size) { ev.preventDefault(); const n = ev.shiftKey ? 20 : 2, dx = {ArrowLeft: -n, ArrowRight: n}[ev.key] || 0, dy = {ArrowUp: -n, ArrowDown: n}[ev.key] || 0;
     const steps = []; S.sel.forEach(id => { const b = S.blocks.get(id); if (!b || b.kind === 'arrow') return; const before = snap(b); b.x += dx; b.y += dy; steps.push({before, after: snap(b)}); put(b); }); record(steps); return; }
-  const tools = {v: 'select', h: 'hand', n: 'note', t: 'text', c: 'code', k: 'proj', r: 'term', l: 'todo', u: 'link', p: 'pen', a: 'arrow', o: 'shape'};
+  const tools = {v: 'select', h: 'hand', n: 'note', t: 'text', c: 'code', k: 'proj', r: 'term', l: 'todo', u: 'link', p: 'pen', a: 'arrow', o: 'shape', y: 'output'};
   if (tools[k]) { setTool(tools[k]); return; }
   if (k === 'i') { $('.ol-file').click(); return; }
   if (k === 'f') { fit(S.sel.size ? [...S.sel].map(id => S.blocks.get(id)).filter(Boolean) : null); return; }
   if (k === '0') { zoomAt(1); return; }
 }, true);
-function duplicate(ids, off) {
+// One fresh copy of some blocks. Everything gets a new id, so a copy can land on the board it
+// came from or on any other one; lines between copied blocks are pointed at the copies, and a
+// line with only one end in the set is left out, as it would have nothing to join to.
+function copyRows(rows, off) {
   const map = new Map(), out = [];
-  ids.forEach(id => { const b = S.blocks.get(id); if (b && b.kind !== 'arrow') map.set(id, uuid()); });
-  ids.forEach(id => { const b = S.blocks.get(id); if (!b) return;
-    if (b.kind === 'arrow') { if (!map.has(b.data.from) || !map.has(b.data.to)) return; out.push({...snap(b), id: uuid(), data: {from: map.get(b.data.from), to: map.get(b.data.to)}}); }
-    else out.push({...snap(b), id: map.get(id), x: b.x + off, y: b.y + off}); });
-  out.forEach(b => put(b)); record(out.map(b => ({before: null, after: snap(b)}))); select(out.map(b => b.id)); sfx('tap');
+  rows.forEach(b => { if (b && b.id && b.kind && b.kind !== 'arrow') map.set(b.id, uuid()); });
+  rows.forEach(b => {
+    if (!b || !b.id || !b.kind) return;
+    // whose board it came from, and where it had got to on the way there, is none of the copy's business
+    const {_ghost, _remote, updated_at, group_id, deleted, ...rest} = snap(b);
+    const data = {...(rest.data || {})}; delete data._rev;
+    if (b.kind === 'arrow') {
+      if (!map.has(data.from) || !map.has(data.to)) return;
+      out.push({...rest, id: uuid(), x: 0, y: 0, w: 0, h: 0,
+                data: {...data, from: map.get(data.from), to: map.get(data.to)}});
+    } else out.push({...rest, id: map.get(b.id), data,
+                     x: Math.round((rest.x || 0) + off.x), y: Math.round((rest.y || 0) + off.y)});
+  });
+  return out;
+}
+// Copies go on the board in front of what is already there, in the stacking order above.
+function landRows(out, extra) {
+  if (!out.length) return out;
+  let top = Math.max(0, ...[...S.blocks.values()].map(b => b.z || 0));
+  stackOrder(out).forEach(b => { b.z = ++top; });
+  out.forEach(b => put(b));
+  const steps = out.map(b => ({before: null, after: snap(b)}));
+  if (extra) steps.push(...extra());
+  record(steps);
+  select(out.filter(b => b.kind !== 'arrow').map(b => b.id));
+  if (out.some(b => b.kind === 'arrow')) repaintJoins();
+  sfx('tap');
+  return out;
+}
+function duplicate(ids, off) {
+  landRows(copyRows(withAllInside(ids).map(id => S.blocks.get(id)).filter(Boolean), {x: off, y: off}));
+}
+// A box is copied with what is in it, and with the lines running between them.
+function withAllInside(ids) {
+  const all = new Set(withInsides(ids));
+  S.blocks.forEach(b => { if (b.kind === 'arrow' && all.has(b.data?.from) && all.has(b.data?.to)) all.add(b.id); });
+  return [...all];
+}
+// What was copied is kept in the page's own storage as well as on the computer's clipboard. The
+// storage copy is the one that matters: it is still there after switching to another board, which
+// is how blocks move from one board to another, and it works even where the clipboard is refused.
+const Clip = {
+  put(rows) {
+    const list = rows.filter(Boolean).map(b => { const {_ghost, _remote, ...r} = snap(b); return r; });
+    store.set('olClip', {at: Date.now(), rows: list});
+    try { navigator.clipboard.writeText('bb-online:' + JSON.stringify(list)); } catch (_) {}
+    return list.filter(b => b.kind !== 'arrow').length;
+  },
+  rows() { const c = store.get('olClip', null); return c && Array.isArray(c.rows) ? c.rows : []; },
+  count() { return this.rows().filter(b => b && b.kind !== 'arrow').length; },
+};
+function copySel(ids) {
+  const n = Clip.put(withAllInside(ids).map(i => S.blocks.get(i)).filter(Boolean));
+  if (!n) return;
+  toast(`Copied ${n} block${n > 1 ? 's' : ''} — paste it on any board`);
+}
+// Blocks from a copy, dropped on this board around p.
+function pasteRows(rows, p) {
+  const list = (rows || []).filter(r => r && r.id && r.kind);
+  const solid = list.filter(b => b.kind !== 'arrow');
+  if (!solid.length) return 0;
+  const x0 = Math.min(...solid.map(b => b.x || 0)), y0 = Math.min(...solid.map(b => b.y || 0));
+  const x1 = Math.max(...solid.map(b => (b.x || 0) + (b.w || 0))), y1 = Math.max(...solid.map(b => (b.y || 0) + (b.h || 0)));
+  const at = p || centre();
+  const out = copyRows(list, {x: at.x - (x0 + x1) / 2, y: at.y - (y0 + y1) / 2});
+  landRows(out, () => regrowBoxes(out.map(b => b.id)));
+  return out.filter(b => b.kind !== 'arrow').length;
 }
 
 // ---------------------------------------------------------------- paste and drop
@@ -2732,9 +3309,11 @@ document.addEventListener('paste', ev => {
   const cd = ev.clipboardData; if (!cd) return;
   const img = [...cd.items].find(i => i.type.startsWith('image/'));
   if (img) { ev.preventDefault(); addImage(img.getAsFile(), centre()); return; }
-  const t = cd.getData('text/plain'); if (!t) return; ev.preventDefault();
-  if (t.startsWith('bb-online:')) { try { const list = JSON.parse(t.slice(10)); list.forEach(b => S.blocks.has(b.id) || S.blocks.set(b.id, {...b, _ghost: true}));
-    duplicate(list.map(b => b.id), 30); list.forEach(b => S.blocks.get(b.id)?._ghost && S.blocks.delete(b.id)); } catch (_) {} return; }
+  const t = cd.getData('text/plain');
+  // nothing on the computer's clipboard, but blocks copied here earlier: those are what was meant
+  if (!t) { if (Clip.count()) { ev.preventDefault(); pasteRows(Clip.rows(), centre()); } return; }
+  ev.preventDefault();
+  if (t.startsWith('bb-online:')) { try { pasteRows(JSON.parse(t.slice(10)), centre()); } catch (_) { toast('That copy could not be read'); } return; }
   addText(t, centre());
 });
 function addText(t, p, name) {
@@ -3150,6 +3729,7 @@ async function myGroups() {
 }
 // Before a board is swapped for another, whatever is open on the old one is finished and saved there.
 function leaveBoard() {
+  closeLabel(false);
   if (S.editing) stopEdit();
   if (IDE.id) IDE.close();
   drag = null;
@@ -3567,7 +4147,7 @@ let hits = [], hitAt = -1;
 
 function searchable(b) {
   const D = b.data || {};
-  const bits = [D.title, D.text, D.label, D.url, D.lang,
+  const bits = [D.title, D.text, D.label, D.url, D.lang, D.by,
                 D.html && stripTags(D.html),
                 Array.isArray(D.items) && D.items.map(i => i && (i.t || i.text)).join(' '),
                 Array.isArray(D.files) && D.files.map(f => f && (f.n + ' ' + (f.t || ''))).join(' ')];
@@ -3968,6 +4548,8 @@ function showMap(on) {
   if (on) drawMap();
 }
 
+// Kinds with a colour of their own on the little map, so they can be picked out at a glance.
+const MAP_COLOR = {output: '#0f9ea0'};
 function drawMap() {
   if (!mapOn || mapBox.hidden) return;
   const w = mapCv.width, hgt = mapCv.height, g = mapCv.getContext('2d');
@@ -3988,11 +4570,21 @@ function drawMap() {
     const [px, py] = at(b.x, b.y);
     const pw = Math.max(2, b.w * k), ph = Math.max(2, b.h * k);
     const D = b.data || {};
-    g.fillStyle = okColor(D.color) || okColor(D.bg) || (b.kind === 'shape' ? 'transparent' : ink);
+    g.fillStyle = okColor(D.color) || okColor(D.bg) || MAP_COLOR[b.kind] || (b.kind === 'shape' ? 'transparent' : ink);
     g.globalAlpha = b.kind === 'shape' ? 1 : .55;
     if (b.kind === 'shape') { g.strokeStyle = okColor(D.color) || ink; g.lineWidth = 1; g.strokeRect(px, py, pw, ph); }
     else g.fillRect(px, py, pw, ph);
     if (S.sel.has(b.id)) { g.globalAlpha = 1; g.strokeStyle = PAL[0]; g.lineWidth = 1.5; g.strokeRect(px, py, pw, ph); }
+  });
+  // the lines too: without them the map shows a scatter of blocks and not the shape of the plan
+  g.lineWidth = 1;
+  S.blocks.forEach(l => {
+    if (l.kind !== 'arrow') return;
+    const p = S.blocks.get(l.data?.from), q = S.blocks.get(l.data?.to); if (!p || !q) return;
+    const [ax, ay] = at(p.x + p.w / 2, p.y + p.h / 2), [bx, by] = at(q.x + q.w / 2, q.y + q.h / 2);
+    g.globalAlpha = S.sel.has(l.id) ? 1 : .4;
+    g.strokeStyle = okColor(l.data.color) || REL[relOf(l)].color || ink;
+    g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke();
   });
   g.globalAlpha = 1;
   const [fx, fy] = at(seen.x0, seen.y0), [fx1, fy1] = at(seen.x1, seen.y1);
@@ -4064,7 +4656,7 @@ board.addEventListener('pointermove', ev => {
 const ctx = $('.ol-ctx');
 const KIND_NAME = {note: 'note', sticky: 'sticky note', text: 'text', code: 'code', proj: 'project',
                    term: 'terminal output', todo: 'checklist', image: 'picture', link: 'link',
-                   ink: 'drawing', arrow: 'line', shape: 'box'};
+                   ink: 'drawing', arrow: 'line', shape: 'box', output: 'output'};
 function closeCtx() {
   ctx.classList.remove('on'); ctx.replaceChildren();
   const sw = $('.ol-switch');
@@ -4133,7 +4725,8 @@ board.addEventListener('contextmenu', ev => {
   if (ev.target.closest('input,textarea,[contenteditable="true"],[contenteditable="plaintext-only"],.ol-ide')) return;
   ev.preventDefault();
   closeMenu();
-  const lineEl = ev.target.closest('.ol-links path.hit');
+  // the bend handle sits on the middle of the line, which is where people aim: it is the line
+  const lineEl = ev.target.closest('.ol-links path.hit, .ol-links circle');
   if (lineEl) {                                    // a joining line is not a block
     const b = S.blocks.get(lineEl.dataset.id);
     if (b) { select([b.id]); ctxBuild(linkItems(b)); ctxOpen(ev.clientX, ev.clientY); }
@@ -4152,16 +4745,97 @@ board.addEventListener('contextmenu', ev => {
   ctxOpen(ev.clientX, ev.clientY);
 }, true);
 
-// Everything you can do to a line joining two blocks.
+// Everything you can do to a line joining two blocks. The top half is what the line means and
+// where it goes; the look of it has its own menu underneath, so this one stays short.
 function linkItems(b) {
   const D = b.data || {}, set = patch => {
     change(b.id, x => { x.data = {...x.data, ...patch}; });
-    if (!('from' in patch) && !('label' in patch)) rememberLine(S.blocks.get(b.id).data);
+    if (!('from' in patch) && !('label' in patch) && !('bend' in patch) && !('step' in patch))
+      rememberLine(S.blocks.get(b.id).data);
   };
-  const ends = D.ends || 'to', form = D.form || 'curve';
+  const ends = D.ends || 'to', form = D.form || 'curve', rel = relOf(b);
   const pick = (label, on, patch) => ({label: (on ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + label, go: () => set(patch)});
+  const a = S.blocks.get(D.from), c = S.blocks.get(D.to);
+  const named = x => x ? (shortName(x) || KIND_NAME[x.kind] || x.kind) : 'the other end';
   return [
     {head: 'line'},
+    {label: 'What it means\u2026', go: () => relMenu(b, ctxWas)},
+    {label: 'Which sides it joins\u2026', go: () => sideMenu(b, ctxWas)},
+    {label: 'How it looks\u2026', go: () => lineLookMenu(b, ctxWas)},
+    {rule: 1},
+    {label: D.label ? 'Change what it says\u2026' : 'Write on the line\u2026', key: 'double-click',
+     go: () => editLabel(S.blocks.get(b.id) || b)},
+    (D.label || D.step) && {label: 'Take the writing off', go: () => set({label: '', step: null})},
+    {rule: 1},
+    {label: `Go to ${named(c)}`, key: 'Enter', go: () => goTo(c)},
+    {label: `Go back to ${named(a)}`, key: 'Shift Enter', go: () => goTo(a)},
+    {label: 'Pick out the whole chain', go: () => {
+      const ids = chainFrom([D.from, D.to]); select(ids);
+      toast(`Picked out ${ids.length} joined up`); }},
+    {rule: 1},
+    {label: 'Number the steps along this chain', go: () => {
+      const k = numberChain(D.from);
+      toast(k ? `Numbered ${k} step${k > 1 ? 's' : ''}` : 'Nothing to number'); }},
+    D.step != null && {label: 'Take the numbers off this chain', go: () => clearSteps(D.from)},
+    {rule: 1},
+    pick('Step round what is in the way', !!D.dodge, {dodge: !D.dodge, bend: null}),
+    D.bend && {label: 'Straighten it again', go: () => set({bend: null})},
+    {label: 'Swap which end points', go: () => set({from: D.to, to: D.from})},
+    {label: 'Delete the line', key: 'Del', warn: 1, go: () => remove([b.id])},
+    {rule: 1},
+    // the shapes and heads are still here, so the menu nobody has to learn again still works
+    {head: 'quickly'},
+    pick('Arrow one way', ends === 'to', {ends: 'to'}),
+    pick('Arrows both ways', ends === 'both', {ends: 'both'}),
+    pick('Plain line, no arrow', ends === 'none', {ends: 'none'}),
+    pick('Curved', form === 'curve', {form: 'curve'}),
+    pick('Straight', form === 'straight', {form: 'straight'}),
+    pick('Right angle', form === 'elbow', {form: 'elbow'}),
+    pick('Dashed', !!D.dash, {dash: !D.dash}),
+    pick('Thicker', !!D.thick, {thick: !D.thick}),
+    {colours: c => set({color: c}), palette: PAL},
+    {label: 'Back to the plain colour', go: () => set({color: null})},
+  ];
+}
+// What the line means. Picking one sets the look that goes with it; your own label, if you wrote
+// one, is left alone and shown instead of the word.
+function relMenu(b, at) {
+  const D = b.data || {}, rel = relOf(b);
+  const set = patch => change(b.id, x => { x.data = {...x.data, ...patch}; });
+  const items = [{head: 'what it means'}];
+  Object.keys(REL).forEach(k => items.push({
+    label: (rel === k ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + REL[k].name,
+    go: () => set({rel: k, ...relLook(k)}),
+  }));
+  items.push({rule: 1},
+    {label: (D.relword === false ? '\u00a0\u00a0\u00a0 ' : '\u2713  ') + 'Write what it means on the line',
+     go: () => set({relword: D.relword === false})});
+  ctxBuild(items); ctxOpen(at ? at.x : innerWidth / 2, at ? at.y : 120, true);
+}
+// Which side of each block the line attaches to. Worked out from where the block is, so the
+// choice sticks as the blocks are dragged about.
+function sideMenu(b, at) {
+  const D = b.data || {};
+  const a = S.blocks.get(D.from), c = S.blocks.get(D.to);
+  const named = x => x ? (shortName(x) || KIND_NAME[x.kind] || x.kind).slice(0, 18) : 'the other end';
+  const set = patch => change(b.id, x => { x.data = {...x.data, ...patch}; });
+  const row = (key, cur) => Object.keys(SIDES).map(s => ({
+    label: (cur === s ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + SIDES[s], go: () => set({[key]: s}),
+  }));
+  const items = [{head: 'from ' + named(a)},
+    {label: (!D.a ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + 'Whichever way it faces', go: () => set({a: null})},
+    ...row('a', D.a),
+    {rule: 1}, {head: 'to ' + named(c)},
+    {label: (!D.b ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + 'Whichever way it faces', go: () => set({b: null})},
+    ...row('b', D.b)];
+  ctxBuild(items); ctxOpen(at ? at.x : innerWidth / 2, at ? at.y : 120, true);
+}
+function lineLookMenu(b, at) {
+  const D = b.data || {}, ends = D.ends || 'to', form = D.form || 'curve';
+  const set = patch => { change(b.id, x => { x.data = {...x.data, ...patch}; });
+    rememberLine(S.blocks.get(b.id).data); };
+  const pick = (label, on, patch) => ({label: (on ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + label, go: () => set(patch)});
+  const items = [{head: 'how it looks'},
     pick('Arrow one way', ends === 'to', {ends: 'to'}),
     pick('Arrows both ways', ends === 'both', {ends: 'both'}),
     pick('Plain line, no arrow', ends === 'none', {ends: 'none'}),
@@ -4172,24 +4846,18 @@ function linkItems(b) {
     {rule: 1},
     pick('Dashed', !!D.dash, {dash: !D.dash}),
     pick('Thicker', !!D.thick, {thick: !D.thick}),
-    {label: D.label ? 'Change the label\u2026' : 'Write on the line\u2026', go: () => {
-      const v = prompt('A word or two for the middle of the line', D.label || '');
-      if (v !== null) set({label: v.trim().slice(0, 60)}); }},
-    D.label && {label: 'Take the label off', go: () => set({label: ''})},
     {colours: c => set({color: c}), palette: PAL},
     {label: 'Back to the plain colour', go: () => set({color: null})},
     {rule: 1},
-    {rule: 1},
+    {label: 'Use this look for new lines', go: () => {
+      rememberLine(S.blocks.get(b.id).data); toast('New lines will look like this one'); }},
     {label: 'New lines go back to the usual look', go: () => {
-      store.set('olLine', null); toast('New lines: right angle, no arrow, dashed'); }},
-    {rule: 1},
-    {label: 'Swap which end points', go: () => set({from: D.to, to: D.from})},
-    {label: 'Delete the line', key: 'Del', warn: 1, go: () => remove([b.id])},
-  ];
+      store.set('olLine', null); toast('New lines: right angle, no arrow, dashed'); }}];
+  ctxBuild(items); ctxOpen(at ? at.x : innerWidth / 2, at ? at.y : 120, true);
 }
 
 // The blocks that carry a name of their own, and where it lives.
-const TITLED = {code: 'title', proj: 'title', term: 'title', todo: 'title', link: 'title', shape: 'text'};
+const TITLED = {code: 'title', proj: 'title', term: 'title', todo: 'title', link: 'title', shape: 'text', output: 'title'};
 function renameBlock(b) {
   const field = TITLED[b.kind];
   if (!field) return toast('That one has no name \u2014 press Enter to edit what is in it');
@@ -4201,7 +4869,7 @@ function renameBlock(b) {
 }
 
 // Which blocks can be dressed up, and in what.
-const CAN_SIZE = ['note', 'sticky', 'text', 'todo', 'shape', 'link', 'code', 'term', 'proj'];
+const CAN_SIZE = ['note', 'sticky', 'text', 'todo', 'shape', 'link', 'code', 'term', 'proj', 'output'];
 const CAN_STYLE = ['note', 'sticky', 'text', 'todo', 'shape', 'link'];
 const baseSize = b => b.kind === 'text' ? (b.data.size || 40)
   : (b.data.fs || (b.kind === 'sticky' ? 16 : b.kind === 'code' || b.kind === 'term' ? 12.5 : b.kind === 'proj' ? 11.5 : 15));
@@ -4274,14 +4942,37 @@ function blockItems(b, sel) {
     catch (_) { return ''; }
   };
   const D = b.data || {}, lock = locked(b);
-  const shape = b.kind === 'shape';
+  const shape = b.kind === 'shape', out_ = b.kind === 'output';
   const setD = patch => change(b.id, x => { x.data = {...x.data, ...patch}; });
   return [
     {head: many ? sel.length + ' blocks' : (KIND_NAME[b.kind] || b.kind)},
     !many && !lock && TITLED[b.kind] && {label: 'Rename\u2026', key: 'F2', go: () => renameBlock(b)},
     !many && !lock && {label: 'Draw a line from here', key: 'A', go: () => startLink(b.id)},
+    !many && linesOn(b.id).length && {label: `Pick out everything joined to this`, go: () => {
+      const ids = chainFrom([b.id]); select(ids); toast(`Picked out ${ids.length} joined up`); }},
+    !many && linesOn(b.id).length === 1 && {label: 'Follow its line', go: () => {
+      const l = linesOn(b.id)[0];
+      goTo(S.blocks.get(l.data.from === b.id ? l.data.to : l.data.from)); }},
     !many && coding && {label: 'Open in the editor', key: 'Enter', go: () => startEdit(b.id)},
     !many && coding && {label: 'Run it', key: 'F5', go: () => boardRun(b)},
+    !many && out_ && {label: 'Run the code again', key: 'F5', go: () => outRun(b)},
+    !many && out_ && feederOf(b.id) && {label: 'Show me the code it comes from', go: () => {
+      const s = S.blocks.get(feederOf(b.id)); if (!s) return; select([s.id]); fit([s]); }},
+    !many && out_ && !feederOf(b.id) && {label: 'Join it to a code block\u2026', go: () => {
+      startLink(b.id); toast('Now click the code block it should show'); }},
+    !many && out_ && {label: 'Open it on its own', go: () => outBig(b)},
+    !many && out_ && {label: 'Copy what is in it', go: () =>
+      navigator.clipboard.writeText(b.data.text || '').then(() => toast('Copied')).catch(() => {})},
+    !many && out_ && {label: 'Clear it', go: () => outClear(b)},
+    !many && out_ && {rule: 1},
+    !many && out_ && {label: 'Show it as\u2026', go: () => outShowMenu(b, ctxWas)},
+    !many && out_ && {label: 'How tall\u2026', go: () => outTallMenu(b, ctxWas)},
+    !many && out_ && {label: (D.wrap === false ? '\u00a0\u00a0\u00a0 ' : '\u2713  ') + 'Wrap long lines',
+                      go: () => setD({wrap: D.wrap === false})},
+    !many && out_ && {label: (D.add === true ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + 'Keep what came before',
+                      go: () => setD({add: D.add !== true})},
+    !many && out_ && {label: (D.stamp === false ? '\u00a0\u00a0\u00a0 ' : '\u2713  ') + 'Say who ran it',
+                      go: () => setD({stamp: D.stamp === false})},
     !many && !coding && !plain &&
       {label: b.kind === 'todo' ? 'Edit the list' : 'Edit the text', key: 'Enter', go: () => startEdit(b.id)},
     !many && b.kind === 'todo' && {label: 'Add an item', go: () => addItem(b)},
@@ -4298,10 +4989,7 @@ function blockItems(b, sel) {
     !many && !!text() && {label: 'Copy the text',
       go: () => navigator.clipboard.writeText(text()).then(() => toast('Copied'))},
     {rule: 1},
-    {label: many ? 'Copy them' : 'Copy', key: 'Ctrl C', go: () => {
-      const list = sel.map(i => S.blocks.get(i)).filter(Boolean);
-      navigator.clipboard.writeText('bb-online:' + JSON.stringify(list));
-      toast(`Copied ${list.length} block${list.length > 1 ? 's' : ''}`); }},
+    {label: many ? 'Copy them' : 'Copy', key: 'Ctrl C', go: () => copySel(sel)},
     {label: many ? 'Duplicate them' : 'Duplicate', key: 'Ctrl D', go: () => duplicate(sel, 24)},
     {label: 'Bring to the front', go: () => toFront(sel)},
     {label: 'Send to the back', go: () => toBack(sel)},
@@ -4869,7 +5557,8 @@ function spaceItems(p) {
     {label: LAYOUTS.board.name, go: () => dropLayout('board', p)},
     {label: LAYOUTS.revision.name, go: () => dropLayout('revision', p)},
     {rule: 1},
-    {label: 'Paste here', key: 'Ctrl V', go: () => pasteAt(p)},
+    {label: Clip.count() ? `Paste ${Clip.count()} copied block${Clip.count() > 1 ? 's' : ''} here` : 'Paste here',
+     key: 'Ctrl V', go: () => pasteAt(p)},
     {label: 'Find on the board\u2026', key: 'Ctrl F', go: openFind},
     {label: (mapOn ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + 'Map of the board', key: 'M',
      go: () => showMap(!mapOn)},
@@ -4896,17 +5585,12 @@ function spaceItems(p) {
 // refused, in which case say what to press instead of appearing to do nothing.
 async function pasteAt(p) {
   let t = '';
-  try { t = await navigator.clipboard.readText(); } catch (_) { return toast('Press Ctrl+V to paste here'); }
-  if (!t.trim()) return toast('Nothing to paste');
+  try { t = await navigator.clipboard.readText(); } catch (_) { t = ''; }
   if (t.startsWith('bb-online:')) {
-    try {
-      const list = JSON.parse(t.slice(10));
-      list.forEach(b => S.blocks.has(b.id) || S.blocks.set(b.id, {...b, _ghost: true}));
-      duplicate(list.map(b => b.id), 30);
-      list.forEach(b => S.blocks.get(b.id)?._ghost && S.blocks.delete(b.id));
-    } catch (_) { toast('That copy could not be read'); }
-    return;
+    try { if (pasteRows(JSON.parse(t.slice(10)), p)) return; } catch (_) {}
   }
+  // the computer's clipboard is empty, or was refused: fall back to the copy kept in the page
+  if (!t.trim()) { if (pasteRows(Clip.rows(), p)) return; return toast('Nothing to paste'); }
   addText(t, p);
 }
 
@@ -4929,6 +5613,9 @@ nav && nav.addEventListener('click', () => setTimeout(() => { start(); R.focus({
 if (document.querySelector('#online.on')) start();
 new MutationObserver(() => { if (document.querySelector('#online.on')) start(); }).observe(document.getElementById('online'), {attributes: true, attributeFilter: ['class']});
 window.bbWriting = Writing;
-window.bbOnline = {S, IDE, run, add, fit, placeCode, codeFiles, select, autoCmd, start, useLocal, incoming, sniff, guessLang, clean, paint, place, put, drawLinks, startEdit, tidy, dropLayout, Writing, view: v => { S.view = v; applyView(); }};
+window.bbOnline = {S, IDE, run, add, fit, placeCode, codeFiles, select, autoCmd, start, useLocal, incoming, sniff, guessLang, clean, paint, place, put, drawLinks, startEdit, tidy, dropLayout, Writing,
+  Clip, copySel, pasteRows, duplicate, toFront, toBack, stackOrder, outputsOf, feederOf, outRun, outBig, outShow, boardRun, remove,
+  REL, relOf, lineText, linkPath, chainFrom, numberChain, clearSteps, goTo, editLabel, linesOn, inTheWay,
+  view: v => { S.view = v; applyView(); }};
 })();
 """

@@ -24,13 +24,16 @@ def main(message=None):
         print("This folder is not a git repository yet. Run: git init")
         return 1
 
-    remote = git("remote", "get-url", "origin", quiet=True)
-    if remote.returncode:
+    # whichever remote this repository has - origin if there is one, otherwise the first
+    names = [n for n in git("remote", quiet=True).stdout.split() if n]
+    name = "origin" if "origin" in names else (names[0] if names else None)
+    if not name:
         print("No GitHub repository is linked yet. Make one at https://github.com/new,")
         print("then run:\n")
         print('  git remote add origin https://github.com/<you>/blackboard-buddy.git')
         print("  git push -u origin main")
         return 1
+    remote = git("remote", "get-url", name)
 
     # anything private that slipped past .gitignore stops the whole thing
     staged = git("status", "--porcelain").stdout.splitlines()
@@ -48,7 +51,7 @@ def main(message=None):
             return 1
         print("Committed:", msg)
 
-    push = git("push", "origin", "HEAD")
+    push = git("push", name, "HEAD")
     if push.returncode:
         print("Could not push. If it is asking to sign in, run `git push` once in a terminal.")
         return 1
