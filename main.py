@@ -18,6 +18,7 @@ import sys
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 import markdown
@@ -26,8 +27,9 @@ from dotenv import load_dotenv
 import online
 import vault as notebook
 
+IS_MAC = sys.platform == "darwin"
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-LOCAL = Path(os.getenv("LOCALAPPDATA", HERE)) / "BlackboardBuddy"
+LOCAL = (Path.home() / "Library" / "Application Support" if IS_MAC else Path(os.getenv("LOCALAPPDATA", HERE))) / "BlackboardBuddy"
 
 
 def _writable(folder):
@@ -42,19 +44,30 @@ def _writable(folder):
 
 # Your key, data and notes live next to the app; if that folder is read-only
 # (say the app was opened straight from a zip), they go in your Windows profile instead.
-BASE = HERE if _writable(HERE) else LOCAL
+# On a Mac the app is a sealed bundle that an update replaces whole, so everything lives in Application Support.
+BASE = LOCAL if IS_MAC and getattr(sys, "frozen", False) else HERE if _writable(HERE) else LOCAL
 BASE.mkdir(parents=True, exist_ok=True)
+
+
+def open_path(path):
+    """Open a file, folder or web address in its own app: Explorer and friends, or Finder on a Mac."""
+    if IS_MAC:
+        import subprocess
+        subprocess.Popen(["open", str(path)])
+    else:
+        os.startfile(path)
 ENV = BASE / ".env"
 load_dotenv(ENV)
 
 BB_URL = os.getenv("BB_URL", "https://blackboard.uwe.ac.uk")
-VERSION = "1.1.0"  # bump this for every release you upload
-UPDATE_REPO = ""  # GitHub "owner/repo" whose Releases hold new versions; empty = no update checks
+VERSION = "1.2.0"  # bump this for every release you upload
+UPDATE_REPO = "CatForSale/blackboard-buddy-releases"  # GitHub "owner/repo" whose Releases hold new versions; empty = no update checks
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "45"))
 NOTES_DAYS = int(os.getenv("NOTES_DAYS", "14"))
 NOTES_PER_RUN = int(os.getenv("NOTES_PER_RUN", "8"))
 PLANS_PER_RUN = int(os.getenv("PLANS_PER_RUN", "6"))
 AI_EFFORT = os.getenv("AI_EFFORT", "medium")
+AI_NEW = False   # whether the last run_ai wrote anything new
 
 DATA_DIR = BASE / "data"
 notebook.ROOT = BASE / "Notebook"
@@ -65,6 +78,7 @@ MATERIALS_NAME = "Blackboard study files"
 SNAPSHOT = DATA_DIR / "snapshot.json"
 CACHE = DATA_DIR / "ai-cache.json"
 SETTINGS = DATA_DIR / "settings.json"
+SHARED = DATA_DIR / "shared"            # the notes someone shared with you, when you follow them
 ACTIVITY = DATA_DIR / "activity.json"
 SPEND = DATA_DIR / "spend.json"
 DONE = DATA_DIR / "done.json"           # assignments you've ticked off yourself, as "course|title"
@@ -155,6 +169,105 @@ def set_env(name, value):
 def display_name(snapshot):
     """The name typed on the welcome screen, else the first name Blackboard has."""
     return os.getenv("USER_NAME") or snapshot["me"].get("name", "")
+
+
+def following():
+    """Whose shared notes this app shows instead of its own Blackboard sync, or None."""
+    f = load_json(SETTINGS, {}).get("follow")
+    return f if isinstance(f, dict) and f.get("code") else None
+
+
+def snap_file():
+    return SHARED / "snapshot.json" if following() else SNAPSHOT
+
+
+def ai_file():
+    return SHARED / "ai-latest.json" if following() else DATA_DIR / "ai-latest.json"
+
+
+def share_payload():
+    """Your synced Blackboard and Claude's notes, minus anything personal: no marks, feedback, submission
+    status, Blackboard ID or file paths on this computer. Returns None before the first sync."""
+    snap = load_json(SNAPSHOT, None)
+    if not snap:
+        return None
+    ai = load_json(DATA_DIR / "ai-latest.json", {})
+    keep_gb = ("id", "name", "description", "due", "contentId", "possible", "overall")
+    courses = []
+    for c in snap.get("courses", []):
+        c = dict(c)
+        c["gradebook"] = [{k: g.get(k) for k in keep_gb} for g in c.get("gradebook") or []]
+        c["contents"] = [{**{k: v for k, v in i.items() if k != "files"}, "files": []} for i in c.get("contents") or []]
+        courses.append(c)
+    return {"v": 1, "from": os.getenv("USER_NAME") or "", "synced": snap.get("synced"),
+            "snapshot": {"synced": snap.get("synced"), "me": {"id": None, "userName": "", "name": ""},
+                         "courses": courses, "calendar": snap.get("calendar") or []},
+            "ai": {"briefing": ai.get("briefing"), "plans": ai.get("plans") or [], "notes": ai.get("notes") or []}}
+
+
+class _Clean(HTMLParser):
+    """Keeps plain formatting tags and https links; drops scripts, styles, embeds and every other attribute."""
+    OK = {"p", "br", "b", "strong", "i", "em", "u", "s", "ul", "ol", "li", "a", "span", "div", "h1", "h2", "h3", "h4",
+          "h5", "h6", "table", "thead", "tbody", "tr", "td", "th", "blockquote", "code", "pre", "hr", "sub", "sup"}
+    DROP = {"script", "style", "iframe", "object", "embed", "svg", "math", "template", "noscript", "textarea",
+            "select", "form", "frame", "frameset", "title", "head"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.DROP:
+            self.skip += 1
+            return
+        if self.skip or tag not in self.OK:
+            return
+        a = dict(attrs)
+        extra = ""
+        if tag == "a" and re.match(r"(https?://|mailto:|#)", (a.get("href") or "").strip(), re.I):
+            extra = f' href="{html.escape(a["href"].strip())}" target="_blank" rel="noopener"'
+        if tag == "code" and re.fullmatch(r"language-[\w+-]{1,30}", a.get("class") or ""):
+            extra = f' class="{a["class"]}"'
+        self.out.append(f"<{tag}{extra}>")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag not in self.DROP:
+            self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag in self.DROP:
+            self.skip = max(0, self.skip - 1)
+        elif not self.skip and tag in self.OK and tag != "br":
+            self.out.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(html.escape(data, quote=False))
+
+
+def safe_html(text):
+    c = _Clean()
+    c.feed(str(text or ""))
+    c.close()
+    return "".join(c.out)
+
+
+def defang_share(x, key=""):
+    """Someone else's shared notes are shown inside this app, so nothing in them may run: page HTML is cut
+    down to plain formatting, addresses must be https, and other text can't open a tag."""
+    if isinstance(x, dict):
+        return {str(k)[:60]: defang_share(v, str(k)) for k, v in x.items()}
+    if isinstance(x, list):
+        return [defang_share(v, key) for v in x]
+    if not isinstance(x, str):
+        return x if isinstance(x, (int, float, bool)) or x is None else None
+    if key in ("body", "html", "description"):
+        return safe_html(x)
+    if key == "url":
+        return x if x.startswith("https://") and '"' not in x else ""
+    if key in ("md", "briefing"):
+        return x      # Markdown: md() cleans what it makes while following someone
+    return x.replace("<", "‹")
 
 
 def settings():
@@ -303,7 +416,8 @@ def released_grades(snapshot):
 
 # ---------------------------------------------------------------- AI
 
-def run_ai(snapshot, bb, deadlines, announcements, grades):
+def run_ai(snapshot, bb, deadlines, announcements, grades, old=None):
+    global AI_NEW
     from ai import AI, file_to_blocks
     import anthropic
 
@@ -312,12 +426,6 @@ def run_ai(snapshot, bb, deadlines, announcements, grades):
     results = {"briefing": None, "plans": [], "notes": [], "feedback": None}
     today = datetime.now().strftime("%A %d %B %Y")
     by_id = {c["id"]: c for c in snapshot["courses"]}
-
-    def cached(key, fn):
-        if key not in cache:
-            cache[key] = fn()
-            save_json(CACHE, cache)
-        return cache[key]
 
     def item_blocks(course_id, item):
         blocks = []
@@ -329,6 +437,42 @@ def run_ai(snapshot, bb, deadlines, announcements, grades):
                 blocks += file_to_blocks(att["fileName"], data)
         return blocks
 
+    # Downloads go through the one browser, so they happen first, in order; then everything that needs
+    # writing is asked of Claude side by side (four at a time) instead of one after another.
+    jobs = {}   # cache key -> (what the status says, the call that writes it)
+
+    def want(key, label, fn):
+        if key not in cache and key not in jobs:
+            jobs[key] = (label, fn)
+
+    def ask_all():
+        if not jobs:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        def job(label, fn):
+            log(label)
+            return fn()
+        err = None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {k: pool.submit(job, *v) for k, v in jobs.items()}
+            for k, f in futures.items():
+                try:
+                    cache[k] = f.result()
+                except Exception as e:   # keep what did get written, then report the first problem
+                    err = err or e
+        save_json(CACHE, cache)
+        if err:
+            raise err
+
+    bkey = gkey = None
+    plan_rows, note_rows = [], []
+    # every item that had notes before, so a changed file gets fresh notes however old it is
+    had = {}
+    for k in cache:
+        if k.startswith("notes:"):
+            had.setdefault(k.split(":")[1], []).append(k)
+    old_items = {c["id"]: {i["id"] for i in c.get("contents", [])} for c in (old or {}).get("courses", [])}
     try:
         brief_in = (
             today,
@@ -340,70 +484,87 @@ def run_ai(snapshot, bb, deadlines, announcements, grades):
         # same day and nothing new on Blackboard: reuse the briefing instead of paying again
         # bump v2 when the briefing prompt changes
         bkey = "briefing:v2:" + hashlib.sha1(json.dumps(brief_in, default=str, sort_keys=True).encode()).hexdigest()
-        if bkey not in cache:
-            log("AI: writing weekly briefing")
-        results["briefing"] = cached(bkey, lambda: ai.weekly_briefing(*brief_in))
+        want(bkey, "AI: writing weekly briefing", lambda: ai.weekly_briefing(*brief_in))
 
         open_tasks = [d for d in deadlines if not d["submitted"] and d["due"] > now()]
         for d in open_tasks[:PLANS_PER_RUN]:
             course = by_id.get(d["courseId"], {})
             item = next((i for i in course.get("contents", []) if i["id"] == d.get("contentId")), None)
             key = f"plan:{d['courseId']}:{d['title']}:{d['due'].isoformat()}:{(item or {}).get('modified')}"
-            log(f"AI: assignment plan for {d['title']}")
+            plan_rows.append((d, key))
+            if key in cache:
+                continue
             col = next((c for c in course.get("gradebook", []) if c["id"] == d.get("columnId")), {})
             info = {"title": d["title"], "due": d["due"].strftime("%A %d %B %Y %H:%M"),
                     "points_possible": col.get("possible"),
                     "description": strip_html(col.get("description", "")),
                     "instructions": strip_html((item or {}).get("body", ""))}
-            md = cached(key, lambda: ai.assignment_plan(
-                course.get("name", d["course"]), info,
-                item_blocks(d["courseId"], item) if item else [], today))
-            results["plans"].append({"course": d["course"], "title": d["title"], "due": d["due"], "md": md})
+            blocks = item_blocks(d["courseId"], item) if item else []
+            want(key, f"AI: assignment plan for {d['title']}",
+                 lambda name=course.get("name", d["course"]), info=info, blocks=blocks: ai.assignment_plan(name, info, blocks, today))
 
+        # Notes are written for: anything changed in the last NOTES_DAYS, anything that had notes and has
+        # changed since (in any module, however old), and anything newly added to a module seen before.
+        # A module seen for the first time doesn't count as all new, so adding earlier years costs nothing.
         cutoff = now() - timedelta(days=NOTES_DAYS)
         candidates = []
         for c in snapshot["courses"]:
             for i in c["contents"]:
                 changed = parse_date(i.get("modified") or i.get("created"))
-                if changed and changed >= cutoff and i["handler"] in FILE_HANDLERS \
+                renewed = i["id"] in had
+                added = c["id"] in old_items and i["id"] not in old_items[c["id"]]
+                if changed and (changed >= cutoff or renewed or added) and i["handler"] in FILE_HANDLERS \
                         and i["handler"] != "resource/x-bb-folder" and not ADMIN_PAGES.search(i["path"]) \
                         and not re.search(r"\.(csv|xlsx?|zip)$", i["title"], re.I):
-                    candidates.append((changed, c, i))
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        new_count = 0
-        for changed, c, i in candidates:
+                    candidates.append((changed, c, i, renewed))
+        candidates.sort(key=lambda x: (x[3], x[0]), reverse=True)    # refreshes first, then newest
+        new_count = renewed_count = 0
+        for changed, c, i, renewed in candidates:
             key = f"notes:{i['id']}:{i.get('modified')}"
             if key not in cache:
-                if new_count >= settings()["notes_per_sync"]:
+                # refreshing notes you already had has its own allowance, so it never waits behind new files
+                if (renewed_count >= 20) if renewed else (new_count >= settings()["notes_per_sync"]):
                     continue
                 blocks = item_blocks(c["id"], i)
                 if not blocks:
                     continue
-                log(f"AI: study notes for {i['title']}")
-                new_count += 1
-                cached(key, lambda: ai.study_notes(c["name"], i["path"], blocks))
-            results["notes"].append({"course": c["name"], "title": i["title"], "path": i["path"],
-                                     "changed": changed, "md": cache[key]})
-        # keep older notes too (including ones made on demand from the Notes tab)
-        have = {(n["course"], n["path"]) for n in results["notes"]}
-        for c in snapshot["courses"]:
-            for i in c["contents"]:
-                key = f"notes:{i['id']}:{i.get('modified')}"
-                if key in cache and (c["name"], i["path"]) not in have:
-                    results["notes"].append({"course": c["name"], "title": i["title"], "path": i["path"],
-                                             "changed": parse_date(i.get("modified") or i.get("created")),
-                                             "md": cache[key]})
+                if renewed:
+                    renewed_count += 1
+                else:
+                    new_count += 1
+                want(key, f"AI: study notes for {i['title']}", lambda name=c["name"], path=i["path"], blocks=blocks: ai.study_notes(name, path, blocks))
+            note_rows.append((changed, c, i, key))
 
         if grades:
             gkey = "feedback:" + hashlib.sha1(json.dumps(grades, sort_keys=True).encode()).hexdigest()
-            log("AI: summarising grades and feedback")
-            results["feedback"] = cached(gkey, lambda: ai.grade_feedback(grades))
+            want(gkey, "AI: summarising grades and feedback", lambda: ai.grade_feedback(grades))
+        ask_all()
     except anthropic.AuthenticationError:
         log("AI skipped: your ANTHROPIC_API_KEY in .env is missing or invalid.")
     except anthropic.APIConnectionError:
         log("AI stopped: could not reach the Claude API (check your internet).")
     except anthropic.APIStatusError as e:
         log(f"AI stopped: Claude API error {e.status_code}: {e.message}")
+
+    AI_NEW = bool(jobs)
+    # whatever got written (all of it, unless something went wrong part way)
+    results["briefing"] = cache.get(bkey)
+    results["plans"] = [{"course": d["course"], "title": d["title"], "due": d["due"], "md": cache[key]}
+                        for d, key in plan_rows if key in cache]
+    results["notes"] = [{"course": c["name"], "title": i["title"], "path": i["path"], "changed": changed, "md": cache[key]}
+                        for changed, c, i, key in note_rows if key in cache]
+    # keep older notes too (including ones made on demand from the Notes tab)
+    have = {(n["course"], n["path"]) for n in results["notes"]}
+    for c in snapshot["courses"]:
+        for i in c["contents"]:
+            key = f"notes:{i['id']}:{i.get('modified')}"
+            if key not in cache and had.get(i["id"]):    # changed, new notes not written yet: keep the last ones
+                key = max(had[i["id"]])
+            if key in cache and (c["name"], i["path"]) not in have:
+                results["notes"].append({"course": c["name"], "title": i["title"], "path": i["path"],
+                                         "changed": parse_date(i.get("modified") or i.get("created")),
+                                         "md": cache[key]})
+    results["feedback"] = cache.get(gkey) if gkey else None
 
     log(f"AI cost this run: about ${ai.cost:.2f}")
     add_spend(ai.cost)
@@ -541,6 +702,38 @@ def sync_materials(bb, courses, old_snapshot):
                     i["files"].append(entry)
             except Exception as ex:
                 log(f"Couldn't save files from {i['title']}: {ex!r}")
+
+
+def term_start(courses):
+    """Monday of teaching week 1, in milliseconds. Module codes end in things like "26sep" (the
+    September 2026 intake), and UWE teaching starts on the Monday on or after the 18th of that month
+    (12th for a January start)."""
+    seen = {}
+    for c in courses:
+        m = re.search(r"(\d{2})(sep|jan)", c.lower())
+        if m:
+            seen[m.groups()] = seen.get(m.groups(), 0) + 1
+    if seen:
+        yy, mon = max(seen, key=seen.get)
+        d = datetime(2000 + int(yy), 9 if mon == "sep" else 1, 18 if mon == "sep" else 12)
+    else:
+        t = datetime.now()
+        d = datetime(t.year if t.month >= 8 else t.year - 1, 9, 18)
+    d += timedelta(days=(7 - d.weekday()) % 7)
+    return int(d.timestamp() * 1000)
+
+
+def said_week(*texts):
+    """The teaching week a note's own title or folder names ("Week 5", "Wk5"), or 0."""
+    m = re.search(r"\bw(?:ee)?k\s*0?(\d{1,2})(?!\d)", " ".join(t or "" for t in texts), re.I)
+    return int(m.group(1)) if m and 0 < int(m.group(1)) <= 30 else 0
+
+
+def when_ms(value):
+    try:
+        return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
+    except (TypeError, ValueError):
+        return 0
 
 
 def heading_topic(n):
@@ -771,6 +964,32 @@ html.busy .pointer-ring::after{content:"";position:absolute;inset:-1.4px;border-
 html.no-anim .pointer-ring,html.no-anim .pointer-dot{transition:none}
 html.no-anim.busy .pointer-ring::after{animation:none;border-color:var(--red)}
 
+/* ---- no Claude key yet: just Online and Notebook */
+html.locked nav button[data-tab]:not([data-tab=online]):not([data-tab=notebook]),html.locked .refresh{display:none!important}
+html.following nav button[data-tab=grades]{display:none!important}
+.sh-about{font-size:13px;line-height:1.5;color:var(--muted);margin:0 0 10px}
+.sh-card{border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:0 0 16px;display:flex;flex-direction:column;gap:10px}
+.sh-code{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sh-code b{font:700 26px/1 var(--mono);letter-spacing:.12em}
+.sh-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.sh-card small{color:var(--muted);font-size:12px;line-height:1.45}
+.sh-in{flex:1;min-width:140px;border:1px solid var(--line);border-radius:10px;padding:9px 11px;font:15px var(--mono);letter-spacing:.1em;text-transform:uppercase;background:var(--inset);color:var(--text)}
+.sh-who{font-size:14px}
+.sh-msg{display:block;min-height:16px;color:var(--red);font-size:12.5px}
+.follow-note{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px;padding:9px 14px;border-radius:14px;background:var(--inset);font-size:13px}
+.follow-note i{width:8px;height:8px;border-radius:50%;background:#2fd27a;box-shadow:0 0 0 4px rgba(47,210,122,.18);flex:none}
+.follow-note button{margin-left:auto;border:0;background:none;color:var(--text);text-decoration:underline;cursor:pointer;font:inherit}
+.unlock-b{margin-left:6px;border:1px solid var(--red);background:transparent;color:var(--red);border-radius:999px;padding:6px 12px;
+ font:10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
+.unlock-b:hover{background:var(--red);color:#fff}
+.unlock{position:fixed;inset:0;z-index:90;display:grid;place-items:center;background:rgba(0,0,0,.55);backdrop-filter:blur(10px)}
+.unlock-card{width:min(420px,90vw);padding:26px;border-radius:22px;background:var(--bg);color:var(--text);border:1px solid var(--line);box-shadow:0 24px 70px rgba(0,0,0,.35)}
+.unlock-card h2{margin:0 0 6px} .unlock-card p{color:var(--muted);font-size:13.5px;margin:0 0 10px}
+.unlock-card label{display:block;margin:12px 0 5px;font:10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.unlock-card input{width:100%;box-sizing:border-box;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:transparent;color:inherit;font:inherit}
+.unlock-card .umsg{color:var(--red);min-height:1em;margin-top:10px}
+.unlock-card .ubtns{display:flex;gap:8px;justify-content:flex-end}
+
 /* ---- where to put the window: our own Snap Layouts, since frameless loses the real one */
 .snapmenu{position:fixed;top:38px;right:12px;z-index:62;display:none;grid-template-columns:repeat(4,1fr);gap:5px;padding:8px;
  border-radius:14px;background:var(--card);border:1px solid var(--line);box-shadow:0 16px 44px rgba(0,0,0,.26)}
@@ -780,7 +999,7 @@ html.no-anim.busy .pointer-ring::after{animation:none;border-color:var(--red)}
 .snapmenu button:hover{border-color:var(--text);background:var(--inset)}
 .snapmenu i{position:absolute;background:var(--text);opacity:.75;border-radius:2px}
 .snapmenu .sl{inset:5px 50% 5px 5px} .snapmenu .sr{inset:5px 5px 5px 50%}
-.snapmenu .sf{inset:5px} .snapmenu .st{inset:5px 5px 50% 5px}
+.snapmenu .sf{inset:5px} .snapmenu .stop{inset:5px 5px 50% 5px}
 .snapmenu .stl{inset:5px 50% 50% 5px} .snapmenu .str{inset:5px 5px 50% 50%}
 .snapmenu .sbl{inset:50% 50% 5px 5px} .snapmenu .sbr{inset:50% 5px 5px 50%}
 .snapmenu .swin{font-size:14px;line-height:1;color:var(--muted)}
@@ -871,6 +1090,8 @@ html.no-anim.busy .pointer-ring::after{animation:none;border-color:var(--red)}
  position:fixed;top:0;left:0;right:0;height:38px;z-index:9;display:none;
  align-items:center;justify-content:center;pointer-events:auto}
 .app .titlebar,.setup .titlebar{display:flex}
+/* a Mac window keeps its own title bar and traffic lights, so none of the drawn ones */
+html.mac .titlebar,html.mac .wctl,html.mac .redge,html.mac .snapmenu{display:none!important}
 html.intro-on .titlebar span{opacity:0}
 .titlebar button,.titlebar a{app-region:no-drag;-webkit-app-region:no-drag}
 .titlebar span{font:9.5px var(--mono);letter-spacing:.26em;color:var(--muted);opacity:.65;user-select:none;
@@ -930,6 +1151,86 @@ html.intro-on .acct,html.intro-on .ask{opacity:0}
 .sheet .label{margin:14px 2px 2px}
 .who{display:flex;align-items:center;gap:14px} .who b{display:block;font-size:18px} .who .sub{margin:2px 0 0}
 .av.big{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;background:var(--text);color:var(--bg);font-size:26px}
+/* profile card */
+.acct .av[data-shape]{width:34px;height:34px;display:grid;place-items:center;font-size:16px;border-radius:50%}
+.av[data-shape=square],.pc-av[data-shape=square]{border-radius:12px}
+.av[data-shape=hex],.pc-av[data-shape=hex]{border-radius:0;clip-path:polygon(25% 5%,75% 5%,100% 50%,75% 95%,25% 95%,0 50%)}
+.pcard{position:relative;border-radius:22px;overflow:hidden;border:1px solid var(--line);margin:8px 0 6px;background:rgba(127,127,127,.06);--pc:#d71921}
+.pc-ban{height:80px;transition:background .3s;position:relative;overflow:hidden}
+.pc-av{position:absolute;left:18px;top:42px;width:68px;height:68px;display:grid;place-items:center;font:800 30px/1 var(--dotf);
+ text-transform:uppercase;border-radius:50%;box-shadow:0 0 0 4px var(--bg),0 0 0 6px var(--pc),0 10px 28px rgba(0,0,0,.35);transition:border-radius .2s}
+.pc-av[data-shape=hex]{box-shadow:none;filter:drop-shadow(0 6px 14px rgba(0,0,0,.4))}
+.pc-txt{padding:38px 18px 16px;display:flex;flex-direction:column;gap:4px}
+.pc-name{font:800 22px/1.1 var(--dotf);letter-spacing:.03em;overflow-wrap:anywhere}
+.pc-tag{font-size:13px} .pc-tag:empty,.pc-meta:empty{display:none}
+.pc-meta{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}
+.pc-meta::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--pc);margin-right:7px;vertical-align:1px}
+.pc-open{position:absolute;right:12px;top:90px;border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;
+ padding:6px 14px;font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:border-color .2s}
+.pc-open:hover{border-color:var(--pc)}
+.pc-edit{display:grid;gap:10px;padding:10px 2px 4px} .pc-edit[hidden]{display:none}
+.pc-two{display:grid;grid-template-columns:110px 1fr;gap:10px}
+.pc-f{display:flex;flex-direction:column;gap:5px}
+.pc-f span,.pc-l{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.pc-f input{width:100%;box-sizing:border-box;background:rgba(127,127,127,.08);border:1px solid var(--line);border-radius:12px;padding:10px 12px;
+ color:var(--text);font:inherit;font-size:14px;outline:0;transition:border-color .2s,box-shadow .2s}
+.pc-f input:focus{border-color:var(--pc);box-shadow:0 0 0 3px color-mix(in srgb,var(--pc) 30%,transparent)}
+.pc-f-name input{font:800 20px/1.2 var(--dotf);letter-spacing:.04em;padding:12px 14px}
+.pc-row{display:flex;flex-wrap:wrap;gap:8px}
+.pc-chip{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:10px;padding:7px 12px;font:inherit;font-size:12px;
+ cursor:pointer;transition:transform .15s}
+.pc-chip:hover{transform:translateY(-1px)} .pc-chip.on{outline:2px solid var(--text);outline-offset:2px}
+.pc-chip.ban{width:46px;height:28px;padding:0;border:0} .pc-chip.dot{width:26px;height:26px;padding:0;border-radius:50%}
+.pc-badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px} .pc-badges:empty{display:none}
+.pc-badges span{font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--pc) 55%,transparent);
+ background:color-mix(in srgb,var(--pc) 14%,transparent)}
+.pc-name[data-font=sans],.pc-name[data-font=serif],.pc-name[data-font=round]{letter-spacing:0;font-weight:700}
+.pc-own{align-items:center} .pc-mini{font-size:11px;color:var(--muted)}
+.pc-own input[type=color],.pc-acc-own{width:34px;height:28px;padding:0;border:1px solid var(--line);border-radius:8px;background:none;cursor:pointer}
+.pc-acc-own{margin-top:-4px;width:26px;height:26px;border-radius:50%}
+.pc-ring{position:absolute;left:12px;top:36px;width:80px;height:80px;border-radius:50%;display:none;
+ background:conic-gradient(var(--pc),transparent 30%,var(--pc) 55%,transparent 80%,var(--pc));animation:pcspin 2.6s linear infinite}
+.pc-ring[data-shape=square]{border-radius:18px} .pc-ring[data-shape=hex]{border-radius:0;clip-path:polygon(25% 5%,75% 5%,100% 50%,75% 95%,25% 95%,0 50%)}
+.pcard[data-fx=ring] .pc-ring{display:block} .pcard[data-fx=ring] .pc-av{box-shadow:0 0 0 4px var(--bg)}
+.pcard[data-fx=glow]{border-color:var(--pc);box-shadow:0 0 0 1px var(--pc),0 0 34px color-mix(in srgb,var(--pc) 45%,transparent)}
+.pcard[data-fx=shimmer] .pc-ban::after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.4) 50%,transparent 70%);
+ background-size:250% 100%;animation:pcshim 3s linear infinite}
+.pcard[data-fx=float] .pc-av{animation:pcfloat 3s ease-in-out infinite}
+@keyframes pcspin{to{transform:rotate(1turn)}}
+@keyframes pcshim{from{background-position:150% 0}to{background-position:-100% 0}}
+@keyframes pcfloat{50%{transform:translateY(-6px)}}
+@media (prefers-reduced-motion:reduce){.pc-ring,.pcard .pc-av,.pcard .pc-ban::after{animation:none!important}}
+.pc-save{margin-top:4px;border:0;border-radius:14px;padding:12px;font:inherit;font-weight:700;cursor:pointer;background:var(--pc);color:var(--pc-ink,#fff)}
+/* loading a backup */
+.bk-modal{position:fixed;inset:0;z-index:60;display:grid;place-items:center;background:rgba(0,0,0,.55);backdrop-filter:blur(6px)}
+.bk-box{width:min(440px,calc(100vw - 32px));max-height:min(560px,calc(100vh - 48px));overflow:auto;background:var(--bg);color:var(--text);
+ border:1px solid var(--line);border-radius:24px;padding:20px 22px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
+.bk-box h3{margin:0 0 8px;font:800 20px/1.2 var(--dotf)}
+.bk-box p{margin:0 0 12px;font-size:14px;line-height:1.5;color:var(--muted)}
+.bk-box .bk-warn{border-left:3px solid var(--red);padding:10px 12px;background:rgba(215,25,33,.1);border-radius:10px;color:var(--text)}
+.bk-list{display:flex;flex-direction:column;gap:6px}
+.bk-list button{display:flex;justify-content:space-between;gap:10px;text-align:left;border:1px solid var(--line);background:transparent;color:var(--text);
+ border-radius:12px;padding:10px 12px;font:inherit;font-size:14px;cursor:pointer}
+.bk-list button:hover{border-color:var(--text)} .bk-list small{color:var(--muted)}
+.un-zone{border-top:1px dashed color-mix(in srgb,var(--red) 50%,transparent);padding-top:14px}
+.un-box{width:min(520px,calc(100vw - 32px));max-height:min(680px,calc(100vh - 48px))}
+.un-steps{display:flex;gap:6px;margin:0 0 14px} .un-steps i{flex:1;height:4px;border-radius:2px;background:var(--line)} .un-steps i.on{background:var(--red)}
+.un-list{display:flex;flex-direction:column;gap:6px}
+.un-item{display:grid;grid-template-columns:auto 1fr auto;gap:4px 10px;align-items:start;border:1px solid var(--line);border-radius:12px;padding:10px 12px;cursor:pointer}
+.un-item:hover{border-color:var(--text)} .un-item.on{border-color:var(--red);background:rgba(215,25,33,.07)}
+.un-item input{margin:3px 0 0;accent-color:var(--red)} .un-item b{font-size:14px} .un-item small{grid-column:2/4;color:var(--muted);font-size:12px;line-height:1.4;overflow-wrap:anywhere}
+.un-item em{font:11px var(--mono);font-style:normal;color:var(--muted);white-space:nowrap}
+.un-item.lock{cursor:default;opacity:.8}
+.un-all{display:flex;justify-content:space-between;align-items:center;margin:0 0 8px;font-size:13px;color:var(--muted)}
+.un-all button{border:0;background:none;color:var(--text);text-decoration:underline;cursor:pointer;font:inherit}
+.un-sum{margin:0 0 12px;padding:0;list-style:none;font-size:13.5px;line-height:1.6} .un-sum li::before{content:"✕  ";color:var(--red);font-weight:700}
+.un-sum.keep li::before{content:"✓  ";color:var(--green,#2a9d5b)}
+.un-type{width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:15px var(--mono);background:var(--inset);color:var(--text)}
+.un-type.ok{border-color:var(--red)}
+.bk-btns{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.bk-btns button{border-radius:12px;padding:10px 16px;font:inherit;font-weight:600;cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--text)}
+.bk-btns .bk-yes{background:var(--red);border-color:var(--red);color:#fff;min-width:150px}
+.bk-btns button:disabled{opacity:.45;cursor:not-allowed}
 .facts{display:grid;grid-template-columns:1fr auto;gap:8px 12px;margin:6px 0 0;font-size:14px}
 .facts dt{color:var(--muted)} .facts dd{margin:0;text-align:right;font-family:var(--mono);font-size:12.5px}
 .row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;padding:8px 0;border-top:1px solid var(--line)}
@@ -962,8 +1263,40 @@ html.intro-on .acct,html.intro-on .ask{opacity:0}
 .askwarn .aw-meta b{font-family:var(--mono)}
 .aw-check{display:flex;align-items:center;gap:8px;margin:12px 0 2px;font-size:13.5px;color:var(--muted);cursor:pointer}
 .aw-check input{width:16px;height:16px;accent-color:var(--text)}
-.map-wrap{border-radius:22px;padding:10px 12px 12px}
-.nmap{display:block;width:100%;height:380px;touch-action:none} .nmap.on-dot{cursor:pointer}
+.map-wrap{border-radius:22px;padding:12px 14px 12px;position:relative}
+.nmap{display:block;width:100%;height:clamp(440px,64vh,680px);touch-action:none} .nmap.on-dot{cursor:pointer}
+.map-wrap.full{position:fixed;inset:16px;z-index:58;display:flex;flex-direction:column;background:var(--bg);box-shadow:0 0 0 100vmax rgba(0,0,0,.6)}
+.map-wrap.full .map-stage{flex:1;min-height:0} .map-wrap.full .nmap{height:100%}
+.map-stage{position:relative}
+.map-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 2px 8px}
+.map-modes{display:flex;align-items:center;gap:4px;flex-wrap:wrap;font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.map-modes span{margin-right:4px}
+.map-modes button,.map-full{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:4px 11px;font:11px var(--mono);letter-spacing:.04em;text-transform:uppercase;cursor:pointer}
+.map-modes button.on{background:var(--text);color:var(--bg);border-color:var(--text)}
+.map-full{font-size:14px;padding:3px 10px;text-transform:none}
+.map-legend{display:flex;align-items:center;flex-wrap:wrap;gap:6px 16px;margin:0 4px 6px;font:11px var(--mono);color:var(--muted);min-height:18px}
+.map-legend .ml-ramp{display:inline-block;width:150px;height:8px;border-radius:4px;vertical-align:middle;margin:0 6px}
+.map-legend .ml-sw{display:inline-flex;align-items:center;gap:5px} .map-legend .ml-sw i{width:9px;height:9px;border-radius:50%;background:var(--c)}
+.map-legend .ml-shape{margin-left:auto;display:flex;flex-wrap:wrap;gap:4px 14px}
+.map-legend .ml-key{display:inline-flex;align-items:center;gap:5px} .map-legend .ml-ico{flex:none;display:block}.map-legend .ml-hint{opacity:.65;font-size:.92em}
+.map-weeks{display:flex;align-items:flex-end;gap:3px;margin:8px 2px 0;overflow-x:auto;padding-bottom:2px}
+.map-weeks button{flex:1 0 34px;display:flex;flex-direction:column;align-items:stretch;gap:3px;border:1px solid transparent;background:transparent;
+ color:var(--muted);border-radius:8px;padding:3px 3px 2px;cursor:pointer;font:10px var(--mono)}
+.map-weeks button i{display:block;height:var(--h);min-height:2px;border-radius:3px;background:var(--c)}
+.map-weeks button.empty i{opacity:.3}
+.map-weeks button:hover{border-color:var(--line);color:var(--text)} .map-weeks button.on{border-color:var(--text);color:var(--text)}
+.map-weeks button.now b{color:var(--text)} .map-weeks b{font-weight:400}
+.map-tip{position:absolute;z-index:2;pointer-events:none;max-width:280px;background:var(--bg);color:var(--text);border:1px solid var(--line);
+ border-radius:12px;padding:9px 11px;font-size:12.5px;line-height:1.45;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+.map-tip b{display:block;font-size:13.5px;margin-bottom:2px} .map-tip small{display:block;color:var(--muted);overflow-wrap:anywhere}
+.map-tip .mt-row{display:flex;gap:6px;align-items:center} .map-tip .mt-row i{width:9px;height:9px;border-radius:50%;background:var(--c);flex:none}
+.map-tip em{display:block;margin-top:4px;font:10.5px var(--mono);font-style:normal;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.map-tip .mt-h{margin-top:4px;color:var(--text)!important;font-weight:600}
+.map-tip .mt-link{display:grid;gap:0;padding:3px 0 3px 9px;border-left:2px solid var(--muted);margin:3px 0}
+.map-tip .mt-link span{font-size:12px} .map-tip .mt-link small{font-size:11px}
+.map-tip .mt-link.mt-link{border-left-color:var(--muted)} .map-tip .mt-link.mt-sim{border-left-style:dashed}
+.map-tip .mt-bar{height:5px;border-radius:3px;background:var(--inset);margin:6px 0 2px;overflow:hidden} .map-tip .mt-bar i{display:block;height:100%;background:var(--text)}
+.map-tip .mt-new{display:inline-block;font:10px var(--mono);padding:0 5px;border-radius:4px;background:var(--text);color:var(--bg);margin-left:4px;vertical-align:1px}
 .map-meta{margin:2px 8px 0;font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 .map-key{float:right;letter-spacing:.04em}
 /* a dropdown's list is drawn by Windows, which ignored the dark theme and showed grey on white: colour it ourselves */
@@ -1191,6 +1524,7 @@ const scrim = document.querySelector('.scrim');
     if (ev.target.closest('button,a,input')) return;
     const x0 = ev.screenX, y0 = ev.screenY;
     const move = m => {
+      if (!(m.buttons & 1)) return stop();      // let go somewhere the page didn't hear about
       if (Math.abs(m.screenX - x0) < 4 && Math.abs(m.screenY - y0) < 4) return;
       stop(); api().win_drag();
     };
@@ -1283,9 +1617,11 @@ window.uiZoom = () => parseFloat(document.documentElement.style.zoom) || 1;
     document.documentElement.classList.remove('cur-away');
     const t = ev.target, near = sel => t.closest && t.closest(sel);
     const off = t.disabled || (t.closest && t.closest('button:disabled,[aria-disabled=true]'));
+    const grip = t.closest && t.closest('.ol-rs,[data-rz]');
+    const gc = grip && (grip.dataset.c || grip.dataset.rz);
     const edge = t.classList && [...t.classList].find(c => c in EDGE_TURN);
-    ring.dataset.turn = edge ? EDGE_TURN[edge] : 0;
-    const shape = edge ? 'rz' : off ? 'no' : near(SLIDER) ? 'slide' : near(TYPEABLE) ? 'text'
+    ring.dataset.turn = edge ? EDGE_TURN[edge] : gc ? (gc === 'ne' || gc === 'sw' ? -45 : 45) : 0;
+    const shape = edge || gc ? 'rz' : off ? 'no' : near(SLIDER) ? 'slide' : near(TYPEABLE) ? 'text'
       : near(DRAGGABLE) ? 'drag' : near(PRESSABLE) ? 'hot' : '';
     for (const k of SHAPES) { ring.classList.toggle(k, k === shape); dot.classList.toggle(k, k === shape); }
     overCanvas = t.tagName === 'CANVAS';
@@ -1320,20 +1656,23 @@ window.uiZoom = () => parseFloat(document.documentElement.style.zoom) || 1;
   const MIN_W = 720, MIN_H = 480;
   document.querySelectorAll('.redge').forEach(el => {
     const side = SIDES[[...el.classList].find(c => SIDES[c])];
-    el.addEventListener('pointerdown', async ev => {
+    el.addEventListener('pointerdown', ev => {
       ev.preventDefault();
-      if (!window.pywebview) return;
-      const start = await pywebview.api.win_bounds();
-      if (!start) return;
+      if (!window.pywebview || ev.button !== 0) return;
+      // Everything is listened for straight away: waiting for the window's size first meant a quick
+      // click could be over before the page was listening for the button coming up, and the edge
+      // then went on resizing the window whenever the mouse passed over it.
       const dpr = devicePixelRatio || 1, x0 = ev.screenX, y0 = ev.screenY;
       const [w_, n_, e_, s_] = side;
-      let want = null, queued = false;
-      el.setPointerCapture(ev.pointerId);
+      let start = null, want = null, queued = false, live = true;
+      try { el.setPointerCapture(ev.pointerId); } catch (_) {}
       const push = () => {
         queued = false;
-        if (want) pywebview.api.win_set_bounds(want.x, want.y, want.w, want.h);
+        if (live && want) pywebview.api.win_set_bounds(want.x, want.y, want.w, want.h);
       };
       const move = m => {
+        if (!(m.buttons & 1)) return stop();
+        if (!start) return;
         const dx = Math.round((m.screenX - x0) * dpr), dy = Math.round((m.screenY - y0) * dpr);
         let {x, y, w, h} = start;
         if (w_) { const take = Math.min(dx, w - MIN_W); x += take; w -= take; }
@@ -1344,13 +1683,20 @@ window.uiZoom = () => parseFloat(document.documentElement.style.zoom) || 1;
         if (!queued) { queued = true; requestAnimationFrame(push); }   // at most one call a frame
       };
       const stop = () => {
+        live = false;
         el.removeEventListener('pointermove', move);
         el.removeEventListener('pointerup', stop);
         el.removeEventListener('pointercancel', stop);
+        el.removeEventListener('lostpointercapture', stop);
+        removeEventListener('blur', stop);
+        try { el.releasePointerCapture(ev.pointerId); } catch (_) {}
       };
       el.addEventListener('pointermove', move);
       el.addEventListener('pointerup', stop);
       el.addEventListener('pointercancel', stop);
+      el.addEventListener('lostpointercapture', stop);
+      addEventListener('blur', stop);
+      pywebview.api.win_bounds().then(b => { if (!b) stop(); else start = b; }, stop);
     });
   });
   // hovering or right-clicking Maximise offers the half and quarter layouts
@@ -1459,7 +1805,7 @@ A.querySelector('.a-name').textContent = BB.name || 'Student';
 A.querySelector('.a-user').textContent = [BB.user, BB.programme].filter(Boolean).join(' · ');
 A.querySelector('.a-sync').textContent = BB.synced;
 A.querySelector('.a-spend').textContent = '$' + Number(BB.spend || 0).toFixed(2);
-document.querySelector('.acct .av').textContent = (BB.name || '?')[0].toUpperCase();
+document.querySelector('.acct .av').textContent = ((BB.profile && BB.profile.avatar) || BB.name || '?')[0].toUpperCase();
 const SY = A.querySelector('.s-sync'), NP = A.querySelector('.s-notes'), NPV = A.querySelector('.s-notes-v');
 SY.value = String(BB.settings.sync_hours); NP.value = BB.settings.notes_per_sync; NPV.textContent = NP.value;
 const saveSettings = () => window.pywebview && pywebview.api.save_settings(
@@ -1469,6 +1815,155 @@ SY.onchange = saveSettings; NP.oninput = () => { NPV.textContent = NP.value; }; 
 A.querySelector('.s-files').onclick = async () => {
   const r = await pywebview.api.open_materials(); if (r && r !== 'ok') A.querySelector('.s-files-msg').textContent = r; };
 A.querySelector('.s-files-path').textContent = BB.materials;
+// ---- the profile card: a live preview, changed in place, saved to data/profile.json
+const PC_BANNERS = {aurora: 'linear-gradient(135deg,#7f5af0,#2cb67d)', sunset: 'linear-gradient(135deg,#ff6b6b,#f7b267)',
+  ocean: 'linear-gradient(135deg,#023e8a,#00b4d8)', night: 'linear-gradient(135deg,#0f0c29,#302b63,#24243e)',
+  candy: 'linear-gradient(135deg,#f72585,#7209b7)', ember: 'linear-gradient(135deg,#d71921,#3a0306)', mono: 'linear-gradient(135deg,#1c1c1c,#4a4a4a)'};
+const PC_PATTERNS = {none: '', dots: 'radial-gradient(rgba(255,255,255,.3) 1.2px,transparent 1.7px) 0 0/12px 12px',
+  grid: 'linear-gradient(rgba(255,255,255,.16) 1px,transparent 1px) 0 0/16px 16px,linear-gradient(90deg,rgba(255,255,255,.16) 1px,transparent 1px) 0 0/16px 16px',
+  stripes: 'repeating-linear-gradient(45deg,rgba(255,255,255,.14) 0 6px,transparent 6px 14px)'};
+const PC_ACCENTS = ['#d71921', '#ff8a00', '#f5c400', '#2cb67d', '#00b4d8', '#4361ee', '#7f5af0', '#f72585', '#f2f2f2', '#111111'];
+const PC_FONTS = {dot: ['Dot', 'var(--dotf)'], sans: ['Clean', '"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif'],
+  serif: ['Serif', 'Georgia,"Times New Roman",serif'], mono: ['Code', '"Cascadia Code",Consolas,monospace'],
+  round: ['Round', '"Arial Rounded MT Bold","Segoe UI",sans-serif']};
+const PC_EFFECTS = {none: 'None', glow: 'Glow', shimmer: 'Shimmer', ring: 'Spinning ring', float: 'Float'};
+let PC = {name: BB.name || '', tag: '', course: BB.programme || '', avatar: '', accent: '#d71921', banner: 'aurora', pattern: 'dots',
+          shape: 'round', g1: '#7f5af0', g2: '#2cb67d', font: 'dot', effect: 'none', badges: [], avatarImg: '', bannerImg: '', ...(BB.profile || {})};
+const inkOn = hex => { const n = parseInt(hex.slice(1), 16);
+  return ((n >> 16) * 299 + ((n >> 8) & 255) * 587 + (n & 255) * 114) / 1000 > 150 ? '#0b0b0b' : '#ffffff'; };
+function dressAvatar(el, p) {
+  el.dataset.shape = p.shape;
+  if (p.avatarImg) { el.textContent = ''; el.style.background = `center/cover no-repeat url("${p.avatarImg}")`; el.style.color = ''; return; }
+  el.textContent = p.avatar || (p.name || '?')[0];
+  el.style.background = p.accent; el.style.color = inkOn(p.accent);
+}
+const bannerOf = p => p.banner === 'image' && p.bannerImg ? `center/cover no-repeat url("${p.bannerImg}")`
+  : p.banner === 'custom' ? `linear-gradient(135deg,${p.g1},${p.g2})` : (PC_BANNERS[p.banner] || PC_BANNERS.aurora);
+const PCARD = A.querySelector('.pcard'), PCE = A.querySelector('.pc-edit');
+function paintCard(p) {
+  PCARD.querySelector('.pc-ban').style.background = [PC_PATTERNS[p.pattern], bannerOf(p)].filter(Boolean).join(',');
+  dressAvatar(PCARD.querySelector('.pc-av'), p);
+  const nm = PCARD.querySelector('.pc-name'); nm.textContent = p.name || 'Your name';
+  nm.style.fontFamily = (PC_FONTS[p.font] || PC_FONTS.dot)[1]; nm.dataset.font = p.font;
+  PCARD.querySelector('.pc-tag').textContent = p.tag || '';
+  PCARD.querySelector('.pc-meta').textContent = p.course || '';
+  PCARD.querySelector('.pc-badges').replaceChildren(...(p.badges || []).map(t => { const s = document.createElement('span'); s.textContent = t; return s; }));
+  PCARD.dataset.fx = p.effect || 'none'; PCARD.querySelector('.pc-ring').dataset.shape = p.shape;
+  [PCARD, PCE].forEach(el => { el.style.setProperty('--pc', p.accent); el.style.setProperty('--pc-ink', inkOn(p.accent)); });
+  PCE.querySelector('.pc-rm-av').hidden = !p.avatarImg; PCE.querySelector('.pc-rm-ban').hidden = !p.bannerImg;
+}
+function applyProfile(p) {
+  document.querySelectorAll('.acct .av, .who .av').forEach(el => dressAvatar(el, p));
+  A.querySelector('.a-name').textContent = p.name || 'Student';
+}
+[['.pc-in-name', 'name'], ['.pc-in-tag', 'tag'], ['.pc-in-course', 'course'], ['.pc-in-av', 'avatar']].forEach(([cls, key]) => {
+  const i = PCE.querySelector(cls); i.value = PC[key] || ''; i.oninput = () => { PC[key] = i.value; paintCard(PC); }; });
+const BADGES = PCE.querySelector('.pc-in-badges');
+BADGES.value = (PC.badges || []).join(', ');
+BADGES.oninput = () => { PC.badges = BADGES.value.split(',').map(s => s.trim().slice(0, 18)).filter(Boolean).slice(0, 4); paintCard(PC); };
+const chipSets = [];
+const pcChips = (cls, list, key, dress) => {
+  const box = PCE.querySelector(cls);
+  const mark = () => box.querySelectorAll('.pc-chip').forEach(b => b.classList.toggle('on', b.dataset.v === PC[key]));
+  const draw = () => {
+    box.replaceChildren(...list().map(v => { const b = document.createElement('button'); b.type = 'button'; b.className = 'pc-chip';
+      b.dataset.v = v; b.title = v; dress(b, v); b.onclick = () => { PC[key] = v; mark(); paintCard(PC); }; return b; }));
+    mark();
+  };
+  chipSets.push(draw); draw();
+};
+const redrawChips = () => chipSets.forEach(d => d());
+pcChips('.pc-banners', () => [...Object.keys(PC_BANNERS), 'custom', ...(PC.bannerImg ? ['image'] : [])], 'banner', (b, v) => {
+  b.classList.add('ban'); b.style.background = bannerOf({...PC, banner: v}); b.title = v === 'custom' ? 'Your own colours' : v === 'image' ? 'Your image' : v; });
+pcChips('.pc-patterns', () => Object.keys(PC_PATTERNS), 'pattern', (b, v) => { b.textContent = v[0].toUpperCase() + v.slice(1); });
+pcChips('.pc-accents', () => [...new Set([...PC_ACCENTS, PC.accent])], 'accent', (b, v) => { b.classList.add('dot'); b.style.background = v; });
+pcChips('.pc-fonts', () => Object.keys(PC_FONTS), 'font', (b, v) => { b.textContent = PC_FONTS[v][0]; b.style.fontFamily = PC_FONTS[v][1]; });
+pcChips('.pc-shapes', () => ['round', 'square', 'hex'], 'shape', (b, v) => { b.textContent = {round: 'Round', square: 'Square', hex: 'Hexagon'}[v]; });
+pcChips('.pc-effects', () => Object.keys(PC_EFFECTS), 'effect', (b, v) => { b.textContent = PC_EFFECTS[v]; });
+// any colour at all for the accent, at the end of the swatches
+const accOwn = document.createElement('input'); accOwn.type = 'color'; accOwn.className = 'pc-acc-own'; accOwn.title = 'Any colour'; accOwn.value = PC.accent;
+PCE.querySelector('.pc-accents').after(accOwn);
+accOwn.oninput = () => { PC.accent = accOwn.value; paintCard(PC); };
+accOwn.onchange = redrawChips;
+const G1 = PCE.querySelector('.pc-g1'), G2 = PCE.querySelector('.pc-g2'); G1.value = PC.g1; G2.value = PC.g2;
+[[G1, 'g1'], [G2, 'g2']].forEach(([i, k]) => { i.oninput = () => { PC[k] = i.value; PC.banner = 'custom'; paintCard(PC); }; i.onchange = redrawChips; });
+// pictures are cut to size here, so the card stays small enough to keep and back up
+const pickImage = () => new Promise(ok => { const f = PCE.querySelector('.pc-file'); f.value = ''; f.onchange = () => ok(f.files[0] || null); f.click(); });
+async function cutImage(file, w, h) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = url; });
+    const s = Math.max(w / img.naturalWidth, h / img.naturalHeight), sw = w / s, sh = h / s;
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').drawImage(img, (img.naturalWidth - sw) / 2, (img.naturalHeight - sh) / 2, sw, sh, 0, 0, w, h);
+    let out = c.toDataURL('image/webp', .85);
+    if (!out.startsWith('data:image/webp')) out = c.toDataURL('image/jpeg', .85);
+    return out;
+  } finally { URL.revokeObjectURL(url); }
+}
+const msgPC = t => { A.querySelector('.s-name-msg').textContent = t; };
+PCE.querySelector('.pc-up-av').onclick = async () => { const f = await pickImage(); if (!f) return;
+  try { PC.avatarImg = await cutImage(f, 256, 256); paintCard(PC); msgPC(''); } catch (_) { msgPC("That picture couldn't be opened"); } };
+PCE.querySelector('.pc-rm-av').onclick = () => { PC.avatarImg = ''; paintCard(PC); };
+PCE.querySelector('.pc-up-ban').onclick = async () => { const f = await pickImage(); if (!f) return;
+  try { PC.bannerImg = await cutImage(f, 840, 240); PC.banner = 'image'; redrawChips(); paintCard(PC); msgPC(''); } catch (_) { msgPC("That image couldn't be opened"); } };
+PCE.querySelector('.pc-rm-ban').onclick = () => { PC.bannerImg = ''; if (PC.banner === 'image') PC.banner = 'aurora'; redrawChips(); paintCard(PC); };
+const closeEditor = () => { PCE.hidden = true; A.querySelector('.pc-open').textContent = 'Customize'; };
+A.querySelector('.pc-open').onclick = () => { if (!PCE.hidden) return closeEditor(); PCE.hidden = false;
+  A.querySelector('.pc-open').textContent = 'Close'; PCE.querySelector('.pc-in-name').focus(); };
+A.querySelector('.pc-save').onclick = async () => {
+  const r = await pywebview.api.profile_save(PC);
+  if (!r || !r.ok) { msgPC((r && r.msg) || "Couldn't save"); return; }
+  PC = {...PC, ...r.profile}; BB.profile = PC; BB.name = PC.name; paintCard(PC); applyProfile(PC); msgPC('Saved');
+  closeEditor(); PCARD.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  try { localStorage.setItem('olName', JSON.stringify(PC.name)); localStorage.setItem('olColor', JSON.stringify(PC.accent)); } catch (_) {}   // the group board uses them too
+};
+paintCard(PC); if (BB.profile) applyProfile(PC);
+
+// ---- loading a backup: pick one, read the warning, and Yes only wakes up after 5 seconds
+async function loadBackup() {
+  let list = []; try { list = await pywebview.api.backups_list() || []; } catch (_) {}
+  const M = document.createElement('div'); M.className = 'bk-modal';
+  const box = document.createElement('div'); box.className = 'bk-box'; M.append(box); document.body.append(M);
+  let t = 0;
+  const close = () => { clearInterval(t); M.remove(); };
+  M.onclick = ev => { if (ev.target === M) close(); };
+  M.addEventListener('keydown', ev => { if (ev.key === 'Escape') close(); });
+  const when = s => new Date(s).toLocaleString(undefined, {weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'});
+  const pick = () => {
+    box.innerHTML = '<h3>Load a backup</h3><p>Pick the copy to go back to. Newest first.</p><div class="bk-list"></div><div class="bk-btns"><button class="bk-no">Cancel</button></div>';
+    const L = box.querySelector('.bk-list');
+    if (!list.length) L.innerHTML = '<p>No backups yet.</p>';
+    list.forEach(f => { const b = document.createElement('button'); b.innerHTML = '<span></span><small></small>';
+      b.firstChild.textContent = when(f.when); b.lastChild.textContent = Math.max(1, Math.round(f.size / 1024)) + ' KB';
+      b.onclick = () => warn(f); L.append(b); });
+    box.querySelector('.bk-no').onclick = close; box.querySelector('.bk-no').focus();
+  };
+  const warn = f => {
+    box.innerHTML = '<h3>Load this backup?</h3><p class="bk-warn"></p><p>Everything as it is right now is backed up first, so you can come back to it from this same list.</p><small class="bk-msg"></small><div class="bk-btns"><button class="bk-back">Back</button><button class="bk-yes" disabled></button></div>';
+    box.querySelector('.bk-warn').textContent = 'Warning: your notebook, offline boards, profile and settings will be replaced with the copy from ' + when(f.when) + '. Anything you changed after that will be gone from the app.';
+    const yes = box.querySelector('.bk-yes'), back = box.querySelector('.bk-back'), m = box.querySelector('.bk-msg');
+    let n = 5;
+    const tick = () => { yes.textContent = n > 0 ? 'Yes, load it (' + n + ')' : 'Yes, load it'; yes.disabled = n > 0; if (n-- <= 0) clearInterval(t); };
+    clearInterval(t); tick(); t = setInterval(tick, 1000); back.focus();
+    back.onclick = () => { clearInterval(t); pick(); };
+    yes.onclick = async () => {
+      yes.disabled = back.disabled = true; m.textContent = 'Backing up what you have now, then loading…';
+      try { await window.bbLeave(); } catch (_) {}
+      window.bbFrozen = true;                              // nothing on the page may save over what comes back
+      let r; try { r = await pywebview.api.backup_restore(f.file); } catch (e) { r = {msg: String(e)}; }
+      if (!r || !r.ok) { window.bbFrozen = false; m.textContent = (r && r.msg) || "Couldn't load it"; yes.disabled = back.disabled = false; return; }
+      try { Object.keys(localStorage).filter(k => k.startsWith('olBoardMirror')).forEach(k => localStorage.removeItem(k)); } catch (_) {}
+      m.textContent = r.msg + '. Reopening…';
+      setTimeout(() => location.reload(), 600);
+    };
+  };
+  pick();
+}
+A.querySelector('.s-bk-load').onclick = loadBackup;
+A.querySelector('.s-bk-open').onclick = () => pywebview.api.backups_open();
+A.querySelector('.s-bk-now').onclick = async () => { const m = A.querySelector('.s-bk-msg'); m.textContent = 'Backing up…';
+  const r = await pywebview.api.backup_now(); m.textContent = (r && r.msg) || ''; };
 A.querySelector('.s-files-move').onclick = async () => {
   const m = A.querySelector('.s-files-msg'); m.textContent = 'Pick a folder…';
   const r = await pywebview.api.choose_materials();
@@ -1485,6 +1980,161 @@ A.querySelector('.s-check').onclick = async () => {
   if (u && u.version) { m.textContent = ''; closeSheets(); bbUpdate(u); }
   else m.textContent = u && u.error ? u.error : 'You have the latest version.';
 };
+const UN = {
+  app: ['The app itself', 'The program, its files and the dashboard page. Always removed.'],
+  settings: ['Settings and Claude keys', 'Your saved Claude accounts and API keys, Blackboard address and app settings.'],
+  data: ['Your boards, profile and deadlines', 'Offline boards, your name card, ticked-off work, notes Claude made, what it cost.'],
+  notebook: ['Notebook', 'Everything you wrote in the Notebook.'],
+  materials: ['Downloaded Blackboard files', 'Lecture slides and files fetched from Blackboard. They can be downloaded again.'],
+  backups: ['Backups', 'The automatic copies made every 15 minutes.'],
+  browser: ['Sign-ins and browser data', 'The Blackboard sign-in and the app’s saved page data on this computer.'],
+  projects: ['Code projects', 'Folders saved to Documents\\Blackboard Buddy projects from board code blocks.'],
+};
+const unSize = n => n < 1024 ? (n ? n + ' B' : '—') : n < 1048576 ? Math.round(n / 1024) + ' KB' : n < 1073741824 ? (n / 1048576).toFixed(1) + ' MB' : (n / 1073741824).toFixed(2) + ' GB';
+async function uninstallFlow() {
+  let info; try { info = await pywebview.api.uninstall_info(); } catch (e) { info = {parts: [], blocked: String(e)}; }
+  const M = document.createElement('div'); M.className = 'bk-modal';
+  const box = document.createElement('div'); box.className = 'bk-box un-box'; M.append(box); document.body.append(M);
+  const pick = new Set(['app']); let backup = true, t = 0, busy = false;
+  const close = () => { if (busy) return; clearInterval(t); M.remove(); };
+  M.onclick = ev => { if (ev.target === M) close(); };
+  M.addEventListener('keydown', ev => { if (ev.key === 'Escape') close(); });
+  const steps = n => '<div class="un-steps">' + [1, 2, 3].map(i => '<i class="' + (i <= n ? 'on' : '') + '"></i>').join('') + '</div>';
+  const parts = (info.parts || []).filter(x => x.key === 'app' || x.found);
+  const keepsData = () => ['data', 'notebook', 'settings'].some(k => !pick.has(k));
+  // 1: what goes
+  const choose = () => {
+    box.innerHTML = steps(1) + '<h3>Uninstall Blackboard Buddy</h3><p>What should be removed along with the app? Anything you leave unticked stays on this computer, so a fresh install picks it straight back up.</p>' +
+      '<div class="un-all"><span class="un-total"></span><span><button class="un-every">Tick everything</button> · <button class="un-none">Only the app</button></span></div><div class="un-list"></div>' +
+      '<p class="bk-warn un-blocked" hidden></p><div class="bk-btns"><button class="bk-no">Cancel</button><button class="bk-yes un-next">Next</button></div>';
+    const L = box.querySelector('.un-list');
+    const total = () => { box.querySelector('.un-total').textContent = 'Frees about ' + unSize(parts.filter(x => pick.has(x.key)).reduce((a, x) => a + x.size, 0)); };
+    parts.forEach(x => {
+      const [name, what] = UN[x.key] || [x.key, ''];
+      const row = document.createElement('label'); row.className = 'un-item' + (x.key === 'app' ? ' lock' : '');
+      row.innerHTML = '<input type="checkbox"><b></b><em></em><small></small>';
+      const cb = row.querySelector('input'); cb.checked = pick.has(x.key); cb.disabled = x.key === 'app'; row.classList.toggle('on', cb.checked);
+      row.querySelector('b').textContent = name; row.querySelector('em').textContent = unSize(x.size);
+      row.querySelector('small').textContent = what + (x.key === 'materials' && info.custom_materials ? ' In your own folder: ' + x.where : '');
+      cb.onchange = () => { cb.checked ? pick.add(x.key) : pick.delete(x.key); row.classList.toggle('on', cb.checked); total(); };
+      L.append(row);
+    });
+    const all = on => { L.querySelectorAll('input:not(:disabled)').forEach((cb, i) => { cb.checked = on; cb.onchange(); }); };
+    box.querySelector('.un-every').onclick = () => all(true);
+    box.querySelector('.un-none').onclick = () => all(false);
+    total();
+    box.querySelector('.bk-no').onclick = close;
+    const next = box.querySelector('.un-next');
+    if (info.blocked) { const w = box.querySelector('.un-blocked'); w.hidden = false; w.textContent = info.blocked; next.disabled = true; }
+    next.onclick = keep; box.querySelector('.bk-no').focus();
+  };
+  // 2: a last backup?
+  const keep = () => {
+    box.innerHTML = steps(2) + '<h3>Keep a copy?</h3><p>A final backup holds your notebook, boards, profile and settings in one zip, so you can load it into Blackboard Buddy later with Settings › Load a backup.</p>' +
+      '<div class="un-list"><label class="un-item"><input type="checkbox" class="un-bk"><b>Save a final backup to my Desktop</b><em></em><small></small></label></div>' +
+      '<div class="bk-btns"><button class="bk-back">Back</button><button class="bk-yes un-next">Next</button></div>';
+    const cb = box.querySelector('.un-bk'), row = cb.closest('.un-item');
+    cb.checked = backup; row.classList.toggle('on', backup);
+    row.querySelector('small').textContent = keepsData() ? 'Optional. Some of your things stay on this computer anyway.' : 'Recommended: everything of yours is about to be removed.';
+    cb.onchange = () => { backup = cb.checked; row.classList.toggle('on', backup); };
+    box.querySelector('.bk-back').onclick = choose; box.querySelector('.un-next').onclick = confirmIt; box.querySelector('.un-next').focus();
+  };
+  // 3: say it twice
+  const confirmIt = () => {
+    const gone = parts.filter(x => pick.has(x.key)), stay = parts.filter(x => !pick.has(x.key));
+    box.innerHTML = steps(3) + '<h3>Are you sure?</h3><p>The app closes, then these go to the Recycle Bin:</p><ul class="un-sum"></ul>' +
+      '<p class="un-stay-h">These stay:</p><ul class="un-sum keep"></ul><p class="un-note"></p>' +
+      '<p>Type <b>uninstall</b> to confirm.</p><input class="un-type" autocomplete="off" spellcheck="false" aria-label="Type uninstall to confirm">' +
+      '<small class="bk-msg"></small><div class="bk-btns"><button class="bk-back">Back</button><button class="bk-yes" disabled></button></div>';
+    const [G, K] = box.querySelectorAll('.un-sum');
+    gone.forEach(x => { const li = document.createElement('li'); li.textContent = UN[x.key][0] + ' · ' + unSize(x.size); G.append(li); });
+    stay.forEach(x => { const li = document.createElement('li'); li.textContent = UN[x.key][0]; K.append(li); });
+    if (!stay.length) { box.querySelector('.un-stay-h').remove(); K.remove(); }
+    box.querySelector('.un-note').textContent = (backup ? 'A final backup goes to your Desktop first. ' : 'No final backup will be made. ') +
+      'Groups you are in online stay on the server; leave them first if you want to.';
+    const inp = box.querySelector('.un-type'), yes = box.querySelector('.bk-yes'), back = box.querySelector('.bk-back'), m = box.querySelector('.bk-msg');
+    let n = 5;
+    const ready = () => { const ok = inp.value.trim().toLowerCase() === 'uninstall'; inp.classList.toggle('ok', ok);
+      yes.textContent = n > 0 ? 'Uninstall (' + n + ')' : 'Uninstall'; yes.disabled = n > 0 || !ok; };
+    clearInterval(t); ready(); t = setInterval(() => { n--; ready(); if (n <= 0) clearInterval(t); }, 1000);
+    inp.oninput = ready; inp.onkeydown = ev => { if (ev.key === 'Enter' && !yes.disabled) yes.click(); }; inp.focus();
+    back.onclick = () => { clearInterval(t); keep(); };
+    yes.onclick = async () => {
+      busy = true; yes.disabled = back.disabled = inp.disabled = true;
+      m.textContent = backup ? 'Saving your final backup…' : 'Closing…';
+      try { await window.bbLeave(); } catch (_) {}
+      let r; try { r = await pywebview.api.uninstall([...pick], backup); } catch (e) { r = {error: String(e)}; }
+      if (!r || !r.ok) { busy = false; m.textContent = (r && r.error) || "Couldn't uninstall."; back.disabled = inp.disabled = false; ready(); return; }
+      window.bbFrozen = true;
+      box.innerHTML = '<h3>Goodbye 👋</h3><p>Blackboard Buddy is closing and removing itself. A message will pop up when it is done.</p>' +
+        (r.saved ? '<p class="un-saved"></p>' : '');
+      if (r.saved) box.querySelector('.un-saved').textContent = 'Your final backup: ' + r.saved;
+    };
+  };
+  choose();
+}
+A.querySelector('.s-uninstall').onclick = () => { closeSheets(); uninstallFlow(); };
+
+// ---- Settings > Share: give a code out, or follow someone else's
+const SH = A.querySelector('[data-s=share].set-pane');
+const shWhen = t => t ? new Date(t).toLocaleString(undefined, {weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'}) : 'not yet';
+const shCode = c => c ? c.slice(0, 4) + '-' + c.slice(4) : '';
+async function drawShare(msg) {
+  const M = SH.querySelector('.sh-msg'), own = SH.querySelector('.sh-own'), fol = SH.querySelector('.sh-follow');
+  let st; try { st = await pywebview.api.share_status(); } catch (e) { M.textContent = 'Sharing works in the app.'; return; }
+  M.textContent = msg || '';
+  const act = async (b, fn, ...a) => { b.disabled = true; M.textContent = '';
+    let r; try { r = await pywebview.api[fn](...a); } catch (e) { r = {error: String(e)}; }
+    b.disabled = false; if (r && r.error) { M.textContent = r.error; return null; } return r; };
+  // yours
+  if (st.share) {
+    own.innerHTML = '<div class="sh-card"><div class="sh-code"><b></b><button class="ghost sh-copy">Copy</button></div>'
+      + '<small class="sh-when"></small><div class="sh-row"><button class="ghost sh-now">Send my latest now</button><button class="ghost danger sh-stop">Stop sharing</button></div></div>';
+    own.querySelector('b').textContent = shCode(st.share.code);
+    own.querySelector('.sh-when').textContent = 'Last sent ' + shWhen(st.share.updated) + (st.share.size ? ' · ' + Math.max(1, Math.round(st.share.size / 1024)) + ' KB' : '')
+      + '. It goes out again by itself after every sync. Anyone with the code can see it, so only give it to people you trust.';
+    own.querySelector('.sh-copy').onclick = async ev => { try { await navigator.clipboard.writeText(shCode(st.share.code)); ev.target.textContent = 'Copied'; setTimeout(() => ev.target.textContent = 'Copy', 1400); } catch (_) {} };
+    own.querySelector('.sh-now').onclick = async ev => { ev.target.textContent = 'Sending…'; if (await act(ev.target, 'share_now')) drawShare('Sent.'); else ev.target.textContent = 'Send my latest now'; };
+    own.querySelector('.sh-stop').onclick = async ev => {
+      if (!confirm('Stop sharing? Everyone following your code loses your updates, and the code stops working.')) return;
+      if (await act(ev.target, 'share_stop')) drawShare('Stopped. The code no longer works.'); };
+  } else {
+    own.innerHTML = '<div class="sh-card"><div class="sh-row"><button class="ghost sh-start">Make a share code</button></div><small></small></div>';
+    own.querySelector('small').textContent = st.has_sync ? 'You get a code like ABCD-2345 to give to classmates.' : 'Sync with Blackboard once first, so there is something to share.';
+    own.querySelector('.sh-start').disabled = !st.has_sync;
+    own.querySelector('.sh-start').onclick = async ev => { ev.target.textContent = 'Making your code…'; if (await act(ev.target, 'share_start')) drawShare(); else ev.target.textContent = 'Make a share code'; };
+  }
+  // theirs
+  if (st.follow) {
+    fol.innerHTML = '<div class="sh-card"><span class="sh-who"></span><small class="sh-fwhen"></small>'
+      + '<div class="sh-row"><button class="ghost sh-check">Check for new notes</button><button class="ghost danger sh-unf">Stop following</button></div></div>';
+    fol.querySelector('.sh-who').textContent = 'Following ' + (st.follow.name || 'a classmate') + ' · ' + shCode(st.follow.code);
+    fol.querySelector('.sh-fwhen').textContent = 'Their notes from ' + shWhen(st.follow.synced || st.follow.updated) + ' · new ones arrive by themselves every 15 minutes while the app is open.'
+      + (st.has_key ? ' Stop following to go back to your own Blackboard sync.' : ' To sync your own Blackboard instead, add a Claude key in the Claude tab and stop following.');
+    fol.querySelector('.sh-check').onclick = async ev => { await act(ev.target, 'follow_now'); M.textContent = 'Checking… the page updates if there is anything new.'; };
+    fol.querySelector('.sh-unf').onclick = async ev => {
+      if (!confirm('Stop following ' + (st.follow.name || 'them') + '? Your app goes back to your own sync' + (st.has_key ? '.' : ' (none yet: add a Claude key to start one).'))) return;
+      if (await act(ev.target, 'unfollow')) { M.textContent = 'Stopped. Reloading…'; setTimeout(() => location.reload(), 500); } };
+  } else {
+    fol.innerHTML = '<div class="sh-card"><div class="sh-row"><input class="sh-in" maxlength="9" placeholder="ABCD-2345" aria-label="Share code" spellcheck="false" autocomplete="off"><button class="ghost sh-go">Follow</button></div>'
+      + '<small>Enter a classmate\'s code to see their notes, deadlines and plans here, kept up to date. Your Notebook and boards stay yours.</small></div>';
+    const inp = fol.querySelector('.sh-in'), go = fol.querySelector('.sh-go');
+    inp.oninput = () => { const v = inp.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8); inp.value = v.length > 4 ? v.slice(0, 4) + '-' + v.slice(4) : v; };
+    inp.onkeydown = ev => { if (ev.key === 'Enter') go.click(); };
+    go.onclick = async () => { go.textContent = 'Getting their notes…';
+      const r = await act(go, 'follow', inp.value); go.textContent = 'Follow';
+      if (r) { M.textContent = 'Now following ' + (r.follow && r.follow.name || 'them') + '. Reloading…'; setTimeout(() => location.reload(), 600); } };
+  }
+}
+SH && A.querySelector('.set-tab[data-s=share]').addEventListener('click', () => drawShare());
+// whose notes these are, at the top of This week
+if (BB.follow) {
+  const n = document.createElement('div'); n.className = 'follow-note';
+  n.innerHTML = '<i></i><span></span><button>Settings</button>';
+  n.querySelector('span').textContent = 'Shared by ' + (BB.follow.name || 'a classmate') + ' · their notes from ' + shWhen(BB.follow.synced || BB.follow.updated);
+  n.querySelector('button').onclick = () => { document.querySelector('.acct')?.click(); setTimeout(() => A.querySelector('.set-tab[data-s=share]').click(), 50); };
+  document.getElementById('week')?.prepend(n);
+}
 A.querySelector('.s-signout').onclick = async () => {
   if (!confirm('Sign out of Blackboard on this computer? You will be asked to sign in on the next sync.')) return;
   A.querySelector('.s-signout-msg').textContent = await pywebview.api.sign_out();
@@ -1939,7 +2589,7 @@ document.querySelectorAll('.chat-hints button').forEach(b => b.onclick = () => s
 
 // ---- Notes: make notes for one file on demand
 document.addEventListener('click', async ev => {
-  const b = ev.target.closest('.mk'); if (!b || !window.pywebview) return;
+  const b = ev.target.closest('.mk[data-item]'); if (!b || !window.pywebview) return;   // only the Notes tab's own buttons
   b.disabled = true; b.textContent = 'Writing…';
   const r = await pywebview.api.make_notes(b.dataset.item, b.dataset.view);
   if (r !== 'ok') { b.disabled = false; b.textContent = 'Make notes'; b.title = r; alert(r); }
@@ -1987,22 +2637,55 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
     .filter(w => !STOP.has(w)).map(w => w.length > 4 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w);
   const LINK = /\[\[([^\]|#\n]+)/g;
   let nodes = [], edges = [], drag = null, alpha = 0, raf = 0, nbNotes = [], here = null;
+  // when each note is from: its date, and the teaching week (week 1 starts on DATA.term)
+  const DAY = 864e5, WK = 7 * DAY, T0 = DATA.term || 0, NEWDAYS = 7;
+  const weekOf = t => t && T0 ? Math.max(0, Math.floor(Math.round((new Date(t).setHours(0, 0, 0, 0) - T0) / DAY) / 7) + 1) : 0;
+  const wcOf = w => { const d = new Date(T0); d.setDate(d.getDate() + (w - 1) * 7); return d.toLocaleDateString(undefined, {day: 'numeric', month: 'short'}); };
+  const dateOf = t => new Date(t).toLocaleDateString(undefined, {weekday: 'short', day: 'numeric', month: 'short'});
+  const ago = t => { const d = Math.floor((Date.now() - t) / DAY); return d <= 0 ? 'today' : d === 1 ? 'yesterday' : d < 14 ? d + ' days ago' : Math.round(d / 7) + ' weeks ago'; };
+  const weekName = w => w ? 'Week ' + w + ' · w/c ' + wcOf(w) : 'Before term';
+  let mode = 'age', onlyWeek = null, tMin = 0, tMax = 0;
+  try { mode = localStorage.mapColour || 'age'; } catch (_) {}
+  // colours: a ramp from old (cool) to new (bright) for age, distinct hues for weeks and modules
+  const RAMP = {dark: ['#5560d8', '#1aa3c4', '#46d68c', '#d6f046'], light: ['#3a3fb0', '#0b7f99', '#23905a', '#7a9a00']};
+  const CAT = {dark: ['#4fc3f7', '#ffb74d', '#81c784', '#ba68c8', '#fff176', '#f48fb1', '#4db6ac', '#a1887f', '#9fa8da', '#e6ee9c'],
+               light: ['#0277bd', '#e65100', '#2e7d32', '#7b1fa2', '#a07800', '#c2185b', '#00796b', '#6d4c41', '#3949ab', '#827717']};
+  const hex = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+  const ramp = (f, th) => { const S = RAMP[th], x = Math.max(0, Math.min(1, f)) * (S.length - 1), i = Math.min(S.length - 2, Math.floor(x)), u = x - i;
+    const a = hex(S[i]), b = hex(S[i + 1]); return 'rgb(' + a.map((v, k) => Math.round(v + (b[k] - v) * u)).join(',') + ')'; };
+  const cat = (i, th) => CAT[th][((i % CAT[th].length) + CAT[th].length) % CAT[th].length];
+  const modIdx = k => Math.max(0, DATA.modules.findIndex(m => m.key === k));
+  const isNew = n => n.t && Date.now() - n.t < NEWDAYS * DAY;
+  function theme() { const c = document.createElement('canvas').getContext('2d');
+    c.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#000';
+    const [r, g, b] = hex(c.fillStyle.length === 7 ? c.fillStyle : '#000000'); return (r * 299 + g * 587 + b * 114) / 1000 < 128 ? 'dark' : 'light'; }
+  function paint(n, fg, th) {
+    if (n.kind === 'mod') return mode === 'module' ? cat(modIdx(n.key), th) : fg;
+    if (mode === 'age') return n.t ? ramp(tMax > tMin ? (n.t - tMin) / (tMax - tMin) : 1, th) : fg;
+    if (mode === 'week') return n.t || n.wk ? cat(n.wk, th) : fg;
+    if (mode === 'module') return n.key ? cat(modIdx(n.key), th) : fg;
+    return fg;
+  }
+  const shown = n => onlyWeek === null || n.kind === 'mod' || n.wk === onlyWeek;
 
   function build() {
     const old = new Map(nodes.map(n => [n.id, n]));
     const map = new Map(), E = new Map();
     const add = (id, o) => { if (!map.has(id)) { const p = old.get(id); map.set(id, {id, deg: 0, vx: 0, vy: 0,
       x: p ? p.x : (Math.random() - .5) * 260, y: p ? p.y : (Math.random() - .5) * 160, ...o}); } return map.get(id); };
-    const join = (a, b, kind) => { if (!a || !b || a === b) return; const k = a.id < b.id ? a.id + '|' + b.id : b.id + '|' + a.id;
-      if (!E.has(k) || kind !== 'sim') E.set(k, [a, b, kind]); };
+    const join = (a, b, kind, info) => { if (!a || !b || a === b) return; const k = a.id < b.id ? a.id + '|' + b.id : b.id + '|' + a.id;
+      if (!E.has(k) || kind !== 'sim') E.set(k, [a, b, kind, info]); };
     const hubs = DATA.modules.map(m => add('m:' + m.key, {kind: 'mod', label: m.name, key: m.key}));
     const hubFor = s => { s = (s || '').toLowerCase(); return hubs.find(h => s.includes(h.label.toLowerCase())); };
     const docs = [];
-    DATA.study.forEach((n, i) => { const d = add('s:' + i, {kind: 'study', label: n.topic || n.title, key: n.key, title: n.title});
+    DATA.study.forEach((n, i) => { const d = add('s:' + i, {kind: 'study', label: n.topic || n.title, key: n.key, title: n.title,
+      path: n.path, t: n.t || 0, wk: n.week || weekOf(n.t)});
       join(d, map.get('m:' + n.key), 'mod'); docs.push([d, n.text]); });
     nbNotes.filter(n => !/^(Start here|Linking notes)$/.test(n.name)).forEach(n => {
-      const d = add('n:' + n.name.toLowerCase(), {kind: 'nb', label: n.name.split('/').pop(), name: n.name});
-      join(d, hubFor(n.name.split('/')[0]) || hubFor(n.text.slice(0, 600)), 'mod'); docs.push([d, n.text]);
+      const d = add('n:' + n.name.toLowerCase(), {kind: 'nb', label: n.name.split('/').pop(), name: n.name, t: n.mtime || 0, wk: weekOf(n.mtime)});
+      Object.assign(d, {t: n.mtime || 0, wk: weekOf(n.mtime)});
+      const hub = hubFor(n.name.split('/')[0]) || hubFor(n.text.slice(0, 600)); if (hub) d.key = hub.key;
+      join(d, hub, 'mod'); docs.push([d, n.text]);
     });
     // written [[links]] between Notebook notes
     const nbs = [...map.values()].filter(x => x.kind === 'nb');
@@ -2015,14 +2698,24 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
     const vecs = tfs.map(tf => { const v = new Map(); let len = 0;
       tf.forEach((c, w) => { const x = (1 + Math.log(c)) * Math.log((docs.length + 1) / df.get(w)); if (x > 0) { v.set(w, x); len += x * x; } });
       len = Math.sqrt(len) || 1; v.forEach((x, w) => v.set(w, x / len)); return v; });
+    const shared = (a, b) => [...a].filter(([w]) => b.has(w)).map(([w, x]) => [w, x * b.get(w)])
+      .sort((p, q) => q[1] - p[1]).slice(0, 5).map(p => p[0]);
     const cos = (a, b) => { let s = 0; const [p, q] = a.size < b.size ? [a, b] : [b, a]; p.forEach((x, w) => { const y = q.get(w); if (y) s += x * y; }); return s; };
     vecs.forEach((v, i) => vecs.map((u, j) => [j, i === j ? 0 : cos(v, u)]).sort((a, b) => b[1] - a[1]).slice(0, 2)
-      .forEach(([j, s]) => { if (s >= .12) join(docs[i][0], docs[j][0], 'sim'); }));
+      .forEach(([j, s]) => { if (s >= .12) join(docs[i][0], docs[j][0], 'sim', {s, words: shared(v, vecs[j])}); }));
     nodes = [...map.values()]; edges = [...E.values()];
     edges.forEach(([a, b]) => { a.deg++; b.deg++; });
     const nS = docs.filter(([d]) => d.kind === 'study').length, nN = docs.length - nS, nSim = edges.filter(e => e[2] !== 'mod').length;
+    const dated = nodes.filter(n => n.kind !== 'mod' && n.t);
+    tMin = Math.min(...dated.map(n => n.t)); tMax = Math.max(...dated.map(n => n.t));
+    const per = new Map(); dated.forEach(n => per.set(n.wk, (per.get(n.wk) || 0) + 1));
+    const busy = [...per].sort((a, b) => b[1] - a[1])[0], fresh = dated.filter(isNew).length;
     META.textContent = `${nS} study note${nS === 1 ? '' : 's'} · ${nN} notebook note${nN === 1 ? '' : 's'} · ${nSim} connection${nSim === 1 ? '' : 's'} found`
+      + (dated.length ? ` · ${fresh} new this week · newest ${ago(tMax)} · oldest ${dateOf(tMin)}` : '')
+      + (busy && busy[1] > 1 ? ` · busiest: ${busy[0] ? 'week ' + busy[0] : 'before term'} (${busy[1]})` : '')
       + (docs.length ? '' : ' · make notes in the Notes or Notebook tab and they show up here');
+    if (onlyWeek !== null && !per.has(onlyWeek)) onlyWeek = null;
+    drawWeeks(per); drawLegend();
     CV.setAttribute('aria-label', 'Map of your notes. ' + META.textContent);
     alpha = 1; for (let i = 0; i < 160; i++) step(); kick();
   }
@@ -2050,6 +2743,11 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
       if (drag && V === big) return;
       V.k += (k - V.k) * e; V.x += (-(x0 + x1) / 2 - V.x) * e; V.y += (-(y0 + y1) / 2 - V.y) * e;
     };
+    V.edgeAt = ev => { const p = V.toMap(ev); let best = null, bd = 7 / V.k;
+      edges.forEach(e => { const [a, b] = e; if (!shown(a) || !shown(b)) return;
+        const dx = b.x - a.x, dy = b.y - a.y, L = dx * dx + dy * dy || 1, t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / L));
+        const d = Math.hypot(a.x + t * dx - p.x, a.y + t * dy - p.y); if (d < bd) { bd = d; best = e; } });
+      return best; };
     V.toMap = ev => { const r = canvas.getBoundingClientRect();
       return {x: (ev.clientX - r.left - r.width / 2) / V.k - V.x, y: (ev.clientY - r.top - r.height / 2) / V.k - V.y}; };
     // generous, so the pointer catches a dot from a little way off; it also tells the live pointer where to snap
@@ -2068,30 +2766,34 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
         mut = css.getPropertyValue('--muted').trim(), red = css.getPropertyValue('--red').trim();
       g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, r.width, r.height);
       const P = n => [r.width / 2 + (n.x + V.x) * V.k, r.height / 2 + (n.y + V.y) * V.k];
+      const th = theme();
       const me = nodes.find(n => n.id === here) || null, focus = V.hover || (V.pop ? me : null);
       const near = new Set(); if (focus) edges.forEach(([a, b]) => { if (a === focus) near.add(b); if (b === focus) near.add(a); });
-      edges.forEach(([a, b, k]) => {
-        const on = focus && (a === focus || b === focus);
-        g.strokeStyle = on ? red : mut; g.globalAlpha = focus && !on ? .08 : k === 'sim' ? .35 : .5;
-        g.lineWidth = on ? 1.4 : 1; g.setLineDash(k === 'sim' ? [2, 4] : []);
+      edges.forEach(e => { const [a, b, k, info] = e;
+        const on = (focus && (a === focus || b === focus)) || e === V.edge;
+        const st = Math.min(1, ((info && info.s) || .12) / .45), w = k === 'sim' ? .7 + st * 2 : k === 'link' ? 1.8 : 1;
+        g.strokeStyle = on ? red : k === 'link' ? fg : mut;
+        g.globalAlpha = ((focus || V.edge) && !on) || !shown(a) || !shown(b) ? .08 : k === 'sim' ? .25 + st * .45 : k === 'link' ? .75 : .45;
+        g.lineWidth = on ? w + .8 : w; g.setLineDash(k === 'sim' ? [2, 3 + (1 - st) * 3] : []);
         const [x1, y1] = P(a), [x2, y2] = P(b); g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
       });
       g.setLineDash([]);
       const labels = [];
       nodes.forEach(n => {
         const [x, y] = P(n), s = rad(n), lit = n === V.hover || n === me;
-        g.globalAlpha = focus && !lit && n !== focus && !near.has(n) ? .22 : 1;
-        g.fillStyle = g.strokeStyle = lit ? red : fg;
+        g.globalAlpha = (focus && !lit && n !== focus && !near.has(n)) || !shown(n) ? (shown(n) ? .22 : .1) : 1;
+        g.fillStyle = g.strokeStyle = lit ? red : paint(n, fg, th);
         g.beginPath();
         if (n.kind === 'nb') { g.moveTo(x, y - s - 1); g.lineTo(x + s + 1, y); g.lineTo(x, y + s + 1); g.lineTo(x - s - 1, y); g.closePath(); g.fill(); }
         else if (n.kind === 'mod') { g.lineWidth = 1.6; g.arc(x, y, s, 0, 7); g.stroke(); g.beginPath(); g.arc(x, y, 2.2, 0, 7); g.fill(); }
         else { g.arc(x, y, s, 0, 7); g.fill(); }
+        if (isNew(n) && n.kind !== 'mod' && mode !== 'plain') { g.lineWidth = 1.2; g.beginPath(); g.arc(x, y, s + 3, 0, 7); g.stroke(); }
         if (n === me) {   // "you are here": a ring that breathes
           const t = (performance.now() % 1600) / 1600;
           g.globalAlpha = 1 - t; g.lineWidth = 1.5; g.strokeStyle = red; g.beginPath(); g.arc(x, y, s + 3 + t * 10, 0, 7); g.stroke(); g.globalAlpha = 1;
         }
         if (n.kind === 'mod' || lit || (focus && near.has(n) && !(V.pop && !V.hover)))   // pop-up: neighbours named on hover only
-          labels.push({n, x, y, s, lit, a: g.globalAlpha, prio: lit ? 0 : focus && near.has(n) ? 1 : 2});
+          labels.push({n, x, y, s, lit, a: shown(n) ? g.globalAlpha : .25, prio: lit ? 0 : focus && near.has(n) ? 1 : 2});
       });
       // Labels go wherever there's room: under the dot, over it, to the right, to the left, or a line further out.
       // One that fits nowhere is left out, except the one you're on, which always shows.
@@ -2119,6 +2821,113 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
     return V;
   }
   const big = makeView(CV, [120, 70]);
+  const WRAP = CV.closest('.map-wrap'), WEEKS = WRAP.querySelector('.map-weeks'), LEG = WRAP.querySelector('.map-legend'),
+    TIP = WRAP.querySelector('.map-tip'), FULL = WRAP.querySelector('.map-full');
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]);
+  // the legend draws the same shapes the map does
+  // a line key is two small dots joined the way the map joins them
+  const join = (c, line) => `<circle cx="3.5" cy="9" r="2.3" fill="${c}"/><circle cx="24.5" cy="9" r="2.3" fill="${c}"/>${line}`;
+  const icon = (k, c) => `<svg class="ml-ico${/^(line|link|dash)$/.test(k) ? ' wide' : ''}" viewBox="0 0 ${/^(line|link|dash)$/.test(k) ? 28 : 18} 18" width="${/^(line|link|dash)$/.test(k) ? 28 : 18}" height="18" aria-hidden="true">` + ({
+    study: `<circle cx="9" cy="9" r="4.2" fill="${c}"/>`,
+    nb: `<path d="M9 3.6L14.4 9L9 14.4L3.6 9Z" fill="${c}"/>`,
+    mod: `<circle cx="9" cy="9" r="6.4" fill="none" stroke="${c}" stroke-width="1.7"/><circle cx="9" cy="9" r="2.2" fill="${c}"/>`,
+    new: `<circle cx="9" cy="9" r="4" fill="${c}"/><circle cx="9" cy="9" r="7" fill="none" stroke="${c}" stroke-width="1.3"/>`,
+    line: join(c, `<path d="M6 9H22" stroke="${c}" stroke-width="1.2" opacity=".75"/>`),
+    link: join(c, `<path d="M6 9H22" stroke="${c}" stroke-width="2.4" stroke-linecap="round"/>`),
+    dash: join(c, `<path d="M6.5 9H22" stroke="${c}" stroke-width="1.6" stroke-dasharray="2.5 2.5"/>`),
+  })[k] + '</svg>';
+  function drawLegend() {
+    const th = theme(); let h = '';
+    if (mode === 'age' && tMax) h = `<span>oldest · ${esc(dateOf(tMin))}<i class="ml-ramp" style="background:linear-gradient(90deg,${RAMP[th].join(',')})"></i>newest · ${esc(dateOf(tMax))}</span>`;
+    if (mode === 'week') h = '<span>Each colour is a teaching week · pick a week below to show just that one</span>';
+    if (mode === 'module') h = DATA.modules.map((m, i) => `<span class="ml-sw" style="--c:${cat(i, th)}"><i></i>${esc(m.name)}</span>`).join('');
+    if (mode === 'plain') h = '<span>Plain dots</span>';
+    const fg = getComputedStyle(document.documentElement).getPropertyValue('--text').trim() || '#fff',
+      mut = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#888';
+    const nc = mode === 'age' ? ramp(1, th) : mode === 'week' ? cat(weekOf(Date.now()), th) : fg;
+    if (mode !== 'plain' && tMax) h += `<span class="ml-key">${icon('new', nc)}New in the last ${NEWDAYS} days</span>`;
+    LEG.innerHTML = h + `<span class="ml-shape"><span class="ml-key">${icon('study', fg)}Study note</span><span class="ml-key">${icon('nb', fg)}Notebook note</span>`
+      + `<span class="ml-key">${icon('mod', fg)}Module</span><span class="ml-key">${icon('line', mut)}Same module</span>`
+      + `<span class="ml-key">${icon('link', fg)}You linked them</span><span class="ml-key">${icon('dash', mut)}Similar topic</span><span class="ml-key ml-hint">thicker line = closer match</span></span>`;
+    WRAP.querySelectorAll('.map-modes button').forEach(b => { b.classList.toggle('on', b.dataset.m === mode); b.setAttribute('aria-pressed', b.dataset.m === mode); });
+  }
+  function drawWeeks(per) {
+    per = per || new Map(nodes.filter(n => n.kind !== 'mod' && n.t).reduce((m, n) => m.set(n.wk, (m.get(n.wk) || 0) + 1), new Map()));
+    const ws = [...per.keys()], now = weekOf(Date.now());
+    if (!ws.length) { WEEKS.innerHTML = ''; return; }
+    const lo = Math.min(...ws), hi = Math.max(...ws, Math.min(now, Math.max(...ws) + 3)), top = Math.max(...per.values()), th = theme();
+    WEEKS.innerHTML = '';
+    for (let w = lo; w <= hi; w++) {
+      const c = per.get(w) || 0, b = document.createElement('button');
+      const ts = nodes.filter(n => n.kind !== 'mod' && n.t && n.wk === w).map(n => n.t), mid = ts.length ? ts.reduce((a, b) => a + b) / ts.length : T0 + (w - .5) * WK;
+      const col = mode === 'week' ? cat(w, th) : mode === 'age' && T0 ? ramp(tMax > tMin ? (mid - tMin) / (tMax - tMin) : 1, th) : 'var(--muted)';
+      b.style.setProperty('--h', Math.round(4 + 26 * c / top) + 'px'); b.style.setProperty('--c', col);
+      b.className = (c ? '' : 'empty') + (w === now ? ' now' : '') + (onlyWeek === w ? ' on' : '');
+      b.innerHTML = `<i></i><b>${w ? 'W' + w : 'Pre'}</b>`;
+      b.title = `${weekName(w)} · ${c} note${c === 1 ? '' : 's'}${w === now ? ' · this week' : ''}`;
+      b.setAttribute('aria-label', b.title); b.setAttribute('aria-pressed', onlyWeek === w);
+      b.onclick = () => { onlyWeek = onlyWeek === w ? null : w; drawWeeks(); big.draw(); };
+      WEEKS.append(b);
+    }
+  }
+  WRAP.querySelectorAll('.map-modes button').forEach(b => b.onclick = () => { mode = b.dataset.m;
+    try { localStorage.mapColour = mode; } catch (_) {} drawLegend(); drawWeeks(); big.draw(); if (!POP.hidden) mini.draw(); });
+  function why(e, from) {
+    const [a, b, k, info] = e, other = from ? (a === from ? b : a) : null;
+    if (k === 'mod') return {kind: 'Same module', more: (other || b).kind === 'mod' ? 'Filed under this module' : 'Filed under this module'};
+    if (k === 'link') return {kind: 'You linked them', more: 'A [[link]] written in your Notebook'};
+    const pc = Math.round(info.s * 100);
+    return {kind: `Similar topic · ${pc}% match`, more: info.words.length ? 'Both talk about: ' + info.words.join(', ') : 'Similar wording'};
+  }
+  function lineTip(e, ev) {
+    if (!e) { TIP.hidden = true; return; }
+    const [a, b, k] = e, w = why(e), fg = getComputedStyle(document.documentElement).getPropertyValue('--text').trim();
+    TIP.innerHTML = `<div class="mt-row"><b>${esc(w.kind)}</b></div><small>${esc(a.label)}</small><small>↔ ${esc(b.label)}</small>`
+      + `<small>${esc(w.more)}</small>` + (k === 'sim' ? `<div class="mt-bar"><i style="width:${Math.round(Math.min(1, e[3].s / .6) * 100)}%"></i></div>` : '')
+      + '<em>Click a dot to open it</em>';
+    TIP.hidden = false;
+    const r = CV.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top, tw = TIP.offsetWidth, th = TIP.offsetHeight;
+    TIP.style.left = Math.max(4, Math.min(r.width - tw - 4, x + 14)) + 'px';
+    TIP.style.top = Math.max(4, Math.min(r.height - th - 4, y + 14)) + 'px';
+  }
+  function tip(n) {
+    if (!n || drag) { TIP.hidden = true; return; }
+    const th = theme(), fg = getComputedStyle(document.documentElement).getPropertyValue('--text').trim(), links = edges.filter(([a, b]) => a === n || b === n);
+    const mod = DATA.modules.find(m => m.key === n.key);
+    let h = `<div class="mt-row"><i style="--c:${paint(n, fg, th)}"></i><b>${esc(n.label)}${isNew(n) ? '<span class="mt-new">NEW</span>' : ''}</b></div>`;
+    if (n.kind === 'mod') {
+      const kids = nodes.filter(x => x.kind !== 'mod' && x.key === n.key && x.t), last = Math.max(0, ...kids.map(x => x.t));
+      const wks = [...new Set(kids.map(x => x.wk))].sort((a, b) => a - b);
+      h += `<small>Module · ${kids.length} note${kids.length === 1 ? '' : 's'}</small>`
+        + (last ? `<small>Newest: ${esc(dateOf(last))} (${ago(last)})</small>` : '')
+        + (wks.length ? `<small>Weeks: ${wks.map(w => w || 'pre').join(', ')}</small>` : '');
+    } else {
+      if (n.kind === 'study' && n.title && n.title !== n.label) h += `<small>${esc(n.title)}</small>`;
+      h += `<small>${n.kind === 'nb' ? 'Notebook note' : 'Study note'}${mod ? ' · ' + esc(mod.name) : ''}</small>`;
+      const pth = n.path || '', where = pth.endsWith(n.title || '') ? pth.slice(0, pth.length - (n.title || '').length).replace(/[ /]+$/, '') : pth;
+      if (where) h += `<small>In: ${esc(where)}</small>`;
+      if (n.t) h += `<small>${esc(weekName(n.wk))}</small><small>${n.kind === 'nb' ? 'Edited' : 'Posted or changed'} ${esc(dateOf(n.t))} · ${ago(n.t)}</small>`;
+      h += `<small class="mt-h">${links.length} connection${links.length === 1 ? '' : 's'}</small>`;
+      const order = {link: 0, sim: 1, mod: 2};
+      links.slice().sort((p, q) => order[p[2]] - order[q[2]] || ((q[3] && q[3].s) || 0) - ((p[3] && p[3].s) || 0)).slice(0, 6).forEach(e => {
+        const o = e[0] === n ? e[1] : e[0], w = why(e, n);
+        h += `<div class="mt-link mt-${e[2]}"><span>${esc(o.label)}</span><small>${esc(w.kind)}${e[2] === 'sim' && e[3].words.length ? ' · ' + esc(e[3].words.slice(0, 3).join(', ')) : ''}</small></div>`;
+      });
+      if (links.length > 6) h += `<small>and ${links.length - 6} more</small>`;
+    }
+    TIP.innerHTML = h + '<em>Click to open · drag to move</em>'; TIP.hidden = false;
+    const r = CV.getBoundingClientRect(), st = window.bbStick || {x: r.left, y: r.top};
+    const x = st.x - r.left, y = st.y - r.top, w = TIP.offsetWidth, ht = TIP.offsetHeight;
+    TIP.style.left = Math.max(4, Math.min(r.width - w - 4, x + 16 + w > r.width ? x - w - 16 : x + 16)) + 'px';
+    TIP.style.top = Math.max(4, Math.min(r.height - ht - 4, y - ht / 2)) + 'px';
+  }
+  function setFull(on) {
+    WRAP.classList.toggle('full', on); FULL.textContent = on ? '✕' : '⤢';
+    FULL.setAttribute('aria-label', on ? 'Leave full screen' : 'Make the note map full screen'); FULL.title = on ? 'Leave full screen (Esc)' : 'Full screen';
+    alpha = Math.max(alpha, .3); requestAnimationFrame(() => { big.draw(true); kick(); });
+  }
+  FULL.onclick = () => setFull(!WRAP.classList.contains('full'));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && WRAP.classList.contains('full')) setFull(false); });
 
   // the pop-up: a button above Ask Claude, and a small card with its own canvas
   const BTN = document.createElement('button');
@@ -2190,14 +2999,17 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
   CV.onpointerdown = e => { const n = big.hit(e); if (!n) return; CV.setPointerCapture(e.pointerId);
     drag = {node: n, sx: e.clientX, sy: e.clientY, moved: false}; alpha = Math.max(alpha, .25); kick(); };
   CV.onpointermove = e => {
-    if (!drag) { const n = big.hit(e); if (n !== big.hover) { big.hover = n; CV.classList.toggle('on-dot', !!n); big.draw(); } return; }
+    if (!drag) { const n = big.hit(e); if (n !== big.hover) { big.hover = n; CV.classList.toggle('on-dot', !!n); big.edge = null; big.draw(); tip(n); }
+      if (!n) { const ed = big.edgeAt(e); if (ed !== big.edge) { big.edge = ed; big.draw(); } if (ed) lineTip(ed, e); else TIP.hidden = true; }
+      return; }
+    TIP.hidden = true;
     if (Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 3) drag.moved = true;
     const p = big.toMap(e); drag.node.x = p.x; drag.node.y = p.y; drag.node.vx = drag.node.vy = 0;
   };
   CV.onpointerup = () => { const d = drag; drag = null; if (d && !d.moved) openNode(d.node); kick(); };
-  CV.onpointerleave = () => { if (big.hover && !drag) { big.hover = null; CV.classList.remove('on-dot'); big.draw(); } };
+  CV.onpointerleave = () => { TIP.hidden = true; if (big.edge) { big.edge = null; big.draw(); } if (big.hover && !drag) { big.hover = null; CV.classList.remove('on-dot'); big.draw(); } };
   new ResizeObserver(() => { big.draw(); kick(); }).observe(CV);
-  const redraw = () => { big.draw(); if (!POP.hidden) mini.draw(); };
+  const redraw = () => { drawLegend(); drawWeeks(); big.draw(); if (!POP.hidden) mini.draw(); };
   new MutationObserver(redraw).observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', redraw);
   async function refresh() {   // Notebook notes are read live, so new ones appear without a sync
@@ -2215,6 +3027,1087 @@ try { if (sessionStorage.keepScroll) { const y = +sessionStorage.keepScroll; del
 })();
 """
 
+# ---------------------------------------------------------------- Study: flashcards made from your notes
+# Made without Claude (free): each "### idea" becomes an Explain card, "A **term** is ..." a Define card,
+# two-column tables become cards row by row, and a sentence with one bold term becomes a Fill-the-gap card.
+_SKIP_HEAD = re.compile(r"before you start|deadline|question|check with|summary|key concepts|revision|source|"
+                        r"what (this|the) (file|material)|links?$|further reading|next steps?|overview|catch.?up|order of work|"
+                        r"preparing for|stretch task|contact|tutors?$|module leader|worksheets? \d", re.I)
+_SKIP_ANS = re.compile(r"^who\b|module leader|\btutors?\b|https?://|check with|placeholder|\[insert|nothing specific|\bfolder\b|on blackboard|the (material|brief|file|slides?) "
+                       r"(says|links|does ?n[o']t|doesn't)", re.I)
+
+
+_SKIP_TABLE = {"name", "section", "level", "item", "column", "field", "customer", "channel", "module", "task", "due",
+               "date", "week", "when", "deadline", "contact", "email", "role", "who", "time", "session", "room", "file"}
+
+
+def _plain(t):
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t or "")
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+)(?<!\*)\*(?!\*)", r"\1", t)      # *italic* -> italic, **bold** stays
+    return re.sub(r"[ \t]+", " ", t).strip()
+
+
+def note_week(n):
+    """The teaching week a note belongs to: named in its title or folder, else from when its file changed,
+    counted from the start of that module's own term."""
+    wk = said_week(n["title"], n.get("path"))
+    t = when_ms(n.get("changed"))
+    if not wk and t:
+        t0 = datetime.fromtimestamp(term_start([n["course"]]) / 1000).date()
+        wk = (datetime.fromtimestamp(t / 1000).date() - t0).days // 7 + 1
+    return wk if 0 < wk <= 30 else 0
+
+
+def make_cards(notes, mod_key, modules, this_year=()):
+    out = []
+    for n in notes:
+        wk, cur = note_week(n), n["course"] in this_year
+        text = re.sub(r"```.*?```", "", n.get("md") or "", flags=re.S)
+        text = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith(">"))
+        key, note = mod_key(n["course"]), n.get("topic") or n["title"]
+        seen, cards = set(), []
+
+        def add(kind, q, a, ask):
+            q, a = _plain(q), _plain(a)
+            if len(q) < 3 or len(a) < 6 or len(a) > 900 or q.lower() in seen or _SKIP_ANS.search(q + " " + a):
+                return
+            seen.add(q.lower())
+            cid = hashlib.sha1(f"{n['course']}|{kind}|{q}".encode()).hexdigest()[:12]
+            cards.append({"id": cid, "key": key, "mod": modules.get(key, ""), "note": note, "title": n["title"],
+                          "kind": kind, "ask": ask, "q": q, "a": a, "wk": wk, "cur": cur})
+
+        # ideas: a ### heading and its first points
+        for m in re.finditer(r"^###\s+(.+?)\s*$\n(.*?)(?=^#{1,3}\s|\Z)", text, re.M | re.S):
+            head = re.sub(r"^[\d.]+\s*", "", m.group(1)).strip(" :*")
+            if _SKIP_HEAD.search(head) or len(head) > 90:
+                continue
+            body = m.group(2)
+            pts = [re.sub(r"^\s*(?:[-*+]|\d+\.)\s+", "", l).strip() for l in body.splitlines()
+                   if re.match(r"^\s*(?:[-*+]|\d+\.)\s+", l)]
+            pts = [p for p in pts if not re.match(r"(?i)\**example", p)][:4]
+            if not pts:
+                para = next((l.strip() for l in body.splitlines() if l.strip() and not l.lstrip().startswith(("|", "#"))), "")
+                pts = [para] if para else []
+            if pts:
+                add("idea", head, "\n".join("- " + p for p in pts) if len(pts) > 1 else pts[0], "Explain")
+        # definitions: "A **scalar** is a single number"
+        for m in re.finditer(r"\*\*([^*\n]{2,50})\*\*\s+(is|are|means|refers to|describes|stands for)\s+([^\n]{8,260}?)(?:\.(?:\s|$)|\n|$)", text):
+            term = m.group(1).strip(" :")
+            add("define", term, f"**{term}** {m.group(2)} {m.group(3).strip()}.", "Define")
+        # tables: first column asks, the rest answers
+        for block in re.findall(r"((?:^\|.*\|\s*$\n?){3,})", text, re.M):
+            rows = [[c.strip() for c in r.strip().strip("|").split("|")] for r in block.strip().splitlines()]
+            if len(rows[0]) < 2 or not re.match(r"^[\s:|-]+$", block.strip().splitlines()[1]):
+                continue
+            head = rows[0]
+            h0 = re.sub(r"[*_`]", "", head[0]).strip().lower()
+            if (h0 in _SKIP_TABLE or "\\" in h0 or "named" in h0 or not re.match(r"[a-z]", h0)):
+                continue                       # contact lists, number grids, ticks-and-crosses, deadlines
+            for r in rows[2:20]:
+                if len(r) >= 2 and r[0] and not re.fullmatch(r"[\d\s.%£$-]+", r[0]):
+                    ans = "\n".join(f"- {h}: {c}" for h, c in zip(head[1:], r[1:]) if c) if len(head) > 2 else r[1]
+                    add("table", f"{r[0]}", ans, head[0] or "Recall")
+        # fill the gap: a sentence with one bold term
+        gaps = 0
+        for sent in re.split(r"(?<=[.!?])\s+|\n", text):
+            b = re.findall(r"\*\*([^*\n]{3,40})\*\*", sent)
+            s = sent.strip(" -*")
+            if len(b) == 1 and 50 <= len(s) <= 240 and not s.startswith(("#", "|")) and gaps < 6 \
+                    and not re.search(r"\b(a|an|the|of|for|to|and|in|on|with|by)$", b[0].strip(), re.I):
+                q = s.replace(f"**{b[0]}**", "_____", 1)
+                if "_____" in q:
+                    gaps += 1
+                    add("gap", q, b[0], "Fill the gap")
+        out += cards[:40]
+    return out
+
+
+def study_page(notes, mod_key, modules, term=0, this_year=()):
+    cards = [c for c in make_cards(notes, mod_key, modules, this_year) if c["key"] in modules]
+    data = json.dumps({"cards": cards, "state": load_json(DATA_DIR / "study.json", {}), "term": term,
+                       "modules": [{"key": k, "name": v} for k, v in modules.items()
+                                   if any(c["key"] == k for c in cards)]}).replace("</", "<\\/")
+    return (STUDY_HTML + f'<script type="application/json" id="study-data">{data}</script>') if cards else \
+        '<div class="panel glass"><p class="sub" style="margin:0">Study cards are made from your notes. Make some notes in the Notes tab and they show up here.</p></div>'
+
+
+STUDY_HTML = """
+<style>
+.st-top{display:grid;grid-template-columns:1.4fr 1fr;gap:14px;margin-bottom:14px}
+@media (max-width:760px){.st-top{grid-template-columns:1fr}}
+.st-stats,.st-focus,.st-stage,.st-chart{border-radius:22px;padding:18px}
+.st-stats{display:flex;align-items:center;gap:16px 20px;flex-wrap:wrap}
+.st-ring{position:relative;width:96px;height:96px;flex:none}
+.st-ring svg{width:96px;height:96px;transform:rotate(-90deg)}
+.st-ring circle{fill:none;stroke-width:8} .st-ring .bg{stroke:var(--inset)} .st-ring .fg{stroke:var(--text);stroke-linecap:round;transition:stroke-dashoffset .7s cubic-bezier(.2,.9,.3,1),stroke .3s}
+.st-ring.met .fg{stroke:#2fb36b} .st-ring.win{animation:st-win .7s}
+.st-ring .in{position:absolute;inset:0;display:grid;place-content:center;text-align:center}
+.st-ring b{font:800 24px/1 var(--dotf)} .st-ring small{font:10px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.st-nums{display:grid;grid-template-columns:repeat(3,minmax(70px,1fr));gap:10px 16px;flex:1;min-width:220px}
+.st-nums b{display:block;font:800 22px/1.1 var(--dotf);transform-origin:left center} .st-nums small{font:10.5px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.st-streak.hot{color:#f5a524} .st-streak.hot::after{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:#f5a524;margin-left:5px;vertical-align:5px;box-shadow:0 0 8px #f5a524}
+.st-lvl{flex-basis:100%;display:grid;grid-template-columns:auto 1fr auto;align-items:baseline;gap:6px 10px}
+.st-lvl b{font:800 13px var(--mono)} .st-lvl span{font:11px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.06em} .st-lvl small{font:10.5px var(--mono);color:var(--muted)}
+.st-lvbar{grid-column:1/-1;height:6px;border-radius:3px;background:var(--inset);overflow:hidden}
+.st-lvbar i{display:block;height:100%;width:0;border-radius:3px;background:linear-gradient(90deg,#3b82f6,#a78bfa,#f472b6);transition:width .8s cubic-bezier(.2,.9,.3,1)}
+.st-focus{display:flex;flex-direction:column;gap:10px}
+.st-fhead{display:flex;justify-content:space-between;align-items:center;gap:8px;font:11px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.st-time{font:800 44px/1 var(--dotf);letter-spacing:.04em}
+.st-focus.running .st-time{animation:st-breathe 3.2s ease-in-out infinite}
+.st-fbar{height:6px;border-radius:3px;background:var(--inset);overflow:hidden} .st-fbar i{display:block;height:100%;width:0;background:var(--text);transition:width .9s linear}
+.st-focus.running .st-fbar i{background:linear-gradient(90deg,#3b82f6,#2fb36b)} .st-focus.brk .st-fbar i{background:#f5a524}
+.st-fexp{font:11px/1.45 var(--mono);color:var(--muted)}
+.st-rounds{display:inline-flex;gap:4px;margin-left:4px} .st-rounds i{width:8px;height:8px;border-radius:50%;border:1px solid var(--line);transition:background .3s}
+.st-rounds i.on{background:#2fb36b;border-color:#2fb36b}
+.st-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.st button.chip{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 13px;font:12px var(--mono);cursor:pointer;transition:background .15s,color .15s,border-color .15s,transform .15s}
+.st button.chip:hover{border-color:var(--text)} .st button.chip:active{transform:scale(.96)}
+.st button.chip.on{background:var(--text);color:var(--bg);border-color:var(--text)}
+.st button.chip:disabled{opacity:.4;cursor:default}
+/* filters: one tidy line each, scrolling sideways when they don't fit */
+.st-filters{display:grid;gap:8px;margin:0 0 14px}
+.st-line{display:flex;align-items:center;gap:10px;min-width:0}
+.st-line[hidden]{display:none}
+.st-line>small{flex:none;width:58px;font:10px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.st-line{position:relative}
+.st-scroll{position:relative;display:flex;gap:6px;overflow-x:auto;min-width:0;padding:3px 2px;scrollbar-width:none}
+/* the fade and arrow only show on a side with more to see */
+.st-line.r .st-scroll{-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 56px),transparent);mask-image:linear-gradient(90deg,#000 calc(100% - 56px),transparent)}
+.st-line.l .st-scroll{-webkit-mask-image:linear-gradient(90deg,transparent,#000 56px);mask-image:linear-gradient(90deg,transparent,#000 56px)}
+.st-line.l.r .st-scroll{-webkit-mask-image:linear-gradient(90deg,transparent,#000 56px,#000 calc(100% - 56px),transparent);mask-image:linear-gradient(90deg,transparent,#000 56px,#000 calc(100% - 56px),transparent)}
+.st-arr{position:absolute;top:50%;z-index:2;width:28px;height:28px;margin-top:-14px;padding:0;border-radius:50%;border:1px solid var(--line);background:var(--bg);color:var(--text);
+ font:15px/1 var(--mono);cursor:pointer;display:none;place-items:center;box-shadow:0 2px 12px rgba(0,0,0,.35);transition:border-color .15s,transform .15s}
+.st-arr:hover{border-color:var(--text);transform:scale(1.08)} .st-arr.l{left:66px} .st-arr.r{right:-6px}
+.st-line.l .st-arr.l,.st-line.r .st-arr.r{display:grid}
+.st-scroll::-webkit-scrollbar{display:none}
+.st-scroll button.chip{flex:none;white-space:nowrap}
+.st-modes{gap:10px;align-items:center} .st-seg{flex:none}
+.st-seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;padding:3px;gap:2px}
+.st .st-seg button.chip{border:0;padding:6px 12px}
+.st-modes button.chip b{font-weight:700;margin-left:5px;opacity:.75}
+.st-weeks .wk{position:relative;flex:none;border:1px solid var(--line);background:transparent;color:var(--text);border-radius:12px;padding:6px 12px 8px;cursor:pointer;display:grid;gap:1px;text-align:left;overflow:hidden;transition:border-color .2s,transform .15s,background .15s}
+.st-weeks .wk:hover{border-color:var(--text)}
+.st-weeks .wk b{font:700 12px var(--mono);white-space:nowrap} .st-weeks .wk small{font:10px var(--mono);color:var(--muted);white-space:nowrap}
+.st-weeks .wk i{position:absolute;left:0;bottom:0;height:3px;background:#2fb36b;transition:width .6s}
+.st-weeks .wk.on{background:var(--text);color:var(--bg);border-color:var(--text)} .st-weeks .wk.on small{color:inherit;opacity:.7}
+.st-weeks .wk.now:not(.on){border-color:#2fb36b}
+.st-weeks .wk em{font-style:normal;color:#f5a524;margin-left:4px}
+.st-stage{display:flex;flex-direction:column;gap:16px}
+/* what you pick opens in a panel that drops down under the start screen */
+.st-drop{display:flex;flex-direction:column;gap:14px;border-top:1px solid var(--line);padding-top:16px;scroll-margin-top:16px}
+.st-drop[hidden]{display:none}
+.st-drop.opening{animation:st-drop .45s cubic-bezier(.2,.9,.3,1.1) both;transform-origin:top center}
+.st-dhead{display:flex;justify-content:space-between;align-items:center;gap:10px;font:700 12px var(--mono);text-transform:uppercase;letter-spacing:.08em}
+.st-x{flex:none;width:30px;height:30px;padding:0;border-radius:50%;border:1px solid var(--line);background:transparent;color:var(--text);cursor:pointer;font-size:12px;transition:transform .25s,border-color .15s}
+.st-x:hover{border-color:var(--text);transform:rotate(90deg)}
+.st-body{display:flex;flex-direction:column;gap:14px;min-height:300px}
+.st-body.swap>*{animation:st-fade .35s both}
+.st-stage.open .st-hero b{font-size:24px}
+.st-stage.open .st-tip{display:none}
+@keyframes st-drop{from{opacity:0;transform:translateY(-16px) scaleY(.96)}}
+/* rewards */
+.st-rew{display:grid;grid-template-columns:1fr 1.25fr;gap:18px 24px;border-radius:22px;padding:18px;margin-bottom:14px}
+@media (max-width:760px){.st-rew{grid-template-columns:1fr}}
+.st-quests .st-fhead{flex-wrap:wrap;gap:4px 12px} .st-quests .st-fhead span{white-space:nowrap}
+.st-qbonus{color:#f5a524;text-transform:none;letter-spacing:0} .st-qbonus.all{color:#2fb36b}
+.st-qlist{display:grid;gap:12px;margin-top:12px}
+.st-quest{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:6px 10px;font-size:13.5px}
+.st-quest i.ck{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--line);display:grid;place-items:center;transition:background .3s,border-color .3s}
+.st-quest.done i.ck{background:#2fb36b;border-color:#2fb36b}
+.st-quest.done i.ck::after{content:"";width:4px;height:8px;border:solid #fff;border-width:0 2px 2px 0;transform:translateY(-1px) rotate(45deg)}
+.st-quest.just i.ck{animation:st-win .6s}
+.st-quest small{font:11px var(--mono);color:var(--muted)}
+.st-quest.done span{color:var(--muted)}
+.st-qbar{grid-column:2/-1;height:4px;border-radius:2px;background:var(--inset);overflow:hidden}
+.st-qbar i{display:block;height:100%;border-radius:2px;background:linear-gradient(90deg,#3b82f6,#2fb36b);transition:width .7s cubic-bezier(.2,.9,.3,1)}
+.st-bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(66px,1fr));gap:10px 6px;margin-top:12px}
+.st-badge{display:grid;justify-items:center;gap:5px;text-align:center;cursor:default}
+.st-badge b{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;font:800 11px var(--mono);border:1.5px dashed var(--line);color:var(--muted);transition:transform .25s cubic-bezier(.3,1.6,.5,1)}
+.st-badge small{font:9.5px/1.25 var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.st-badge.got b{border:0;color:#5a3a00;background:linear-gradient(135deg,#ffe08a,#f5a524);box-shadow:0 4px 14px -4px rgba(245,165,36,.6)}
+.st-badge.got small{color:var(--text)}
+.st-badge:hover b{transform:translateY(-2px) rotate(-8deg) scale(1.06)}
+.st-badge.just b{animation:st-spin .8s cubic-bezier(.2,.9,.3,1.3)}
+.st-cshead{margin-top:16px} .st-cs{margin-top:8px}
+.st-cs i.csw{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px;border:1px solid var(--line)}
+.csw.plain{background:var(--inset)} .csw.ocean{background:linear-gradient(135deg,#3b82f6,#2fb36b)} .csw.sunset{background:linear-gradient(135deg,#f5a524,#e5484d)} .csw.aurora{background:linear-gradient(135deg,#a78bfa,#f472b6,#2fb36b)}
+.st-next-un{text-transform:none;letter-spacing:0}
+.st[data-cs=ocean] .st-face{background:linear-gradient(135deg,rgba(59,130,246,.2),rgba(47,179,107,.1)),var(--inset)}
+.st[data-cs=sunset] .st-face{background:linear-gradient(135deg,rgba(245,165,36,.2),rgba(229,72,77,.12)),var(--inset)}
+.st[data-cs=aurora] .st-face{background:linear-gradient(135deg,rgba(167,139,250,.22),rgba(244,114,182,.12) 55%,rgba(47,179,107,.12)),var(--inset)}
+.st-meta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font:11px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.st-meta a{color:inherit;cursor:pointer;text-decoration:underline}
+.st-combo{color:#f5a524;font-weight:700;display:inline-block}
+.st-prog{height:4px;border-radius:2px;background:var(--inset);overflow:hidden} .st-prog i{display:block;height:100%;width:0;background:var(--text);transition:width .45s cubic-bezier(.2,.9,.3,1)}
+/* the card: a stack you work through, a 3D turn, and a fling when graded */
+.st-deck{position:relative;margin-bottom:14px}
+.st-deck::before,.st-deck::after{content:"";position:absolute;left:14px;right:14px;bottom:-7px;height:7px;border-radius:0 0 14px 14px;border:1px solid var(--line);border-top:0;background:var(--inset);opacity:.7;transition:opacity .3s}
+.st-deck::after{left:28px;right:28px;bottom:-13px;height:6px;opacity:.4}
+.st-deck.d0::before,.st-deck.d0::after,.st-deck.d1::after{opacity:0}
+.st-card{position:relative;z-index:1;perspective:1400px;cursor:pointer;outline:none}
+.st-card:focus-visible .st-face{box-shadow:0 0 0 2px var(--text)}
+.st-flip{position:relative;width:100%;min-height:230px;transition:transform .6s cubic-bezier(.3,1.35,.5,1);transform-style:preserve-3d}
+.st-card.back .st-flip{transform:rotateY(180deg)}
+.st-face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border:1px solid var(--line);border-radius:18px;padding:22px 24px;
+ display:flex;flex-direction:column;justify-content:center;gap:10px;background:var(--inset);overflow:auto}
+.st-face.b{transform:rotateY(180deg)}
+.st-face.b::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(105deg,transparent 42%,rgba(255,255,255,.07) 50%,transparent 58%);transform:translateX(-130%)}
+.st-card.back:not(.ghost) .st-face.b::after{animation:st-shine 1s .3s ease}
+.st-card.in{animation:st-in .45s cubic-bezier(.2,.9,.3,1.15) both}
+.st-card.lift{animation:st-lift .6s ease}
+.st-card.ghost{position:absolute;inset:0;z-index:3;pointer-events:none;transition:transform .42s cubic-bezier(.5,0,.75,.3),opacity .42s}
+.st-card.ghost.out{opacity:0}
+.st-card.ghost.out.g0{transform:translateX(-55%) rotate(-9deg)} .st-card.ghost.out.g1{transform:translate(-18%,-30%) rotate(-4deg)}
+.st-card.ghost.out.g2{transform:translateX(55%) rotate(8deg)} .st-card.ghost.out.g3{transform:translate(60%,-28%) rotate(14deg)}
+.st-card.ghost.g0 .st-face{border-color:#e5484d;box-shadow:inset 0 0 0 2px rgba(229,72,77,.5)} .st-card.ghost.g1 .st-face{border-color:#f5a524;box-shadow:inset 0 0 0 2px rgba(245,165,36,.5)}
+.st-card.ghost.g2 .st-face{border-color:#2fb36b;box-shadow:inset 0 0 0 2px rgba(47,179,107,.5)} .st-card.ghost.g3 .st-face{border-color:#3b82f6;box-shadow:inset 0 0 0 2px rgba(59,130,246,.5)}
+.st-ask{font:11px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:flex;align-items:center}
+.st-ask i.k,.st-list summary i.k{flex:none;display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px;background:var(--kc)}
+.st-q{font-size:22px;line-height:1.35;font-weight:700} .st-pop{animation:st-pop .35s both}
+.st-a{font-size:16px;line-height:1.55} .st-a ul{margin:0;padding-left:20px} .st-a code,.st-q code{font-family:var(--mono);font-size:.9em;background:var(--bg);padding:1px 5px;border-radius:5px}
+.st-hint{font:11px var(--mono);color:var(--muted)}
+.st-blank{display:inline-block;width:3.4em;height:.9em;border-bottom:2px solid currentColor;opacity:.55;margin:0 .15em;vertical-align:baseline}
+.st-grade,.st-next{scroll-margin-bottom:96px}
+.st-grade{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.st-grade button{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:14px;padding:10px 6px;cursor:pointer;font:600 14px var(--sans,inherit);display:flex;flex-direction:column;align-items:center;gap:2px;
+ animation:st-pop .3s both;animation-delay:calc(var(--i) * 45ms);transition:background .15s,border-color .15s,transform .12s}
+.st-grade button:hover{transform:translateY(-2px)} .st-grade button:active{transform:scale(.95)}
+.st-grade button small{font:10.5px var(--mono);color:var(--muted)} .st-grade button kbd{font:10px var(--mono);opacity:.6}
+.st-grade .g0:hover{border-color:#e5484d;background:rgba(229,72,77,.12)} .st-grade .g1:hover{border-color:#f5a524;background:rgba(245,165,36,.12)}
+.st-grade .g2:hover{border-color:#2fb36b;background:rgba(47,179,107,.12)} .st-grade .g3:hover{border-color:#3b82f6;background:rgba(59,130,246,.12)}
+.st-show,.st-cta{border:0;border-radius:14px;padding:12px 18px;background:var(--text);color:var(--bg);font-weight:700;cursor:pointer;font-size:15px;font-family:inherit;transition:transform .12s,opacity .15s}
+.st-show:hover,.st-cta:hover{opacity:.9} .st-show:active,.st-cta:active{transform:scale(.98)}
+.st-act{display:grid}
+.st-opts{display:grid;gap:8px}
+.st-opt,.st-tile,.st-pick,.st-note,.st-show,.st-arr{font-family:inherit}
+.st-opt{text-align:left;border:1px solid var(--line);background:transparent;color:var(--text);border-radius:14px;padding:12px 14px;cursor:pointer;font-size:14.5px;line-height:1.45;display:flex;gap:10px;
+ animation:st-pop .32s both;animation-delay:calc(var(--i) * 55ms);transition:border-color .15s,background .2s,opacity .25s,transform .12s}
+.st-opt kbd{font:11px var(--mono);color:var(--muted);flex:none;margin-top:2px}
+.st-opt:hover{border-color:var(--text);transform:translateX(3px)}
+.st-opt.right{border-color:#2fb36b;background:rgba(47,179,107,.14);animation:st-good .45s} .st-opt.wrong{border-color:#e5484d;background:rgba(229,72,77,.14);animation:st-shake .4s}
+.st-opt.dim{opacity:.45} .st-opt.right,.st-opt.wrong,.st-opt.dim{cursor:default;transform:none}
+.st-done{text-align:center;display:grid;gap:10px;place-items:center;flex:1;align-content:center}
+.st-done b{font:800 40px/1 var(--dotf)} .st-done p{margin:0;color:var(--muted)} .st-done .st-big{animation:st-win .6s .1s both}
+.st-sub2{font:12px var(--mono)}
+.st-medal{width:58px;height:58px;display:grid;place-items:center;border-radius:50%;background:var(--inset);border:1px solid var(--line);color:var(--muted);animation:st-spin .7s cubic-bezier(.2,.9,.3,1.3) both}
+.st-medal.gold{background:linear-gradient(135deg,#ffe08a,#f5a524);border-color:#f5a524;color:#5a3a00;box-shadow:0 0 24px rgba(245,165,36,.45)}
+/* start screen */
+.st-home{display:grid;gap:18px}
+.st-hero{display:grid;gap:8px;justify-items:start}
+.st-hero b{font:800 32px/1.05 var(--dotf)} .st-hero p{margin:0;color:var(--muted)}
+.st-picks{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+.st-pick{position:relative;border:1px solid var(--line);background:var(--inset);color:var(--text);border-radius:16px;padding:14px;text-align:left;cursor:pointer;display:grid;gap:6px;align-content:start;
+ transition:transform .18s,border-color .18s,box-shadow .18s,background .18s}
+.st-home.intro .st-pick{animation:st-pop .4s both;animation-delay:calc(var(--i) * 70ms)}
+.st-pick:hover{transform:translateY(-4px);border-color:var(--pc);box-shadow:0 10px 26px -14px var(--pc)}
+/* the open one stays lit, with its arrow turned down toward its panel */
+.st-pick.on{border-color:var(--pc);box-shadow:0 0 0 1px var(--pc),0 12px 28px -14px var(--pc)}
+.st-chev{position:absolute;top:16px;right:14px;width:8px;height:8px;border:solid var(--muted);border-width:0 1.5px 1.5px 0;transform:rotate(-45deg);transition:transform .25s,border-color .2s}
+.st-pick:hover .st-chev{border-color:var(--text)} .st-pick.on .st-chev{transform:rotate(45deg);border-color:var(--pc)}
+.st-pick b{font-size:15px} .st-pick small{color:var(--muted);font-size:12.5px;line-height:1.4}
+.st-pi{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;background:var(--pc);color:#fff;transition:transform .25s cubic-bezier(.3,1.6,.5,1)}
+.st-pick:hover .st-pi{transform:rotate(-8deg) scale(1.1)}
+.st-tip{margin:0;font-size:13px;color:var(--muted)} .st-tip b{font:700 10.5px var(--mono);text-transform:uppercase;letter-spacing:.08em;margin-right:8px;color:var(--text)}
+/* Match */
+.st-match{display:grid;grid-template-columns:1fr 1.5fr;gap:10px}
+.st-col{display:grid;gap:8px;align-content:start}
+.st-tile{border:1px solid var(--line);background:var(--inset);color:var(--text);border-radius:12px;padding:10px 12px;text-align:left;cursor:pointer;font-size:13.5px;line-height:1.4;
+ animation:st-pop .3s both;animation-delay:calc(var(--i) * 40ms);transition:opacity .3s,transform .3s,border-color .15s,background .15s}
+.st-tile.q{font-weight:700} .st-tile:hover{border-color:var(--text)}
+.st-tile.sel{border-color:#3b82f6;background:rgba(59,130,246,.16);transform:scale(1.02)}
+.st-tile.ok{border-color:#2fb36b;background:rgba(47,179,107,.18);animation:st-good .35s}
+.st-tile.bad{border-color:#e5484d;animation:st-shake .4s}
+.st-tile.gone{opacity:0;transform:scale(.85);pointer-events:none}
+/* Type it */
+.st-typebox{display:flex;gap:8px;flex-wrap:wrap}
+.st-in{flex:1;min-width:180px;border:1px solid var(--line);border-radius:12px;padding:11px 14px;background:var(--inset);color:var(--text);font-family:inherit;font-size:16px;font-weight:600;outline:none;transition:border-color .2s,box-shadow .2s}
+.st-in:focus{border-color:var(--text);box-shadow:0 0 0 3px rgba(127,127,127,.18)}
+.st-in.right{border-color:#2fb36b;box-shadow:0 0 0 3px rgba(47,179,107,.22);animation:st-good .4s}
+.st-in.wrong,.st-blurt.wrong{border-color:#e5484d;animation:st-shake .4s}
+.st-fb{min-height:22px;font-size:15px} .st-fb>*{animation:st-fade .3s both} .st-fb .ok{color:#2fb36b} .st-fb .no{color:#e5484d}
+.st-hintt{font:600 16px var(--mono);letter-spacing:.1em;color:var(--muted)}
+/* Blurt */
+.st-intro b{font:800 22px/1.2 var(--dotf)} .st-intro p{margin:6px 0 0;color:var(--muted)}
+.st-notes{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}
+.st-note{border:1px solid var(--line);background:var(--inset);color:var(--text);border-radius:12px;padding:10px 12px;text-align:left;cursor:pointer;display:grid;gap:3px;
+ animation:st-pop .3s both;animation-delay:min(calc(var(--i) * 30ms),.6s);transition:transform .15s,border-color .15s}
+.st-note:hover{transform:translateY(-2px);border-color:#a78bfa} .st-note span{font-weight:700;font-size:14px} .st-note small{font:10.5px var(--mono);color:var(--muted)}
+.st-blurt{min-height:220px;resize:vertical;border:1px solid var(--line);border-radius:14px;padding:14px;background:var(--inset);color:var(--text);font-family:inherit;font-size:15px;line-height:1.6;width:100%;box-sizing:border-box;outline:none}
+.st-blurt:focus{border-color:var(--text)}
+.st-wc{font:11px var(--mono);color:var(--muted)}
+.st-bres{display:flex;gap:18px;align-items:center;flex-wrap:wrap} .st-bres p{margin:4px 0 0;color:var(--muted)} .st-btitle{font-size:20px}
+.st-bres .st-ring .fg{transition:stroke-dashoffset 1.2s cubic-bezier(.2,.9,.3,1);stroke:#a78bfa}
+.st-pts{display:grid;gap:6px;max-height:340px;overflow:auto}
+.st-pt{display:flex;gap:10px;align-items:baseline;padding:7px 10px;border-radius:10px;border:1px solid var(--line);font-size:14px;animation:st-pop .3s both;animation-delay:min(calc(var(--i) * 45ms),1.4s)}
+.st-pt i{flex:none;width:9px;height:9px;border-radius:50%;transform:translateY(1px)}
+.st-pt.got{border-color:rgba(47,179,107,.5);background:rgba(47,179,107,.08)} .st-pt.got i{background:#2fb36b}
+.st-pt.miss{opacity:.8} .st-pt.miss i{border:1.5px solid #e5484d}
+/* All cards */
+.st-list{display:grid;gap:6px;max-height:520px;overflow:auto}
+.st-wh{margin:10px 0 2px;font:700 12px var(--mono);text-transform:uppercase;letter-spacing:.06em;display:flex;gap:8px;align-items:baseline}
+.st-wh small{font-weight:400;color:var(--muted)} .st-list .st-wh:first-child{margin-top:0}
+.st-list details{border:1px solid var(--line);border-radius:12px;padding:9px 12px} .st-list summary{cursor:pointer;font-size:14px}
+.st-list summary small{font:10.5px var(--mono);color:var(--muted);margin-left:6px;text-transform:uppercase}
+.st-list .lv.learnt{color:#2fb36b} .st-list .lv.weak{color:#e5484d} .st-list .lv.learning{color:#3b82f6}
+.st-list .st-a{font-size:14px;margin-top:6px}
+.st-search{border:1px solid var(--line);border-radius:12px;padding:9px 12px;background:var(--inset);color:var(--text);font:inherit;width:100%;box-sizing:border-box}
+.st-chart{margin-top:14px} .st-bars{display:flex;align-items:flex-end;gap:5px;height:90px;margin-top:10px}
+.st-bars div{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;font:10px var(--mono);color:var(--muted)}
+.st-bars i{display:block;width:100%;border-radius:4px 4px 2px 2px;background:var(--text);min-height:2px;opacity:.85;transform-origin:bottom;animation:st-grow .5s both;animation-delay:calc(var(--i) * 25ms)}
+.st-bars.seen i{animation:none;transition:height .5s cubic-bezier(.2,.9,.3,1)}
+.st-bars .hit i{background:#3b82f6;opacity:1} .st-bars .today i{background:#2fb36b;opacity:1}
+nav button[data-tab=study].has-due::after{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:#2fb36b;margin-left:5px;vertical-align:3px}
+/* things that pop up over the page */
+.st-float{position:fixed;z-index:9999;pointer-events:none;transform:translate(-50%,0);font:800 14px var(--mono);color:#2fb36b;text-shadow:0 1px 8px rgba(0,0,0,.35);animation:st-float .95s cubic-bezier(.2,.7,.3,1) forwards}
+.st-confetti{position:fixed;inset:0;z-index:9998;pointer-events:none}
+.st-toast{position:fixed;left:50%;top:22px;z-index:9999;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 18px;border-radius:999px;font:700 13px var(--mono);pointer-events:none;box-shadow:0 10px 30px -10px rgba(0,0,0,.5);animation:st-toast 2.7s ease forwards}
+.bump{animation:st-bump .35s}
+@keyframes st-in{from{opacity:0;transform:translateY(18px) scale(.96)}}
+@keyframes st-lift{40%{transform:translateY(-8px) scale(1.025)}}
+@keyframes st-pop{from{opacity:0;transform:translateY(8px) scale(.94)}}
+@keyframes st-fade{from{opacity:0;transform:translateY(6px)}}
+@keyframes st-shake{20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+@keyframes st-good{40%{transform:scale(1.03)}}
+@keyframes st-bump{40%{transform:scale(1.22)}}
+@keyframes st-win{0%{opacity:0;transform:scale(.6)}55%{opacity:1;transform:scale(1.12)}100%{transform:scale(1)}}
+@keyframes st-spin{from{opacity:0;transform:rotate(-120deg) scale(.4)}}
+@keyframes st-grow{from{transform:scaleY(0)}}
+@keyframes st-float{to{transform:translate(-50%,-46px);opacity:0}}
+@keyframes st-shine{to{transform:translateX(130%)}}
+@keyframes st-breathe{50%{opacity:.7}}
+@keyframes st-toast{0%{opacity:0;transform:translate(-50%,-16px)}10%,85%{opacity:1;transform:translate(-50%,0)}100%{opacity:0;transform:translate(-50%,-10px)}}
+@media (prefers-reduced-motion:reduce){.st *,.st-float,.st-toast{animation:none!important;transition:none!important}}
+</style>
+<div class="st">
+ <div class="st-top">
+  <div class="st-stats glass">
+   <div class="st-ring" title="Today's goal"><svg viewBox="0 0 96 96"><circle class="bg" cx="48" cy="48" r="40"/><circle class="fg" cx="48" cy="48" r="40" stroke-dasharray="251.3" stroke-dashoffset="251.3"/></svg>
+    <div class="in"><b class="st-goal-n">0</b><small class="st-goal-of">of 20</small></div></div>
+   <div class="st-nums">
+    <div><b class="st-due">0</b><small>due now</small></div><div><b class="st-new">0</b><small>new cards</small></div><div><b class="st-streak">0</b><small>day streak</small></div>
+    <div><b class="st-acc">–</b><small>right today</small></div><div><b class="st-mins">0</b><small>focus min</small></div><div><b class="st-known">0</b><small>learnt</small></div>
+   </div>
+   <div class="st-lvl" title="You earn XP for every card, quiz answer, match and blurt"><b class="st-lv">Level 1</b><span class="st-lvname">Starter</span><small class="st-xp">0 / 100 XP</small><div class="st-lvbar"><i></i></div></div>
+  </div>
+  <div class="st-focus glass">
+   <div class="st-fhead"><span class="st-fmode">Focus</span><span class="st-row"><button class="chip st-len on" data-w="25" data-b="5" title="25 minutes of focus, then a 5 minute break">25 / 5</button><button class="chip st-len" data-w="50" data-b="10" title="50 minutes of focus, then a 10 minute break">50 / 10</button></span></div>
+   <div class="st-time">25:00</div><div class="st-fbar"><i></i></div>
+   <small class="st-fexp"></small>
+   <div class="st-row"><button class="chip st-go">Start</button><button class="chip st-reset">Reset</button><span class="st-rounds" title="Focus rounds finished today"></span><small class="st-fmsg" style="color:var(--muted)"></small></div>
+  </div>
+ </div>
+ <div class="st-rew glass">
+  <div class="st-quests"><div class="st-fhead"><span>Today's challenges</span><span class="st-qbonus"></span></div><div class="st-qlist"></div></div>
+  <div class="st-bwrap"><div class="st-fhead"><span>Badges</span><span class="st-bcount"></span></div><div class="st-bgrid"></div>
+   <div class="st-fhead st-cshead"><span>Card style</span><span class="st-next-un"></span></div><div class="st-row st-cs"></div></div>
+ </div>
+ <div class="st-filters">
+  <div class="st-line"><small>Module</small><div class="st-scroll st-mods" role="group" aria-label="Module"></div></div>
+  <div class="st-line st-wline"><small>Week</small><div class="st-scroll st-weeks" role="group" aria-label="Week"></div></div>
+  <div class="st-line"><small>Study</small><div class="st-scroll st-modes" role="group" aria-label="How to study">
+   <span class="st-seg"><button class="chip" data-m="due" title="Cards due for a review">Due<b class="n-due"></b></button><button class="chip" data-m="new" title="Cards you haven't seen yet">New<b class="n-new"></b></button><button class="chip" data-m="weak" title="Cards you keep getting wrong">Weak<b class="n-weak"></b></button></span>
+   <span class="st-seg"><button class="chip" data-m="quiz">Quiz</button><button class="chip" data-m="match">Match</button><button class="chip" data-m="type">Type it</button><button class="chip" data-m="blurt">Blurt</button></span>
+   <span class="st-seg"><button class="chip" data-m="all" title="Every card, by week, searchable">All<b class="n-all"></b></button></span>
+  </div></div>
+ </div>
+ <div class="st-stage glass" aria-live="polite"></div>
+ <div class="st-chart glass"><div class="st-fhead"><span>Last 14 days · cards reviewed</span><span class="st-goal-set">Daily goal <button class="chip st-gm">−</button> <b class="st-goal-v"></b> <button class="chip st-gp">+</button></span></div><div class="st-bars"></div></div>
+</div>
+"""
+
+STUDY_JS = r"""
+// ---- Study: cards from your notes with spaced repetition, plus a quiz, Match, Type it, Blurt, a focus timer and XP
+(() => {
+  const ROOT = document.getElementById('study'), DATA = document.getElementById('study-data');
+  if (!ROOT || !DATA) return;
+  const D = JSON.parse(DATA.textContent), CARDS = D.cards, $ = s => ROOT.querySelector(s);
+  const ST = Object.assign({cards: {}, days: {}, goal: 20, xp: 0, best: {}, blurts: {}, badges: {}, flags: {}, style: 'plain'}, D.state || {});
+  ST.best ||= {}; ST.blurts ||= {}; ST.xp ||= 0; ST.badges ||= {}; ST.flags ||= {}; ST.style ||= 'plain';
+  const DAY = 864e5, MIN = 6e4, dayKey = d => (d || new Date()).toLocaleDateString('en-CA');
+  let saveT = 0;
+  const save = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { pywebview.api.study_save(ST); } catch (_) {} }, 400); };
+  window.addEventListener('beforeunload', () => { try { pywebview.api.study_save(ST); } catch (_) {} });
+  const today = () => (ST.days[dayKey()] ||= {rev: 0, right: 0, mins: 0});
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]);
+  const fmt = t => { const lines = esc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/_{3,}/g, '<span class="st-blank"></span>').split('\n');
+    const pts = lines.filter(l => l.startsWith('- '));
+    return pts.length === lines.length ? '<ul>' + pts.map(l => '<li>' + l.slice(2) + '</li>').join('') + '</ul>' : lines.join('<br>'); };
+  const short = t => t.length > 220 ? t.slice(0, 217) + '…' : t;
+  const calm = () => document.documentElement.classList.contains('no-anim') || matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const sfx = (n, v) => { if (window.SFX) SFX.play(n, v); };
+  const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+  // teaching week, counted the way the note map counts it
+  const NOW_WK = D.term ? Math.max(0, Math.floor(Math.round((new Date().setHours(0, 0, 0, 0) - D.term) / DAY) / 7) + 1) : 0;
+
+  let mod = 'all', wk = 'all', mode = null, session = [], at = 0, flipped = false, quiz = null, game = null, done = {n: 0, right: 0, xp: 0}, lastProg = 0;
+  const pool = () => CARDS.filter(c => (mod === 'all' || c.key === mod) && (wk === 'all' || (c.wk || 0) === +wk));
+  const st = c => ST.cards[c.id];
+  const dueList = () => pool().filter(c => st(c) && st(c).due <= Date.now()).sort((a, b) => st(a).due - st(b).due);
+  const newList = () => pool().filter(c => !st(c));
+  const weakList = () => pool().filter(c => st(c) && (st(c).lapses > 0 || st(c).ease < 2.3)).sort((a, b) => (st(b).lapses - st(a).lapses) || (st(a).ease - st(b).ease));
+  const CARD_MODES = ['due', 'new', 'weak', 'set'];
+
+  // ---- little bits of fun: XP and levels, floating numbers, confetti, toasts, counting numbers
+  const LEVELS = ['Starter', 'Note taker', 'Learner', 'Reviser', 'Quick thinker', 'Scholar', 'Expert', 'Master', 'Legend'];
+  const lvlOf = xp => { let l = 0, need = 100; while (xp >= need) { xp -= need; l++; need = Math.round(need * 1.35); } return {l, into: Math.round(xp), need}; };
+  function gain(n, from) {
+    if (!n) return;
+    const before = lvlOf(ST.xp).l; ST.xp += n; done.xp += n; today().xp = (today().xp || 0) + n;
+    float(from, '+' + n + ' XP');
+    const L = lvlOf(ST.xp);
+    if (L.l > before) setTimeout(() => { const un = STYLES.find(x => x[2] === L.l + 1);
+      toast(`Level up! Level ${L.l + 1} · ${LEVELS[Math.min(L.l, LEVELS.length - 1)]}` + (un ? ` · ${un[1]} cards unlocked` : '')); confetti(); sfx('done'); }, 300);
+  }
+  function float(el, text) {
+    if (calm() || !el || !el.isConnected) return;
+    const r = el.getBoundingClientRect(), f = document.createElement('div');
+    f.className = 'st-float'; f.textContent = text; f.style.left = (r.left + r.width / 2) + 'px'; f.style.top = (r.top - 4) + 'px';
+    document.body.appendChild(f); setTimeout(() => f.remove(), 1000);
+  }
+  function toast(msg) {
+    const t = document.createElement('div'); t.className = 'st-toast'; t.textContent = msg;
+    t.style.top = (22 + 50 * document.querySelectorAll('.st-toast').length) + 'px';     // several stack instead of overlapping
+    document.body.appendChild(t); setTimeout(() => t.remove(), 2700);
+  }
+  function confetti() {
+    if (calm()) return;
+    const c = document.createElement('canvas'), x = c.getContext('2d'), W = c.width = innerWidth, H = c.height = innerHeight;
+    c.className = 'st-confetti'; document.body.appendChild(c);
+    const cols = ['#2fb36b', '#3b82f6', '#f5a524', '#e5484d', '#a78bfa', '#f472b6'];
+    const P = [...Array(130)].map(() => ({x: W / 2 + (Math.random() - .5) * W * .35, y: H * .42, vx: (Math.random() - .5) * 15, vy: -Math.random() * 15 - 4,
+      r: Math.random() * 6, vr: (Math.random() - .5) * .35, w: 5 + Math.random() * 6, h: 3 + Math.random() * 4, c: cols[Math.floor(Math.random() * cols.length)]}));
+    const t0 = performance.now();
+    (function frame(t) {
+      const k = (t - t0) / 1700; x.clearRect(0, 0, W, H);
+      P.forEach(p => { p.vy += .38; p.vx *= .985; p.x += p.vx; p.y += p.vy; p.r += p.vr;
+        x.save(); x.globalAlpha = Math.max(0, 1 - k * k); x.translate(p.x, p.y); x.rotate(p.r); x.fillStyle = p.c; x.fillRect(-p.w / 2, -p.h / 2, p.w, p.h); x.restore(); });
+      if (k < 1) requestAnimationFrame(frame); else c.remove();
+    })(t0);
+  }
+  const bump = el => { el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump'); };
+  function setNum(el, v, suf = '') {
+    const from = +el.dataset.v; el.dataset.v = v;
+    if (isNaN(from) || from === v || calm()) { el.textContent = v + suf; return; }
+    bump(el);
+    if (Math.abs(v - from) <= 3) { el.textContent = v + suf; return; }
+    const t0 = performance.now();
+    (function f(t) { const k = Math.min(1, (t - t0) / 500), e = 1 - Math.pow(1 - k, 3);
+      el.textContent = Math.round(from + (v - from) * e) + suf; if (k < 1 && +el.dataset.v === v) requestAnimationFrame(f); })(t0);
+  }
+  const TIPS = [
+    'Say the answer out loud before you turn the card. It sticks better than reading it.',
+    'Short and often beats one long session. Ten cards a day adds up fast.',
+    'Got one wrong? Good. The mistakes you fix are the ones you remember.',
+    'Mix modules in one session. Switching topics feels harder now and pays off in the exam.',
+    'Explain an idea as if to a friend. The gaps show up straight away.',
+    'Try Blurt the day after a lecture to see what actually stuck.',
+    'A quick review before bed helps. Sleep is when memories settle.',
+    'Hard cards come back sooner. That is the system working, not you failing.',
+    'Use a focus round: 25 minutes on, 5 off. Your phone goes in another room.',
+  ];
+  const cheer = pc => pc >= 90 ? 'Brilliant. You know this.' : pc >= 75 ? 'Great work. Nearly all of it.' : pc >= 50 ? 'Getting there. The misses come back soon.' : 'A tough one. Another go later will feel easier.';
+  const STAR = '<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.4l-5.3 3 1.2-6-4.5-4.1 6-.7z" fill="currentColor"/></svg>';
+
+  // ---- spaced repetition: Again / Hard / Good / Easy, intervals in days
+  function next(c, g) {
+    const s = Object.assign({ivl: 0, ease: 2.5, n: 0, lapses: 0}, st(c) || {});
+    if (g === 0) { s.n = 0; s.lapses++; s.ivl = 0; s.ease = Math.max(1.3, s.ease - .2); s.due = Date.now() + 10 * MIN; return s; }
+    s.n++;
+    s.ivl = g === 1 ? Math.max(1, s.ivl * 1.2) : s.n === 1 ? (g === 3 ? 4 : 1) : s.n === 2 ? (g === 3 ? 7 : 3) : s.ivl * s.ease * (g === 3 ? 1.3 : 1);
+    if (g === 1) s.ease = Math.max(1.3, s.ease - .15); if (g === 3) s.ease = Math.min(3.2, s.ease + .15);
+    s.ivl = Math.min(365, Math.round(s.ivl * 10) / 10); s.due = Date.now() + s.ivl * DAY; return s;
+  }
+  const when = s => s.ivl ? (s.ivl < 1.5 ? '1 day' : s.ivl < 30 ? Math.round(s.ivl) + ' days' : Math.round(s.ivl / 30) + ' mo') : '10 min';
+  function grade(g) {
+    const c = session[at]; if (!c || !flipped) return;
+    const btn = $('.st-grade .g' + g), old = $('.st-card:not(.ghost)');
+    ST.cards[c.id] = Object.assign(next(c, g), {seen: Date.now()});
+    const t = today(); t.rev++; if (g >= 2) t.right++; done.n++; if (g >= 2) done.right++;
+    if (g === 0) session.push(c);                 // see it again before the end
+    sfx(g === 0 ? 'tap' : 'open', .5);
+    gain([2, 5, 10, 12][g], btn);
+    save(); at++; flipped = false; stats(); draw();
+    fling(old, g);
+  }
+  // the graded card flies off (left for Again, right for Good) while the next one rises from the stack
+  function fling(old, g) {
+    const deck = $('.st-deck'); if (!old || !deck || calm()) return;
+    const gh = old.cloneNode(true); gh.classList.add('ghost'); gh.classList.remove('in', 'lift'); gh.removeAttribute('tabindex');
+    deck.appendChild(gh);
+    requestAnimationFrame(() => requestAnimationFrame(() => gh.classList.add('out', 'g' + g)));
+    setTimeout(() => gh.remove(), 450);
+  }
+
+  // ---- what's on screen: the start screen stays on top, and what you pick opens in a drop-down panel under it
+  const STG = $('.st-stage');
+  STG.innerHTML = '<div class="st-home"></div><div class="st-drop" hidden><div class="st-dhead"><span class="st-dtitle"></span>'
+    + '<button class="st-x" aria-label="Close" title="Close (Esc)">✕</button></div><div class="st-body" aria-live="polite"></div></div>';
+  const HOME = $('.st-home'), DROP = $('.st-drop'), S = $('.st-body');
+  const TITLES = {due: 'Review due cards', new: 'Learn new cards', weak: 'Practise weak cards', set: 'The points you missed',
+    quiz: 'Quiz', match: 'Match', type: 'Type it', blurt: 'Blurt', all: 'All cards'};
+  const markPicks = () => HOME.querySelectorAll('[data-go]').forEach(b => { const on = b.dataset.go === (mode === 'set' ? 'blurt' : mode);
+    b.classList.toggle('on', on); b.setAttribute('aria-expanded', on); });
+  function openDrop() {
+    $('.st-dtitle').textContent = TITLES[mode] || ''; STG.classList.add('open'); markPicks();
+    if (!DROP.hidden) return;
+    DROP.hidden = false; DROP.classList.remove('opening'); void DROP.offsetWidth; DROP.classList.add('opening');
+    requestAnimationFrame(() => { if (DROP.getBoundingClientRect().top > innerHeight * .6) DROP.scrollIntoView({block: 'start', behavior: calm() ? 'auto' : 'smooth'}); });
+  }
+  function closeDrop() {
+    if (game && game.timer) clearInterval(game.timer);
+    game = null; quiz = null; mode = null; session = [];
+    ROOT.querySelectorAll('.st-modes .chip').forEach(b => b.classList.remove('on'));
+    DROP.hidden = true; STG.classList.remove('open'); S.innerHTML = ''; home(); sfx('tap', .3);
+  }
+  $('.st-x').onclick = closeDrop;
+  function openNote(c) {
+    show('notes'); openView('notes-' + c.key);
+    setTimeout(() => { const d = [...document.querySelectorAll('#notes-' + c.key + ' details')].find(x => x.querySelector('summary b')?.textContent === c.title);
+      if (d) { d.open = true; d.scrollIntoView({behavior: 'smooth', block: 'center'}); } }, 80);
+  }
+  const KIND = {define: '#3b82f6', idea: '#a78bfa', table: '#f5a524', gap: '#2fb36b'};
+  const dot = c => `<i class="k" style="--kc:${KIND[c.kind] || 'var(--muted)'}"></i>`;
+  function meta(c, i, n) {
+    const w = Math.round(100 * (i - 1) / Math.max(1, n));
+    return `<div class="st-meta"><span>${c.wk ? 'Wk ' + c.wk + ' · ' : ''}${c.mod ? esc(c.mod) + ' · ' : ''}<a class="st-open">${esc(c.note)}</a></span><span><span class="st-combo"></span>${i} / ${n}</span></div>`
+      + `<div class="st-prog"><i style="width:${lastProg}%" data-w="${w}"></i></div>`;
+  }
+  // the progress bar slides from where it was rather than jumping
+  function prog() { const i = $('.st-prog i[data-w]'); if (!i) return; lastProg = +i.dataset.w; requestAnimationFrame(() => requestAnimationFrame(() => { i.style.width = lastProg + '%'; })); }
+  function combo(n) { const el = $('.st-combo'); if (!el) return; el.textContent = n >= 2 ? n + ' in a row · ' : ''; if (n >= 2) bump(el); }
+  const inView = sel => requestAnimationFrame(() => { const el = $(sel); if (el && el.getBoundingClientRect().bottom > innerHeight - 90) el.scrollIntoView({block: 'end', behavior: 'smooth'}); });
+  function swap() { S.classList.remove('swap'); void S.offsetWidth; S.classList.add('swap'); clearTimeout(swap.t); swap.t = setTimeout(() => S.classList.remove('swap'), 450); }
+
+  function start(m, list) {
+    if (game && game.timer) clearInterval(game.timer);
+    game = null; quiz = null; mode = m; at = 0; flipped = false; done = {n: 0, right: 0, xp: 0}; lastProg = 0;
+    ROOT.querySelectorAll('.st-modes .chip').forEach(b => b.classList.toggle('on', b.dataset.m === (m === 'set' ? 'blurt' : m)));
+    if (m === 'set') session = list || [];
+    if (m === 'due') session = dueList().slice(0, 100);
+    if (m === 'new') session = newList().slice(0, Math.max(5, ST.goal - today().rev));
+    if (m === 'weak') session = weakList().slice(0, 15);
+    if (m === 'quiz') { const p = shuffle(pool()), can = [...p.filter(c => c.kind !== 'idea'), ...p.filter(c => c.kind === 'idea')];
+      quiz = {list: can.slice(0, 10), at: 0, score: 0, picked: null, combo: 0, best: 0}; }
+    if (m === 'match') startMatch();
+    if (m === 'type') startType();
+    if (m === 'blurt') game = {note: null, text: '', t0: 0, timer: 0, result: false};
+    home(); swap(); draw(); edges(true);
+  }
+  function finish(big, line, sub, buttons, good) {
+    S.innerHTML = `<div class="st-done"><div class="st-medal${good ? ' gold' : ''}">${STAR}</div><b class="st-big">${big}</b><p>${line}</p>${sub ? `<p class="st-sub2">${sub}</p>` : ''}`
+      + `<div class="st-row">${buttons.map(([t, m]) => `<button class="chip" data-go="${m}">${t}</button>`).join('')}</div></div>`;
+    S.querySelectorAll('[data-go]').forEach(b => b.onclick = () => start(b.dataset.go));
+    sfx('done'); if (good) confetti();
+    try { pywebview.api.track('study'); } catch (_) {}
+  }
+  function empty(msg, buttons) {
+    S.innerHTML = `<div class="st-done"><b>Nothing here</b><p>${msg}</p><div class="st-row">${buttons.map(([t, m]) => `<button class="chip" data-go="${m}">${t}</button>`).join('')}</div></div>`;
+    S.querySelectorAll('[data-go]').forEach(b => b.onclick = () => start(b.dataset.go));
+  }
+
+  function draw() {
+    if (!mode) { DROP.hidden = true; STG.classList.remove('open'); return home(); }
+    openDrop();
+    if (mode === 'all') return browse();
+    if (mode === 'quiz') return drawQuiz();
+    if (mode === 'match') return drawMatch();
+    if (mode === 'type') return drawType();
+    if (mode === 'blurt') return drawBlurt();
+    const c = session[at];
+    if (!c) {
+      if (!done.n) return empty(mode === 'due' ? 'No cards are due right now. Next review ' + nextDue() + '.' : mode === 'weak' ? 'No weak cards. Nice.' : 'No new cards left here.',
+        [['Learn new', 'new'], ['Quiz me', 'quiz'], ['Match', 'match']]);
+      const pc = Math.round(100 * done.right / done.n);
+      return finish(pc + '%', cheer(pc), `${done.n} cards · ${done.right} right · +${done.xp} XP · next review ${nextDue()}`,
+        [['Learn new', 'new'], ['Quiz me', 'quiz'], ['Match', 'match']], pc >= 80);
+    }
+    const s = st(c), left = session.length - at - 1;
+    S.innerHTML = meta(c, at + 1, session.length)
+      + `<div class="st-deck d${Math.min(2, left)}"><div class="st-card in" tabindex="0" aria-label="Card, press Space to turn"><div class="st-flip">`
+      + `<div class="st-face a"><span class="st-ask">${dot(c)}${esc(c.ask)}${s ? '' : ' · new'}</span><div class="st-q">${fmt(c.q)}</div><span class="st-hint">Space or click to turn</span></div>`
+      + `<div class="st-face b"><span class="st-ask">${dot(c)}${esc(c.q.length < 80 ? c.q : c.ask)}</span><div class="st-a">${fmt(c.a)}</div></div></div></div></div><div class="st-act"></div>`;
+    $('.st-open').onclick = () => openNote(c);
+    $('.st-card').onclick = flip;
+    fit(); acts(); prog();
+  }
+  // both faces are stacked, so the card takes the height of the taller one
+  function fit() {
+    const f = $('.st-card:not(.ghost) .st-flip'); if (!f) return;
+    const h = Math.max(...[...f.querySelectorAll('.st-face')].map(x => [...x.children].reduce((a, k) => a + k.offsetHeight + 10, 44)));
+    f.style.height = Math.min(480, Math.max(230, h)) + 'px';
+  }
+  function acts() {
+    const c = session[at], A = $('.st-act'); if (!c || !A) return;
+    if (flipped) {
+      const o = [0, 1, 2, 3].map(g => next(c, g));
+      A.innerHTML = `<div class="st-grade">${['Again', 'Hard', 'Good', 'Easy'].map((t, g) => `<button class="g${g}" data-g="${g}" style="--i:${g}">${t}<small>${when(o[g])}</small><kbd>${g + 1}</kbd></button>`).join('')}</div>`;
+      A.querySelectorAll('button').forEach(b => b.onclick = () => grade(+b.dataset.g));
+      inView('.st-grade');
+    } else {
+      A.innerHTML = '<button class="st-show">Show answer <span style="opacity:.6">(Space)</span></button>';
+      $('.st-show').onclick = flip;
+    }
+  }
+  function flip() {
+    const card = $('.st-card:not(.ghost)'); if (!card || !session[at]) return;
+    flipped = !flipped; card.classList.remove('in', 'lift'); void card.offsetWidth;
+    card.classList.toggle('back', flipped); card.classList.add('lift');
+    sfx('tap', .35); acts();
+  }
+  function nextDue() { const t = Math.min(...pool().filter(st).map(c => st(c).due)); if (!isFinite(t)) return 'once you learn some cards';
+    const h = (t - Date.now()) / 36e5; return h < 1 ? 'within the hour' : h < 24 ? 'in ' + Math.round(h) + ' h' : 'in ' + Math.round(h / 24) + ' days'; }
+
+  // ---- the start screen: what's waiting, the ways to practise, and a tip
+  const ICON = {
+    quiz: '<rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><path d="M14 16.5l2 2 3.5-4"/>',
+    match: '<rect x="3" y="6" width="7" height="12" rx="2"/><rect x="14" y="6" width="7" height="12" rx="2"/><path d="M10 12h4"/>',
+    type: '<rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 11h1M11 11h1M15 11h1M8 14h8"/>',
+    blurt: '<path d="M4 20l4-1 11-11-3-3L5 16z"/><path d="M14 6l3 3"/>',
+  };
+  const PICKS = [
+    ['quiz', 'Quiz me', 'Ten questions, four answers each. Streaks earn bonus XP.', '#3b82f6'],
+    ['match', 'Match', 'Pair six terms with their meanings against the clock.', '#f5a524'],
+    ['type', 'Type it', 'See the meaning, type the term. Close spelling counts.', '#2fb36b'],
+    ['blurt', 'Blurt', 'Write all you remember about a note, then see what you missed.', '#a78bfa'],
+  ];
+  function home() {
+    const due = dueList().length, nw = newList().length,
+      thisWk = NOW_WK && wk === 'all' ? CARDS.filter(c => c.cur !== false && c.wk === NOW_WK && (mod === 'all' || c.key === mod)).length : 0;
+    HOME.innerHTML = `<div class="st-hero"><b>${due ? due + ' due' : nw ? 'Ready when you are' : 'All caught up'}</b>`
+      + `<p>${due ? 'Cards from your notes are waiting for a review.' : nw ? nw + ' new cards to learn' + (wk !== 'all' ? ' in week ' + wk : '') + '.' : 'Nothing due. A quick game keeps it fresh.'}</p>`
+      + `<div class="st-row"><button class="st-cta st-begin">${due ? 'Review now' : nw ? 'Learn new cards' : 'Quiz me'}</button>`
+      + (thisWk ? `<button class="chip st-thiswk">This week's cards · ${thisWk}</button>` : '') + '</div></div>'
+      + `<div class="st-picks">${PICKS.map(([m, t, d, col], i) => `<button class="st-pick" data-go="${m}" style="--i:${i};--pc:${col}" aria-expanded="false"><span class="st-pi"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[m]}</svg></span><b>${t}</b><small>${d}</small><i class="st-chev" aria-hidden="true"></i></button>`).join('')}</div>`
+      + `<p class="st-tip"><b>Tip</b>${TIPS[Math.floor(Math.random() * TIPS.length)]}</p>`;
+    $('.st-begin').onclick = () => start(due ? 'due' : nw ? 'new' : 'quiz');
+    // a pick opens its panel below; pressing the open one again closes it
+    HOME.querySelectorAll('[data-go]').forEach(b => b.onclick = () => b.classList.contains('on') ? closeDrop() : start(b.dataset.go));
+    const tw = $('.st-thiswk'); if (tw) tw.onclick = () => { wk = String(NOW_WK); stats(); start(newList().length ? 'new' : 'quiz'); };
+    markPicks();
+    if (!home.seen) { home.seen = true; HOME.classList.add('intro'); setTimeout(() => HOME.classList.remove('intro'), 1200); }
+  }
+
+  // ---- quiz: pick the right answer out of four
+  // a definition's option leaves out its own term, or the answer would give itself away
+  const opt = o => { if (o.kind !== 'define') return o.a;
+    const t = o.a.replace(/^\*\*[^*]+\*\*\s+(is|are|means|refers to|describes|stands for)\s+/i, ''); return t.charAt(0).toUpperCase() + t.slice(1); };
+  function drawQuiz() {
+    const Q = quiz, c = Q.list[Q.at];
+    if (!Q.list.length) return empty('No cards to quiz on here.', [['Learn new', 'new']]);
+    if (!c) { const pc = Math.round(100 * Q.score / Q.list.length);
+      if (!Q.recorded) { Q.recorded = true; const t = today(); t.qbest = Math.max(t.qbest || 0, Q.score);
+        if (Q.score === Q.list.length && Q.list.length >= 5) ST.flags.perfect = 1; save(); stats(); }
+      return finish(`${Q.score} / ${Q.list.length}`, cheer(pc), `Best streak ${Q.best} · +${done.xp} XP`, [['Another quiz', 'quiz'], ['Match', 'match'], ['Review due', 'due']], pc >= 80); }
+    if (!Q.opts) { const others = shuffle(CARDS.filter(x => x.id !== c.id && opt(x) !== opt(c))),
+        rank = x => (x.kind === c.kind ? 0 : 2) + (x.key === c.key ? 0 : 1);
+      Q.opts = shuffle([c, ...others.sort((x, y) => rank(x) - rank(y)).filter((x, i, a) => a.findIndex(y => opt(y) === opt(x)) === i).slice(0, 3)]); }
+    S.innerHTML = meta(c, Q.at + 1, Q.list.length) + `<span class="st-ask">${dot(c)}${esc(c.ask)}</span><div class="st-q st-pop">${fmt(c.q)}</div><div class="st-opts">`
+      + Q.opts.map((o, i) => `<button class="st-opt" style="--i:${i}" data-i="${i}"><kbd>${i + 1}</kbd><span class="st-a">${fmt(short(opt(o)))}</span></button>`).join('')
+      + '</div><div class="st-act"></div>';
+    $('.st-open').onclick = () => openNote(c);
+    ROOT.querySelectorAll('.st-opt').forEach(b => b.onclick = () => pick(+b.dataset.i));
+    prog(); combo(Q.combo);
+  }
+  function pick(i) {
+    const Q = quiz, c = Q.list[Q.at]; if (!c || Q.picked !== null) return;
+    Q.picked = i; const ok = Q.opts[i] === c;
+    if (ok) { Q.score++; Q.combo++; Q.best = Math.max(Q.best, Q.combo); } else Q.combo = 0;
+    const t = today(); t.rev++; if (ok) t.right++;
+    const bs = [...ROOT.querySelectorAll('.st-opt')];
+    bs.forEach((b, j) => b.classList.add(Q.opts[j] === c ? 'right' : j === i ? 'wrong' : 'dim'));
+    sfx(ok ? 'open' : 'error', .6);
+    if (ok) gain(10 + Math.min(10, (Q.combo - 1) * 2), bs[i]);
+    combo(Q.combo); t.combo = Math.max(t.combo || 0, Q.combo);
+    $('.st-act').innerHTML = '<button class="st-show st-next">Next <span style="opacity:.6">(Space)</span></button>';
+    $('.st-next').onclick = nextQ; inView('.st-next');
+    save(); stats();
+  }
+  function nextQ() { quiz.at++; quiz.picked = null; quiz.opts = null; drawQuiz(); }
+
+  // ---- Match: six terms, six meanings, against the clock
+  function startMatch() {
+    const seen = new Set();
+    const pairs = shuffle(pool().filter(c => (c.kind === 'define' || c.kind === 'table') && c.q.length <= 50 && opt(c).length <= 120 && !c.a.includes('\n')
+        && !/\b(it|this|that|they|these|those|its)\b/i.test(c.q)))
+      .filter(c => { const k = c.q.toLowerCase(), v = opt(c).toLowerCase(); if (seen.has(k) || seen.has(v)) return false; seen.add(k); seen.add(v); return true; }).slice(0, 6);
+    game = {pairs, L: shuffle(pairs.slice()), R: shuffle(pairs.slice()), sel: null, left: pairs.length, miss: 0, t0: 0, timer: 0};
+  }
+  function drawMatch() {
+    const G = game;
+    if (G.pairs.length < 3) return empty('Match needs short definitions, and there are not enough here. Try All modules or All weeks.', [['Quiz me', 'quiz']]);
+    const best = ST.best[mod + '|' + wk];
+    const tile = (c, side, i) => `<button class="st-tile ${side}" style="--i:${i}" data-id="${c.id}" data-side="${side}">${side === 'q' ? fmt(c.q) : fmt(short(opt(c)))}</button>`;
+    S.innerHTML = `<div class="st-meta"><span>Match each term to its meaning${best ? ' · best ' + best + 's' : ''}</span><span><span class="st-mt">0.0s</span> · <span class="st-mm">0 misses</span></span></div>`
+      + `<div class="st-match"><div class="st-col">${G.L.map((c, i) => tile(c, 'q', i)).join('')}</div><div class="st-col">${G.R.map((c, i) => tile(c, 'a', i + 1)).join('')}</div></div>`;
+    S.querySelectorAll('.st-tile').forEach(b => b.onclick = () => tapTile(b));
+  }
+  function tapTile(b) {
+    const G = game; if (!G || b.classList.contains('ok')) return;
+    if (!G.t0) { G.t0 = Date.now(); G.timer = setInterval(() => { const el = $('.st-mt'); if (el) el.textContent = ((Date.now() - G.t0) / 1000).toFixed(1) + 's'; }, 100); }
+    if (!G.sel || G.sel.dataset.side === b.dataset.side) {
+      if (G.sel) G.sel.classList.remove('sel');
+      G.sel = G.sel === b ? null : b; if (G.sel) b.classList.add('sel');
+      sfx('tap', .3); return;
+    }
+    const a = G.sel; G.sel = null; a.classList.remove('sel');
+    if (a.dataset.id === b.dataset.id) {
+      [a, b].forEach(x => x.classList.add('ok'));
+      setTimeout(() => [a, b].forEach(x => x.classList.add('gone')), calm() ? 0 : 380);
+      G.left--; sfx('open', .5); gain(5, b);
+      const t = today(); t.rev++; t.right++; save(); stats();
+      if (!G.left) {
+        today().matches = (today().matches || 0) + 1;
+        clearInterval(G.timer); const secs = Math.round((Date.now() - G.t0) / 100) / 10, key = mod + '|' + wk, best = ST.best[key], nb = !best || secs < best;
+        if (nb) ST.best[key] = secs; save();
+        setTimeout(() => finish(secs.toFixed(1) + 's', nb && best ? 'New best time!' : nb ? 'Your first time. Beat it next go.' : `Your best is ${best}s. So close.`,
+          `${G.miss} ${G.miss === 1 ? 'miss' : 'misses'} · +${done.xp} XP`, [['Play again', 'match'], ['Type it', 'type'], ['Quiz me', 'quiz']], nb), calm() ? 0 : 550);
+      }
+    } else {
+      [a, b].forEach(x => { x.classList.remove('bad'); void x.offsetWidth; x.classList.add('bad'); });
+      G.miss++; $('.st-mm').textContent = G.miss + (G.miss === 1 ? ' miss' : ' misses'); sfx('error', .4);
+    }
+  }
+
+  // ---- Type it: see the meaning (or a sentence with a gap), type the term
+  const tPrompt = c => c.kind === 'gap' ? c.q : opt(c);
+  const tAns = c => (c.kind === 'gap' ? c.a : c.q).replace(/\*\*/g, '');
+  const norm = s => s.toLowerCase().replace(/\([^)]*\)/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+  function lev(a, b) {
+    const d = [...Array(b.length + 1).keys()];
+    for (let i = 1; i <= a.length; i++) { let p = d[0]; d[0] = i;
+      for (let j = 1; j <= b.length; j++) { const t = d[j]; d[j] = Math.min(d[j] + 1, d[j - 1] + 1, p + (a[i - 1] === b[j - 1] ? 0 : 1)); p = t; } }
+    return d[b.length];
+  }
+  // how close the typed answer is, 0 to 1; "A / B", "A or B" and "(B)" each count as answers
+  function closeness(typed, ans) {
+    const t = norm(typed); if (!t) return 0;
+    const alts = [ans, ...ans.split(/\s*[\/,]\s*|\s+or\s+/), ...(ans.match(/\(([^)]+)\)/g) || []).map(x => x.slice(1, -1))].map(norm).filter(Boolean);
+    return Math.max(...alts.map(o => 1 - lev(t, o) / Math.max(t.length, o.length)));
+  }
+  function startType() {
+    const can = shuffle(pool().filter(c => c.kind === 'gap' || (c.kind === 'define' && c.q.length <= 40)
+      || (c.kind === 'table' && c.q.length <= 32 && !c.q.includes('?') && c.q.split(' ').length <= 4 && !c.a.includes('\n'))));
+    game = {list: can.slice(0, 10), at: 0, score: 0, combo: 0, best: 0, state: 'ask', hint: false};
+  }
+  function drawType() {
+    const G = game, c = G.list[G.at];
+    if (!G.list.length) return empty('No short answers to type here. Try All modules or All weeks.', [['Quiz me', 'quiz']]);
+    if (!c) { const pc = Math.round(100 * G.score / G.list.length);
+      return finish(`${G.score} / ${G.list.length}`, cheer(pc), `Best streak ${G.best} · +${done.xp} XP`, [['Again', 'type'], ['Match', 'match'], ['Quiz me', 'quiz']], pc >= 80); }
+    S.innerHTML = meta(c, G.at + 1, G.list.length) + `<span class="st-ask">${dot(c)}${c.kind === 'gap' ? 'Fill the gap' : 'Name it'}</span><div class="st-q st-pop">${fmt(tPrompt(c))}</div>`
+      + '<div class="st-typebox"><input class="st-in" autocomplete="off" spellcheck="false" placeholder="Type your answer, then Enter" aria-label="Your answer">'
+      + '<button class="chip st-hintb">Hint</button><button class="chip st-skip">Show me</button></div><div class="st-fb" aria-live="polite"></div><div class="st-act"></div>';
+    $('.st-open').onclick = () => openNote(c);
+    const inp = $('.st-in'); inp.focus({preventScroll: true});
+    inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); check(false); } };
+    $('.st-hintb').onclick = () => { G.hint = true;
+      $('.st-fb').innerHTML = `<span class="st-hintt">${esc(tAns(c).split(' ').map(w => w.charAt(0) + w.slice(1).replace(/[A-Za-z0-9]/g, '·')).join('  '))}</span>`; inp.focus(); };
+    $('.st-skip').onclick = () => check(true);
+    prog(); combo(G.combo);
+  }
+  function check(giveUp) {
+    const G = game, c = G && G.list[G.at]; if (!c || G.state !== 'ask') return;
+    const inp = $('.st-in');
+    if (!giveUp && !inp.value.trim()) { inp.classList.remove('wrong'); void inp.offsetWidth; inp.classList.add('wrong'); return; }
+    G.state = 'shown';
+    const k = giveUp ? 0 : closeness(inp.value, tAns(c)), ok = k >= .75;
+    inp.readOnly = true; inp.classList.add(ok ? 'right' : 'wrong');
+    if (ok) { G.score++; G.combo++; G.best = Math.max(G.best, G.combo); } else G.combo = 0;
+    ST.cards[c.id] = Object.assign(next(c, ok ? (G.hint ? 1 : 2) : 0), {seen: Date.now()});
+    const t = today(); t.rev++; if (ok) { t.right++; t.typed = (t.typed || 0) + 1; } t.combo = Math.max(t.combo || 0, G.combo);
+    $('.st-fb').innerHTML = ok ? (k > .99 ? '<b class="ok">Spot on.</b>' : `<b class="ok">Close enough.</b> It's spelt <b>${esc(tAns(c))}</b>.`)
+      : `<b class="no">${giveUp ? 'The answer:' : 'Not quite.'}</b> <b>${esc(tAns(c))}</b>`;
+    sfx(ok ? 'open' : 'error', .6);
+    if (ok) gain((G.hint ? 6 : 12) + Math.min(10, (G.combo - 1) * 2), inp);
+    combo(G.combo);
+    $('.st-act').innerHTML = '<button class="st-show st-next">Next <span style="opacity:.6">(Enter)</span></button>';
+    const nb = $('.st-next'); nb.onclick = () => { G.at++; G.state = 'ask'; G.hint = false; drawType(); };
+    nb.focus({preventScroll: true}); inView('.st-next');
+    save(); stats();
+  }
+
+  // ---- Blurt: write everything you remember about one note, then see which key points you got
+  const STOP = new Set(('the and for with that this from into are was were has have its their about which when what your you can will not but also more than then them they these '
+    + 'those each such only other some most very used uses using use how why who where between there here been being does done make made like just over under after before because '
+    + 'while both all any one two way ways part parts type types').split(' '));
+  const words = s => norm(s).split(' ').filter(w => w.length >= 3 && !STOP.has(w));
+  const stem = w => w.slice(0, 5);
+  const notesIn = () => { const m = new Map();
+    pool().forEach(c => { const k = c.key + '|' + c.title; if (!m.has(k)) m.set(k, {k, note: c.note, mod: c.mod, wk: c.wk, cards: []}); m.get(k).cards.push(c); });
+    return [...m.values()].filter(n => n.cards.length >= 3); };
+  function drawBlurt() {
+    const G = game;
+    if (!G.note) {
+      const ns = notesIn().sort((a, b) => (ST.blurts[a.k]?.at || 0) - (ST.blurts[b.k]?.at || 0) || (b.wk || 0) - (a.wk || 0));
+      if (!ns.length) return empty('Blurt needs a note with a few key points. Try All modules or All weeks.', [['Quiz me', 'quiz']]);
+      S.innerHTML = '<div class="st-intro"><b>Blurt it out</b><p>Pick a note. Write everything you remember about it, without looking. Then see which key points you got and which you missed.</p></div>'
+        + `<div class="st-notes">${ns.slice(0, 24).map((n, i) => { const b = ST.blurts[n.k];
+          return `<button class="st-note" style="--i:${i}" data-k="${esc(n.k)}"><span>${esc(n.note)}</span><small>${n.wk ? 'Wk ' + n.wk + ' · ' : ''}${esc(n.mod)} · ${n.cards.length} points${b ? ' · last ' + b.pc + '%' : ''}</small></button>`; }).join('')}</div>`;
+      S.querySelectorAll('.st-note').forEach(b => b.onclick = () => { G.note = ns.find(n => n.k === b.dataset.k); G.t0 = Date.now(); G.text = ''; swap(); drawBlurt(); });
+      return;
+    }
+    if (G.result) return blurtResult();
+    S.innerHTML = `<div class="st-meta"><span>${G.note.wk ? 'Wk ' + G.note.wk + ' · ' : ''}${esc(G.note.mod)} · ${esc(G.note.note)}</span><span class="st-bt">0:00</span></div><div class="st-prog"><i class="st-bprog"></i></div>`
+      + `<textarea class="st-blurt" placeholder="Everything you remember about ${esc(G.note.note)}: terms, ideas, how things connect…" aria-label="What you remember"></textarea>`
+      + '<div class="st-row"><button class="st-show st-check">Compare with my note</button><button class="chip st-back">Pick another</button><small class="st-wc">0 words</small></div>';
+    const ta = $('.st-blurt'); ta.value = G.text; ta.focus();
+    const wc = () => { $('.st-wc').textContent = ta.value.trim().split(/\s+/).filter(Boolean).length + ' words'; };
+    ta.oninput = () => { G.text = ta.value; wc(); }; wc();
+    clearInterval(G.timer);
+    G.timer = setInterval(() => { const el = $('.st-bt'); if (!el) return clearInterval(G.timer);
+      const s = (Date.now() - G.t0) / 1000; el.textContent = Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+      $('.st-bprog').style.width = Math.min(100, s / 1.8) + '%'; }, 500);        // three minutes fills the bar
+    $('.st-check').onclick = () => { if (!G.text.trim()) { ta.classList.remove('wrong'); void ta.offsetWidth; ta.classList.add('wrong'); return; } clearInterval(G.timer); G.result = true; swap(); drawBlurt(); };
+    $('.st-back').onclick = () => start('blurt');
+  }
+  function blurtResult() {
+    const G = game, mine = new Set(words(G.text).map(stem)), seen = new Set();
+    const pts = G.note.cards.map(c => { const key = (c.kind === 'gap' ? c.a : c.q).replace(/\*\*/g, ''), ws = [...new Set(words(key))];
+      return {c, key, got: ws.length > 0 && ws.filter(w => mine.has(stem(w))).length / ws.length >= .6}; })
+      .filter(p => { const k = p.key.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+    const got = pts.filter(p => p.got).length, pc = Math.round(100 * got / pts.length), missed = pts.filter(p => !p.got).map(p => p.c);
+    const prev = ST.blurts[G.note.k]; ST.blurts[G.note.k] = {at: Date.now(), pc}; today().blurts = (today().blurts || 0) + 1; save();
+    S.innerHTML = `<div class="st-bres"><div class="st-ring"><svg viewBox="0 0 96 96"><circle class="bg" cx="48" cy="48" r="40"/><circle class="fg" cx="48" cy="48" r="40" stroke-dasharray="251.3" stroke-dashoffset="251.3"/></svg>`
+      + `<div class="in"><b class="st-bpc" data-v="0">0%</b><small>recalled</small></div></div>`
+      + `<div><b class="st-btitle">${got} of ${pts.length} key points</b><p>${cheer(pc)}${prev ? ` Last time ${prev.pc}%${pc > prev.pc ? ', so that is up ' + (pc - prev.pc) + '.' : '.'}` : ''}</p></div></div>`
+      + `<div class="st-pts">${pts.map((p, i) => `<div class="st-pt ${p.got ? 'got' : 'miss'}" style="--i:${i}"><i></i><span>${esc(p.key)}</span></div>`).join('')}</div>`
+      + `<div class="st-row">${missed.length ? `<button class="st-show st-rmiss">Review the ${missed.length} I missed</button>` : ''}<button class="chip st-retry">Try this one again</button><button class="chip st-again">Blurt another</button></div>`;
+    requestAnimationFrame(() => requestAnimationFrame(() => { $('.st-bres .fg').style.strokeDashoffset = 251.3 * (1 - pc / 100); setNum($('.st-bpc'), pc, '%'); }));
+    const rm = $('.st-rmiss'); if (rm) rm.onclick = () => start('set', shuffle(missed));
+    $('.st-retry').onclick = () => { G.result = false; G.text = ''; G.t0 = Date.now(); swap(); drawBlurt(); };
+    $('.st-again').onclick = () => start('blurt');
+    sfx('done'); gain(10 + 4 * got, $('.st-btitle')); if (pc >= 80) confetti();
+    stats(); try { pywebview.api.track('study'); } catch (_) {}
+  }
+
+  // ---- every card, searchable, by week
+  function browse() {
+    S.innerHTML = '<input class="st-search" placeholder="Search your cards" aria-label="Search cards"><div class="st-list"></div>';
+    const L = $('.st-list'), inp = $('.st-search');
+    const paint = () => { const q = inp.value.trim().toLowerCase();
+      const list = pool().filter(c => !q || (c.q + ' ' + c.a + ' ' + c.note).toLowerCase().includes(q)).sort((a, b) => (a.wk || 99) - (b.wk || 99)).slice(0, 300);
+      let last = null;
+      L.innerHTML = list.map(c => { const s = st(c), lvl = !s ? 'new' : s.ivl >= 21 ? 'learnt' : s.lapses > 1 ? 'weak' : 'learning';
+        let h = '';
+        if ((c.wk || 0) !== last) { last = c.wk || 0; const n = list.filter(x => (x.wk || 0) === last).length;
+          h = `<h4 class="st-wh">${last ? 'Week ' + last : 'No week'}<small>${n} card${n === 1 ? '' : 's'}${last && last === NOW_WK ? ' · this week' : ''}</small></h4>`; }
+        return h + `<details><summary>${dot(c)}${fmt(c.q.length > 140 ? c.q.slice(0, 137) + '…' : c.q)} <small>${esc(c.ask)} · <span class="lv ${lvl}">${lvl}</span>${s ? ' · due ' + (s.due <= Date.now() ? 'now' : new Date(s.due).toLocaleDateString(undefined, {day: 'numeric', month: 'short'})) : ''}</small></summary><div class="st-a">${fmt(c.a)}</div><div class="st-meta" style="margin-top:6px"><span>${esc(c.mod)} · ${esc(c.note)}</span></div></details>`; }).join('')
+        || '<p class="sub">No cards match.</p>'; };
+    inp.oninput = paint; paint();
+  }
+
+  // ---- weeks: one chip per teaching week, with how much of it you've studied
+  const W = $('.st-weeks');
+  function weeks() {
+    const base = CARDS.filter(c => mod === 'all' || c.key === mod), per = new Map();
+    base.forEach(c => { const w = c.wk || 0, r = per.get(w) || {n: 0, seen: 0, learnt: 0}; r.n++; if (st(c)) r.seen++; if (st(c) && st(c).ivl >= 21) r.learnt++; per.set(w, r); });
+    const ws = [...per.keys()].sort((a, b) => (a || 99) - (b || 99));
+    if (wk !== 'all' && !per.has(+wk)) wk = 'all';
+    W.parentElement.hidden = ws.length < 2 && !ws[0];
+    W.innerHTML = `<button class="wk${wk === 'all' ? ' on' : ''}" data-w="all"><b>All weeks</b><small>${base.length} cards</small></button>`
+      + ws.map(w => { const r = per.get(w), p = Math.round(100 * r.seen / r.n), star = r.learnt / r.n >= .8;
+        return `<button class="wk${String(w) === String(wk) ? ' on' : ''}${w && w === NOW_WK ? ' now' : ''}" data-w="${w}" title="${w ? 'Teaching week ' + w : 'Notes without a week'}: ${r.n} cards, ${r.seen} studied, ${r.learnt} learnt">`
+          + `<b>${w ? 'Wk ' + w : 'Other'}${star ? '<em>★</em>' : ''}</b><small>${w && w === NOW_WK ? 'this week · ' : ''}${p}% done</small><i style="width:${p}%"></i></button>`; }).join('');
+    W.querySelectorAll('button').forEach(b => b.onclick = () => { wk = b.dataset.w; sfx('tap', .3); stats(); if (mode) start(mode === 'set' ? 'due' : mode); else { swap(); draw(); } });
+  }
+
+  // ---- rewards: three daily challenges, badges, and card styles that unlock as you level up
+  let booted = false;                  // things already earned before the page opened are added quietly
+  const QUESTS = {
+    rev: t => [`Review ${Math.min(ST.goal, 20)} cards`, t.rev || 0, Math.min(ST.goal, 20)],
+    quiz: t => ['Score 8 or more in a quiz', t.qbest || 0, 8],
+    match: t => ['Finish a Match', t.matches || 0, 1],
+    type: t => ['Get 5 right in Type it', t.typed || 0, 5],
+    blurt: t => ['Blurt a note', t.blurts || 0, 1],
+    focus: t => ['Finish a focus round', t.rounds || 0, 1],
+    combo: t => ['Get 5 right in a row', t.combo || 0, 5],
+  };
+  function todaysQuests() {           // the same three all day, a different mix each day
+    let h = 7; for (const ch of dayKey()) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    const rest = Object.keys(QUESTS).filter(k => k !== 'rev'), pick = ['rev'];
+    while (pick.length < 3) { h = (h * 1103515245 + 12345) >>> 0; const k = rest[(h >>> 16) % rest.length]; if (!pick.includes(k)) pick.push(k); }
+    return pick;
+  }
+  function quests() {
+    const t = today(), ids = todaysQuests(); t.qdone ||= [];
+    $('.st-qlist').innerHTML = ids.map(id => {
+      const [label, v, n] = QUESTS[id](t), ok = v >= n, just = ok && !t.qdone.includes(id);
+      if (just) { t.qdone.push(id); gain(25); save();
+        if (booted) setTimeout(() => { toast('Challenge done: ' + label + ' · +25 XP'); sfx('open', .6); }, 400); }
+      return `<div class="st-quest${ok ? ' done' : ''}${just && booted ? ' just' : ''}"><i class="ck"></i><span>${esc(label)}</span><small>${Math.min(v, n)} / ${n}</small>`
+        + `<div class="st-qbar"><i style="width:${Math.round(100 * Math.min(1, v / n))}%"></i></div></div>`; }).join('');
+    if (!t.qall && ids.every(id => t.qdone.includes(id))) { t.qall = 1; gain(50); save();
+      if (booted) setTimeout(() => { toast('All three challenges done! +50 XP bonus'); confetti(); sfx('done'); }, 1100); }
+    $('.st-qbonus').textContent = t.qall ? 'All done today' : '+25 XP each · +50 for all three';
+    $('.st-qbonus').classList.toggle('all', !!t.qall);
+  }
+  function streak() {
+    const t = today(); let n = 0; const d = new Date(); if (!(t.rev || t.mins)) d.setDate(d.getDate() - 1);
+    for (;;) { const r = ST.days[dayKey(d)]; if (r && (r.rev || r.mins)) { n++; d.setDate(d.getDate() - 1); } else break; }
+    return n;
+  }
+  const weekStar = () => { const per = new Map();
+    CARDS.forEach(c => { if (!c.wk) return; const k = c.key + '|' + c.wk, r = per.get(k) || {n: 0, l: 0}; r.n++; if (st(c) && st(c).ivl >= 21) r.l++; per.set(k, r); });
+    return [...per.values()].some(r => r.n >= 5 && r.l / r.n >= .8); };
+  const BADGES = [
+    ['first', '1', 'First card', 'Review your first card', () => Object.keys(ST.cards).length >= 1],
+    ['c100', '100', 'Century', 'Study 100 different cards', () => Object.keys(ST.cards).length >= 100],
+    ['learnt', '25', 'Locked in', 'Learn 25 cards for good (a 3-week gap)', () => CARDS.filter(c => st(c) && st(c).ivl >= 21).length >= 25],
+    ['s3', '3d', 'On a roll', 'Study 3 days in a row', () => streak() >= 3],
+    ['s7', '7d', 'Week warrior', 'Study 7 days in a row', () => streak() >= 7],
+    ['goal7', '7×', 'Goal getter', 'Hit your daily goal on 7 days', () => Object.values(ST.days).filter(d => (d.rev || 0) >= ST.goal).length >= 7],
+    ['perfect', '10', 'Perfect', 'Get every question right in a quiz', () => !!ST.flags.perfect],
+    ['fast', '20s', 'Quick match', 'Finish a Match in under 20 seconds', () => Object.values(ST.best).some(t => t < 20)],
+    ['blurt', '80%', 'Total recall', 'Score 80% or more in a Blurt', () => Object.values(ST.blurts).some(b => b.pc >= 80)],
+    ['focus', '4×', 'Deep focus', 'Finish 4 focus rounds in one day', () => Object.values(ST.days).some(d => (d.rounds || 0) >= 4)],
+    ['star', '★', 'Week mastered', "Learn 80% of a week's cards", weekStar],
+    ['lv6', 'L6', 'Scholar', 'Reach level 6', () => lvlOf(ST.xp).l >= 5],
+  ];
+  function badges() {
+    const fresh = BADGES.filter(([id, , , , ok]) => !ST.badges[id] && ok()).map(b => b[0]);
+    fresh.forEach((id, i) => { ST.badges[id] = Date.now(); const name = BADGES.find(b => b[0] === id)[2];
+      if (booted) setTimeout(() => { toast('Badge unlocked: ' + name); confetti(); sfx('done'); }, 800 + i * 1000); });
+    if (fresh.length) save();
+    $('.st-bgrid').innerHTML = BADGES.map(([id, g, name, how]) => { const got = ST.badges[id];
+      return `<span class="st-badge${got ? ' got' : ''}${booted && fresh.includes(id) ? ' just' : ''}" title="${esc(name)}: ${esc(how)}${got ? '. Earned ' + new Date(got).toLocaleDateString(undefined, {day: 'numeric', month: 'short'}) : ''}">`
+        + `<b>${g}</b><small>${esc(name)}</small></span>`; }).join('');
+    $('.st-bcount').textContent = Object.keys(ST.badges).length + ' / ' + BADGES.length;
+  }
+  const STYLES = [['plain', 'Plain', 1], ['ocean', 'Ocean', 3], ['sunset', 'Sunset', 5], ['aurora', 'Aurora', 8]];
+  function styles() {
+    const lv = lvlOf(ST.xp).l + 1;
+    if (!STYLES.some(([k, , need]) => k === ST.style && lv >= need)) ST.style = 'plain';
+    $('.st').dataset.cs = ST.style;
+    $('.st-cs').innerHTML = STYLES.map(([k, name, need]) => `<button class="chip${ST.style === k ? ' on' : ''}" data-cs="${k}"${lv < need ? ' disabled' : ''} title="${lv < need ? 'Unlocks at level ' + need : name + ' cards'}"><i class="csw ${k}"></i>${name}${lv < need ? ' · Lv ' + need : ''}</button>`).join('');
+    $('.st-cs').querySelectorAll('button:not([disabled])').forEach(b => b.onclick = () => { ST.style = b.dataset.cs; save(); styles(); sfx('tap', .4); });
+    const nx = STYLES.find(([, , need]) => need > lv);
+    $('.st-next-un').textContent = nx ? `Next: ${nx[1]} cards at level ${nx[2]}` : 'Every card style unlocked';
+  }
+
+  // ---- numbers at the top, the level bar, and the last 14 days
+  let prevRev = null;
+  function stats() {
+    quests(); badges();
+    const t = today(), goal = ST.goal, ring = $('.st-stats .st-ring');
+    setNum($('.st-goal-n'), t.rev); $('.st-goal-of').textContent = 'of ' + goal;
+    $('.st-stats .st-ring .fg').style.strokeDashoffset = 251.3 * (1 - Math.min(1, t.rev / goal));
+    ring.classList.toggle('met', t.rev >= goal);
+    if (prevRev !== null && prevRev < goal && t.rev >= goal) {
+      ring.classList.remove('win'); void ring.offsetWidth; ring.classList.add('win');
+      setTimeout(() => { toast('Daily goal done. Nice work!'); confetti(); sfx('done'); }, 250);
+    }
+    prevRev = t.rev;
+    setNum($('.st-due'), dueList().length); setNum($('.st-new'), newList().length);
+    $('.st-acc').textContent = t.rev ? Math.round(100 * t.right / t.rev) + '%' : '–';
+    setNum($('.st-mins'), Math.round(t.mins || 0));
+    setNum($('.st-known'), CARDS.filter(c => st(c) && st(c).ivl >= 21).length);
+    const n = streak();
+    setNum($('.st-streak'), n); $('.st-streak').classList.toggle('hot', n >= 3);
+    const L = lvlOf(ST.xp);
+    $('.st-lv').textContent = 'Level ' + (L.l + 1); $('.st-lvname').textContent = LEVELS[Math.min(L.l, LEVELS.length - 1)];
+    $('.st-xp').textContent = L.into + ' / ' + L.need + ' XP'; $('.st-lvbar i').style.width = (100 * L.into / L.need) + '%';
+    styles();
+    $('.n-due').textContent = dueList().length || ''; $('.n-new').textContent = newList().length || '';
+    $('.n-weak').textContent = weakList().length || ''; $('.n-all').textContent = pool().length;
+    $('.st-goal-v').textContent = goal;
+    const r = Math.min(8, t.rounds || 0);
+    $('.st-rounds').innerHTML = [...Array(Math.max(4, r))].map((_, i) => `<i class="${i < r ? 'on' : ''}"></i>`).join('');
+    const days = [...Array(14)].map((_, i) => { const x = new Date(); x.setDate(x.getDate() - 13 + i); return x; });
+    const top = Math.max(goal, ...days.map(x => (ST.days[dayKey(x)] || {}).rev || 0));
+    $('.st-bars').innerHTML = days.map((x, i) => { const r = ST.days[dayKey(x)] || {};
+      return `<div class="${i === 13 ? 'today' : ''}${(r.rev || 0) >= goal ? ' hit' : ''}" style="--i:${i}" title="${x.toLocaleDateString(undefined, {weekday: 'short', day: 'numeric', month: 'short'})}: ${r.rev || 0} cards, ${Math.round(r.mins || 0)} focus min, ${r.xp || 0} XP"><i style="height:${Math.round(70 * (r.rev || 0) / top)}px"></i>${x.toLocaleDateString(undefined, {weekday: 'narrow'})}</div>`; }).join('');
+    const tab = document.querySelector('nav button[data-tab="study"]');
+    if (tab) tab.classList.toggle('has-due', dueList().length > 0);
+    weeks(); edges(true);
+    if (ROOT.offsetParent && !stats.grown) { stats.grown = true; setTimeout(() => $('.st-bars').classList.add('seen'), 900); }   // the bars grow in once, not on every card
+    if (!mode) home();
+  }
+  $('.st-gm').onclick = () => { ST.goal = Math.max(5, ST.goal - 5); prevRev = null; save(); stats(); };
+  $('.st-gp').onclick = () => { ST.goal = Math.min(200, ST.goal + 5); prevRev = null; save(); stats(); };
+
+  // ---- modules
+  const M = $('.st-mods');
+  M.innerHTML = '<button class="chip on" data-k="all">All modules</button>' + D.modules.map(m => `<button class="chip" data-k="${m.key}">${esc(m.name)}</button>`).join('');
+  M.querySelectorAll('.chip').forEach(b => b.onclick = () => { mod = b.dataset.k; M.querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === b)); sfx('tap', .3); stats();
+    if (mode) start(mode === 'set' ? 'due' : mode); else { swap(); draw(); } });
+  ROOT.querySelectorAll('.st-modes .chip').forEach(b => b.onclick = () => start(b.dataset.m));
+
+  // ---- filter rows scroll sideways: arrows, the mouse wheel, and the chosen chip kept in view
+  const lines = [...ROOT.querySelectorAll('.st-line')].filter(L => L.querySelector('.st-scroll'));
+  function edge(L) {
+    const sc = L.querySelector('.st-scroll'), max = sc.scrollWidth - sc.clientWidth;
+    L.classList.toggle('l', sc.scrollLeft > 2); L.classList.toggle('r', sc.scrollLeft < max - 2);
+  }
+  function edges(center) {
+    lines.forEach(L => { const sc = L.querySelector('.st-scroll'), on = center && sc.querySelector('.on');
+      if (on && (on.offsetLeft < sc.scrollLeft || on.offsetLeft + on.offsetWidth > sc.scrollLeft + sc.clientWidth))
+        sc.scrollTo({left: on.offsetLeft - 40, behavior: calm() ? 'auto' : 'smooth'});
+      edge(L); });
+  }
+  lines.forEach(L => {
+    const sc = L.querySelector('.st-scroll');
+    L.insertAdjacentHTML('beforeend', '<button class="st-arr l" aria-label="Scroll left" tabindex="-1">‹</button><button class="st-arr r" aria-label="Scroll right" tabindex="-1">›</button>');
+    L.querySelector('.st-arr.l').onclick = () => sc.scrollBy({left: -sc.clientWidth * .7, behavior: 'smooth'});
+    L.querySelector('.st-arr.r').onclick = () => sc.scrollBy({left: sc.clientWidth * .7, behavior: 'smooth'});
+    sc.addEventListener('scroll', () => edge(L), {passive: true});
+    // the wheel scrolls the row sideways, and the page again once the row reaches its end
+    sc.addEventListener('wheel', e => { const max = sc.scrollWidth - sc.clientWidth;
+      if (max < 2 || Math.abs(e.deltaX) > Math.abs(e.deltaY) || (e.deltaY > 0 && sc.scrollLeft >= max - 1) || (e.deltaY < 0 && sc.scrollLeft <= 0)) return;
+      sc.scrollLeft += e.deltaY; e.preventDefault(); }, {passive: false});
+    new ResizeObserver(() => edge(L)).observe(sc);     // also catches the tab first being shown
+  });
+
+  // ---- keys: Space turns / next, 1-4 grade or pick
+  // capture phase, so 1-4 on a card grade it instead of switching tabs
+  document.addEventListener('keydown', e => {
+    if (!ROOT.closest('section')?.classList.contains('on') || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'Escape' && mode && !document.querySelector('.viewer:not([hidden])') && !(e.target.matches('textarea') && e.target.value.trim())) { closeDrop(); e.preventDefault(); e.stopImmediatePropagation(); return; }
+    if (e.target.closest('input,textarea,[contenteditable]')) return;
+    const num = /^[1-4]$/.test(e.key), stop = () => { e.preventDefault(); e.stopImmediatePropagation(); };
+    if (mode === 'quiz' && quiz) {
+      if (num) { if (quiz.picked === null) pick(+e.key - 1); stop(); }
+      else if ((e.key === ' ' || e.key === 'Enter') && quiz.picked !== null) { nextQ(); stop(); }
+      return;
+    }
+    if (!CARD_MODES.includes(mode) || !session[at]) return;
+    if (e.key === ' ' || e.key === 'Enter') { flip(); stop(); }
+    else if (num) { if (flipped) grade(+e.key - 1); stop(); }
+  }, true);
+
+  // ---- focus timer (Pomodoro): focus, then a short break; focus minutes count toward today
+  let len = {w: 25, b: 5}, phase = 'w', left = 25 * 60, run = 0, last = 0, title0 = document.title;
+  const T = $('.st-time'), BAR = $('.st-fbar i'), GO = $('.st-go'), FM = $('.st-fmode'), MSG = $('.st-fmsg'), FX = $('.st-fexp'), FB = $('.st-focus');
+  const mmss = s => String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+  const explain = () => { FX.textContent = phase === 'w' ? `Focus for ${len.w} min, then take a ${len.b} min break. Focus minutes count toward today.`
+    : 'Break time. Stand up, drink some water, look away from the screen.'; };
+  const paintT = () => { T.textContent = mmss(left); BAR.style.width = (100 * (1 - left / (len[phase] * 60))) + '%';
+    FM.textContent = phase === 'w' ? 'Focus' : 'Break'; FB.classList.toggle('running', !!run); FB.classList.toggle('brk', phase === 'b');
+    document.title = run ? `${mmss(left)} · ${phase === 'w' ? 'Focus' : 'Break'}` : title0; };
+  function tick() {
+    const now = Date.now(), dt = (now - last) / 1000; last = now; left -= dt;
+    if (phase === 'w') { today().mins = (today().mins || 0) + dt / 60; }
+    if (left <= 0) {
+      sfx('done');
+      if (phase === 'w') { try { pywebview.api.track('study'); } catch (_) {} today().rounds = (today().rounds || 0) + 1; gain(15, T);
+        MSG.textContent = ''; toast('Focus round done. Take a break!'); phase = 'b'; }
+      else { toast('Break over. Back to it.'); phase = 'w'; }
+      left = len[phase] * 60; explain(); save(); stats();
+    }
+    paintT(); if (Math.round(left) % 30 === 0) { save(); stats(); }
+  }
+  GO.onclick = () => { if (run) { clearInterval(run); run = 0; GO.textContent = 'Start'; save(); stats(); }
+    else { last = Date.now(); run = setInterval(tick, 1000); GO.textContent = 'Pause'; MSG.textContent = ''; } sfx('tap', .4); paintT(); };
+  $('.st-reset').onclick = () => { clearInterval(run); run = 0; phase = 'w'; left = len.w * 60; GO.textContent = 'Start'; MSG.textContent = ''; explain(); paintT(); stats(); };
+  ROOT.querySelectorAll('.st-len').forEach(b => b.onclick = () => { len = {w: +b.dataset.w, b: +b.dataset.b};
+    ROOT.querySelectorAll('.st-len').forEach(x => x.classList.toggle('on', x === b)); if (!run) { phase = 'w'; left = len.w * 60; } explain(); paintT(); });
+
+  explain(); stats(); draw(); paintT(); booted = true;
+  window.bbStudy = {ST, CARDS, start, closeness};
+})();
+"""
+
+
 CORNER_HTML = """
 <button class="acct glass" aria-label="Account and settings"><span class="av"></span></button>
 <button class="ask glass" aria-label="Ask Claude"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l1.9 5.6 5.6 1.9-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.9z"/><path d="M18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>Ask Claude</button>
@@ -2228,6 +4121,7 @@ CORNER_HTML = """
   <button class="set-tab" data-s="claude" role="tab" aria-selected="false">Claude</button>
   <button class="set-tab" data-s="look" role="tab" aria-selected="false">Look</button>
   <button class="set-tab" data-s="tabs" role="tab" aria-selected="false">Tabs</button>
+  <button class="set-tab" data-s="share" role="tab" aria-selected="false">Share</button>
  </nav>
 
  <div class="set-pane on" data-s="general">
@@ -2238,8 +4132,36 @@ CORNER_HTML = """
   <div class="row col"><span class="s-files-where">Study files are saved in <b class="s-files-path"></b></span>
    <span><button class="ghost s-files">Open folder</button> <button class="ghost s-files-move">Choose folder…</button></span>
    <small class="s-files-msg"></small></div>
+  <span class="label">Profile card</span>
+  <div class="pcard"><div class="pc-ban"></div><div class="pc-ring"></div><div class="pc-av"></div>
+   <div class="pc-txt"><b class="pc-name"></b><span class="pc-tag"></span><span class="pc-meta"></span><div class="pc-badges"></div></div>
+   <button class="pc-open" type="button">Customize</button></div>
+  <div class="pc-edit" hidden>
+   <label class="pc-f pc-f-name"><span>Name</span><input class="pc-in-name" maxlength="30" spellcheck="false" placeholder="What should the app call you?"></label>
+   <div class="pc-two"><label class="pc-f"><span>Avatar</span><input class="pc-in-av" maxlength="4" spellcheck="false" placeholder="e.g. M"></label>
+    <label class="pc-f"><span>Status</span><input class="pc-in-tag" maxlength="60" placeholder="Locked in for exams"></label></div>
+   <div class="pc-row"><button class="pc-chip pc-up-av" type="button">Upload a picture</button><button class="pc-chip pc-rm-av" type="button">Remove picture</button></div>
+   <label class="pc-f"><span>Course or role</span><input class="pc-in-course" maxlength="60" placeholder="Computer Science, year 2"></label>
+   <label class="pc-f"><span>Badges</span><input class="pc-in-badges" maxlength="90" spellcheck="false" placeholder="Up to 4, with commas: SDGP, Year 2, Python"></label>
+   <span class="pc-l">Banner</span><div class="pc-banners pc-row"></div>
+   <div class="pc-row pc-own"><span class="pc-mini">Your own</span><input type="color" class="pc-g1" aria-label="Banner colour 1"><input type="color" class="pc-g2" aria-label="Banner colour 2">
+    <button class="pc-chip pc-up-ban" type="button">Upload an image</button><button class="pc-chip pc-rm-ban" type="button">Remove image</button></div>
+   <span class="pc-l">Pattern</span><div class="pc-patterns pc-row"></div>
+   <span class="pc-l">Colour</span><div class="pc-accents pc-row"></div>
+   <span class="pc-l">Name font</span><div class="pc-fonts pc-row"></div>
+   <span class="pc-l">Avatar shape</span><div class="pc-shapes pc-row"></div>
+   <span class="pc-l">Effect</span><div class="pc-effects pc-row"></div>
+   <input type="file" class="pc-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+   <button class="pc-save" type="button">Save card</button>
+  </div>
+  <small class="s-name-msg"></small>
+  <div class="row col"><span>Backups of your notebook, boards and settings are made every 15 minutes, kept outside the app folder</span>
+   <span><button class="ghost s-bk-open">Open backups</button> <button class="ghost s-bk-now">Back up now</button> <button class="ghost s-bk-load">Load a backup…</button></span>
+   <small class="s-bk-msg"></small></div>
   <div class="row"><span class="s-ver"></span><span><small class="s-check-msg"></small> <button class="ghost s-check">Check for updates</button></span></div>
   <div class="row col"><button class="ghost danger s-signout">Sign out of Blackboard</button><small class="s-signout-msg"></small></div>
+  <div class="row col un-zone"><span>Remove Blackboard Buddy from this computer. You choose what else goes with it, and everything removed goes to the Recycle Bin.</span>
+   <button class="ghost danger s-uninstall">Uninstall Blackboard Buddy…</button></div>
  </div>
 
  <div class="set-pane" data-s="claude">
@@ -2278,6 +4200,15 @@ CORNER_HTML = """
   <label class="row">Sound effects <button class="sw s-sfx" aria-pressed="true" aria-label="Sound effects"></button></label>
   <label class="row">Volume <span><input class="s-vol" type="range" min="0" max="100" step="5"> <b class="s-vol-v"></b></span></label>
   <div class="row"><button class="ghost s-reset-look">Back to the standard look</button></div>
+ </div>
+
+ <div class="set-pane" data-s="share">
+  <span class="label">Share my notes</span>
+  <p class="sh-about">Give classmates a code and their app shows your This week, deadlines, updates, notes and plans. They don't need a Claude key, and they get your new ones each time you sync. Your marks, feedback, Notebook, boards, files and keys are never shared.</p>
+  <div class="sh-own"></div>
+  <span class="label">Follow someone's notes</span>
+  <div class="sh-follow"></div>
+  <small class="sh-msg" aria-live="polite"></small>
  </div>
 
  <div class="set-pane" data-s="tabs">
@@ -2339,7 +4270,8 @@ def short(name):
 
 
 def md(text):
-    return markdown.markdown(text or "", extensions=["tables", "fenced_code", "sane_lists"])
+    out = markdown.markdown(text or "", extensions=["tables", "fenced_code", "sane_lists"])
+    return safe_html(out) if following() else out   # someone else's notes: nothing in them may run
 
 
 def days_left(due):
@@ -2502,12 +4434,14 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
     ) or '<tr><td colspan="4">No marks released yet.</td></tr>'
 
     current = [c for c in snapshot["courses"] if c.get("current", True)]
+    mods = sorted(snapshot["courses"], key=lambda c: not c.get("current", True))   # every module, this year's first
+    past = lambda c: "" if c.get("current", True) else '<span class="pill past">Earlier year</span>'
     mod_key = lambda name: hashlib.sha1(name.encode()).hexdigest()[:8]
     cards, views = [], []
-    for c in current:
+    for c in mods:
         n_files = sum(len(i.get("files", [])) for i in c.get("contents", []))
         n_secs = sum(1 for i in c.get("contents", []) if not i.get("parentId"))
-        cards.append(f'<button class="card glass course" data-open="mod-{mod_key(c["name"])}">{e(short(c["name"]))}'
+        cards.append(f'<button class="card glass course" data-open="mod-{mod_key(c["name"])}">{e(short(c["name"]))}{past(c)}'
                      f'<span class="muted">{n_secs} sections · {n_files} files</span></button>')
         views.append(f'<div class="mod-view" id="mod-{mod_key(c["name"])}" hidden><div class="mod-bar">'
                      f'<button class="ghost back">‹ All modules</button>'
@@ -2559,13 +4493,13 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
     all_notes = ai_results.get("notes") or []
     noted = {(n["course"], n["path"]) for n in all_notes}
     ncards, nviews = [], []
-    for c in current:
+    for c in mods:
         k = mod_key(c["name"])
         mine = [n for n in all_notes if n["course"] == c["name"]]
         todo = sorted((i for i in c.get("contents", []) if (c["name"], i["path"]) not in noted
                        and any(f["name"].lower().endswith(READABLE) for f in i.get("files", []))),
                       key=lambda i: order.get((c["name"], i["path"].split(" / ")[0]), 9999))
-        ncards.append(f'<button class="card glass course" data-open="notes-{k}">{e(short(c["name"]))}'
+        ncards.append(f'<button class="card glass course" data-open="notes-{k}">{e(short(c["name"]))}{past(c)}'
                       f'<span class="muted">{len(mine)} note{"" if len(mine) == 1 else "s"} · '
                       f'{len(todo)} file{"" if len(todo) == 1 else "s"} without notes</span></button>')
         todo_html = "".join(
@@ -2595,10 +4529,22 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
         "modules": [{"key": mod_key(c["name"]), "name": short(c["name"])} for c in current
                     if not c["name"].startswith("-")],          # "-BSc (Hons) ..." is the programme, not a module
         "study": [{"key": mod_key(n["course"]), "title": n["title"], "topic": n.get("topic") or heading_topic(n),
-                   "text": n["md"][:6000]}
+                   "text": n["md"][:6000], "path": n.get("path") or "", "t": when_ms(n.get("changed")),
+                   "week": said_week(n["title"], n.get("path"))}
                   for n in all_notes if any(c["name"] == n["course"] for c in current)],
+        "term": term_start(c["name"] for c in current),
     }).replace("</", "<\\/")
-    map_html = ('<h3 class="label">Note map</h3><div class="map-wrap glass"><canvas class="nmap" role="img"></canvas>'
+    study_html = study_page([n for n in all_notes if any(c["name"] == n["course"] for c in mods)], mod_key,
+                            {mod_key(c["name"]): short(c["name"]) for c in mods if not c["name"].startswith("-")},
+                            term_start(c["name"] for c in current), {c["name"] for c in current})
+    map_html = ('<h3 class="label">Note map</h3><div class="map-wrap glass">'
+                '<div class="map-bar"><div class="map-modes" role="group" aria-label="Colour the dots by">'
+                '<span>Colour by</span><button data-m="age">Age</button><button data-m="week">Week</button>'
+                '<button data-m="module">Module</button><button data-m="plain">None</button></div>'
+                '<button class="map-full" aria-label="Make the note map full screen" title="Full screen">⤢</button></div>'
+                '<div class="map-legend"></div>'
+                '<div class="map-stage"><canvas class="nmap" role="img"></canvas><div class="map-tip" hidden></div></div>'
+                '<div class="map-weeks" role="group" aria-label="Show one week"></div>'
                 '<p class="map-meta"></p></div>'
                 f'<script type="application/json" id="map-data">{map_data}</script>')
 
@@ -2625,6 +4571,7 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
         ("updates", "Updates", ann),
         ("plans", "Plans", doc_list(ai_results.get("plans"), "assignment plans")),
         ("notes", "Notes", notes_tab),
+        ("study", "Study", study_html),
         ("notebook", "Notebook", notebook.NB_HTML),
         ("online", "Online", online.ON_HTML),
         ("grades", "Grades",
@@ -2636,9 +4583,11 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
     notebook.init()
     programme = next((short(c["name"]) for c in snapshot["courses"] if c["name"].startswith("-")), "")
     boot = json.dumps({
-        "activity": load_json(ACTIVITY, {}), "settings": settings(),
+        "activity": load_json(ACTIVITY, {}), "settings": {k: v for k, v in settings().items() if k not in ("share", "follow")},
+        "follow": {k: (following() or {}).get(k) for k in ("name", "updated", "synced")} if following() else None,
         "spend": spend.get(datetime.now().strftime("%Y-%m"), 0),
         "name": display_name(snapshot), "version": VERSION, "materials": str(MATERIALS), "online": online.config(settings()), "vault": notebook.ROOT.resolve().as_uri(), "user": snapshot["me"].get("userName", ""),
+        "locked": not signed_in(), "bburl": BB_URL, "profile": load_json(DATA_DIR / "profile.json", None),
         "programme": programme.strip("- ").title(), "synced": f"{parse_date(snapshot['synced']).astimezone():%a %d %b, %H:%M}",
     }).replace("</", "<\\/")
     nav = "".join(f'<button data-tab="{k}">{e(t)}{"<i class=near></i>" if k == "deadlines" and first else ""}</button>'
@@ -2646,8 +4595,9 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
     panes = "".join(f'<section id="{k}">{body}</section>' for k, _, body in tabs)
     synced = parse_date(snapshot["synced"]).astimezone()
     n_current = sum(1 for c in snapshot["courses"] if c.get("current", True))
+    n_past = len(snapshot["courses"]) - n_current
 
-    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    page = f"""<!doctype html><html lang="en" class="{'following' if following() else 'locked' if not signed_in() else ''}{' mac' if IS_MAC else ''}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackboard Buddy</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Doto:wght@700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -2762,6 +4712,7 @@ details.card[open]::details-content{{height:auto;opacity:1}}
 @keyframes near{{0%{{box-shadow:0 0 0 0 rgba(215,25,33,.45)}}70%,100%{{box-shadow:0 0 0 7px rgba(215,25,33,0)}}}}
 nav button .near{{position:absolute;top:7px;right:7px;width:5px;height:5px;margin:0;animation:none}}
 @media (prefers-reduced-motion:reduce){{.near{{animation:none}}}}
+.course .pill.past{{display:table;margin-top:6px;font-size:9.5px;padding:2px 7px;opacity:.7}}
 .pill{{display:inline-block;padding:3px 9px;border-radius:999px;font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;border:1px solid var(--line)}}
 .late{{color:var(--muted);text-decoration:line-through}} .urgent{{background:var(--red);border-color:var(--red);color:#fff}}
 .soon{{background:var(--text);border-color:var(--text);color:var(--bg)}} .later{{color:var(--text)}}
@@ -2812,7 +4763,7 @@ code{{background:rgba(127,127,127,.15);padding:1px 6px;border-radius:6px}}
  <button data-s="tr" title="Top right"><i class="str"></i></button>
  <button data-s="bl" title="Bottom left"><i class="sbl"></i></button>
  <button data-s="br" title="Bottom right"><i class="sbr"></i></button>
- <button data-s="top" title="Top half"><i class="st"></i></button>
+ <button data-s="top" title="Top half"><i class="stop"></i></button>
  <button data-s="win" class="swin" title="Windows layouts (Win+Z)">⊞</button>
 </div>
 <button class="theme glass" title="Light / dark / automatic" aria-label="Change appearance">
@@ -2837,22 +4788,34 @@ and Ask Claude, the briefing, plans and notes stop working until you top it up.<
 <label class="aw-check"><input type="checkbox" class="aw-never"> Don't show this again</label>
 <button class="btn aw-go">I understand, continue</button><button class="ghost aw-no">Cancel</button></div></div>
 <header><h1>{'Hi ' + e(display_name(snapshot)) if display_name(snapshot) else 'This week'}</h1>
-<div class="sub">Last synced {synced:%A %d %B, %H:%M} · {n_current} module{'' if n_current == 1 else 's'} this year</div></header>
+<div class="sub">Last synced {synced:%A %d %B, %H:%M} · {n_current} module{'' if n_current == 1 else 's'} this year{f' · {n_past} from earlier years' if n_past else ''}</div></header>
 <nav class="glass"><span class="indicator"></span>{nav}</nav><main>{panes}</main>
 <script>
 const nav=document.querySelector('nav'),ind=nav.querySelector('.indicator'),btns=[...nav.querySelectorAll('button')];
 const place=(b,instant)=>{{if(instant)ind.style.transition='none';ind.style.left=b.offsetLeft+'px';ind.style.width=b.offsetWidth+'px';
  if(instant){{ind.offsetWidth;ind.style.transition=''}}else{{ind.classList.add('moving');clearTimeout(place.t);place.t=setTimeout(()=>ind.classList.remove('moving'),220)}}
  nav.scrollTo({{left:b.offsetLeft-nav.clientWidth/2+b.offsetWidth/2,behavior:instant?'auto':'smooth'}})}};
-const show=(k,instant)=>{{btns.forEach(b=>b.classList.toggle('on',b.dataset.tab===k));
+const TH={{l:[],i:-1,walk:false}};
+const tabHist=k=>{{if(TH.walk){{TH.walk=false;return}}if(TH.l[TH.i]===k)return;
+ TH.l=TH.l.slice(0,TH.i+1);TH.l.push(k);if(TH.l.length>50)TH.l.shift();TH.i=TH.l.length-1}};
+const show=(k,instant)=>{{if(window.bbPending&&!instant){{const u=window.bbPending;window.bbPending=null;try{{localStorage.tab=k}}catch(_){{}};return bbLeave().then(()=>location.replace(u))}}
+ tabHist(k);btns.forEach(b=>b.classList.toggle('on',b.dataset.tab===k));
  document.querySelectorAll('section').forEach(sec=>{{sec.classList.toggle('on',sec.id===k);
   if(sec.id===k)[...sec.children].forEach((c,i)=>{{c.style.setProperty('--i',Math.min(i,12));c.style.animation='none';c.offsetWidth;c.style.animation=''}})}});
  place(btns.find(b=>b.dataset.tab===k),instant);try{{localStorage.tab=k}}catch(_){{}}}};
 btns.forEach(b=>b.onclick=()=>show(b.dataset.tab));
 // a hidden tab is skipped by the number and arrow keys too
 const vis=()=>btns.filter(b=>!b.hidden);
-window.bbShow=show;window.bbTabs=btns;window.bbPlaceInd=()=>place(btns.find(b=>b.classList.contains('on')),true);
-document.addEventListener('keydown',ev=>{{if(ev.target.closest('input,textarea,[contenteditable="true"],#notebook,#online'))return;
+window.bbShow=show;window.bbTabs=btns;
+// mouse side buttons: back closes whatever is open on top first, then both step through the tabs you've visited
+const overlay=()=>(typeof V!=='undefined'&&!V.hidden)||document.querySelector('.sheet.on,.map-wrap.full,.signin:not([hidden]),[role=dialog]:not([hidden]),[role=alertdialog]:not([hidden])');
+const walk=d=>{{const j=TH.i+d;if(j<0||j>=TH.l.length)return;const b=btns.find(x=>x.dataset.tab===TH.l[j]);
+ if(!b||b.hidden){{TH.l.splice(j,1);if(d<0)TH.i--;return walk(d)}}TH.i=j;TH.walk=true;show(TH.l[j])}};
+['mousedown','auxclick'].forEach(t=>addEventListener(t,ev=>{{if(ev.button===3||ev.button===4)ev.preventDefault()}},true));
+addEventListener('mouseup',ev=>{{if(ev.button!==3&&ev.button!==4)return;ev.preventDefault();
+ if(ev.button===3&&overlay()){{(document.activeElement||document.body).dispatchEvent(new KeyboardEvent('keydown',{{key:'Escape',bubbles:true}}));return}}
+ walk(ev.button===3?-1:1)}},true);window.bbPlaceInd=()=>place(btns.find(b=>b.classList.contains('on')),true);
+document.addEventListener('keydown',ev=>{{if(ev.defaultPrevented||ev.target.closest('input,textarea,[contenteditable="true"],#notebook,#online'))return;
  const v=vis(),i=v.findIndex(b=>b.classList.contains('on'));
  if(/^[1-9]$/.test(ev.key)&&v[ev.key-1])show(v[ev.key-1].dataset.tab);
  if(ev.key==='ArrowRight')show(v[(i+1)%v.length].dataset.tab);
@@ -2920,25 +4883,61 @@ tb.onclick=()=>{{if(switching)return;  // ignore clicks until the current switch
 // app window hooks (only inside the desktop app)
 const st=document.querySelector('.status'),rf=document.querySelector('.refresh');let hideT;
 let watchT;
+// the spinning pointer only shows for the first few seconds of a job; the pill up top keeps the progress
+let curT,curDone=false;
 const bbStatusOff=()=>{{st.classList.remove('show','busy');rf.classList.remove('busy');
- document.documentElement.classList.remove('busy')}};
+ document.documentElement.classList.remove('busy');clearTimeout(curT);curDone=false}};
 window.bbStatus=(msg,busy)=>{{st.querySelector('span').textContent=msg;st.classList.toggle('busy',!!busy);rf.classList.toggle('busy',!!busy);
- document.documentElement.classList.toggle('busy',!!busy);
+ if(!busy){{document.documentElement.classList.remove('busy');clearTimeout(curT);curDone=false}}
+ else if(!curDone&&!document.documentElement.classList.contains('busy')){{document.documentElement.classList.add('busy');
+  curT=setTimeout(()=>{{document.documentElement.classList.remove('busy');curDone=true}},5000)}}
  st.classList.add('show');clearTimeout(hideT);clearTimeout(watchT);
  if(!busy){{hideT=setTimeout(()=>st.classList.remove('show'),4000);return}}
  // A busy message waits for the next one to replace it, so if that never comes - the page was
  // reloaded mid-job, say - it would sit there for good. Check now and then whether it is still true.
  const watch=()=>{{watchT=setTimeout(()=>{{if(!window.pywebview)return bbStatusOff();
-  pywebview.api.state().then(s=>{{if(s&&s.busy){{if(s.msg)st.querySelector('span').textContent=s.msg;watch()}}
+  Promise.race([pywebview.api.state(),new Promise(r=>setTimeout(()=>r(null),6000))]).then(s=>{{if(s&&s.busy){{if(s.msg)st.querySelector('span').textContent=s.msg;watch()}}
    else bbStatusOff()}}).catch(()=>bbStatusOff())}},8000)}};
  watch()}};
 window.addEventListener('pywebviewready',()=>{{document.body.classList.add('app');
  rf.onclick=()=>pywebview.api.refresh();
  document.querySelectorAll('a[href="deadlines.ics"]').forEach(a=>a.onclick=ev=>{{ev.preventDefault();pywebview.api.open_calendar()}});
  if(location.hash.startsWith('#updated'))bbStatus('Up to date',false);
- pywebview.api.state().then(s=>{{if(s.busy)bbStatus(s.msg,true)}})}});
-let t='week';try{{t=localStorage.tab||t}}catch(_){{}};show(document.getElementById(t)?t:'week',true);
-</script>{CORNER_HTML}<script>window.BB={boot}</script><script>{EXTRA_JS}</script><script>{notebook.NB_JS}</script><script>{online.ON_JS}</script></body></html>"""
+ pywebview.api.state().then(s=>{{if(s.busy)bbStatus(s.msg,!s.quiet)}})}});
+// The app's link to the page (pywebview.api) turns up a moment after the page does. Anything that
+// reads your files waits for it, or it would start from an empty board and save that over yours.
+window.bbApiReady=new Promise(res=>{{const ok=()=>!!(window.pywebview&&pywebview.api&&typeof pywebview.api.state==='function');
+ if(ok())return res(true);addEventListener('pywebviewready',()=>res(true));
+ const t0=Date.now(),poll=setInterval(()=>{{if(ok()||Date.now()-t0>8000){{clearInterval(poll);res(ok())}}}},100)}});
+// Whatever is still waiting to be saved, written out before the page goes (each tab adds its own)
+window.bbBeforeLeave=window.bbBeforeLeave||[];
+window.bbLeave=()=>Promise.race([Promise.all(bbBeforeLeave.map(f=>{{try{{return Promise.resolve(f()).catch(()=>{{}})}}catch(_){{}}}})),
+ new Promise(r=>setTimeout(r,3000))]);
+// a finished update reloads the page, but not under your hands on Online or Notebook: there it waits for a tab switch
+window.bbReloadTo=url=>{{let t='';try{{t=localStorage.tab||''}}catch(_){{}}
+ if(t!=='online'&&t!=='notebook')return bbLeave().then(()=>location.replace(url));
+ window.bbPending=url;bbStatus('Updated. Switch tab to see it',false)}};
+// No Claude key yet: Online and Notebook only, with a button to unlock the rest
+if(document.documentElement.classList.contains('locked')){{
+ const nv=document.querySelector('nav.glass'),ub=document.createElement('button');ub.className='unlock-b';ub.type='button';
+ ub.textContent='Unlock everything';ub.title='Add a Claude API key to get your week, deadlines, notes and the rest';nv.appendChild(ub);
+ ub.onclick=()=>{{const d=document.createElement('div');d.className='unlock';
+  d.innerHTML=`<div class="unlock-card glass"><h2>Unlock everything</h2>
+   <p>Your week, deadlines, marks, study notes and Ask Claude need a Claude API key. Get one at platform.claude.com, under API keys.</p>
+   <label>Claude API key</label><input class="uk" type="password" placeholder="sk-ant-…" autocomplete="off">
+   <label>Your Blackboard address</label><input class="uu" spellcheck="false">
+   <p class="umsg"></p><div class="ubtns"><button class="ghost ux">Not now</button><button class="btn ugo">Unlock</button></div></div>`;
+  document.body.appendChild(d);d.querySelector('.uu').value=BB.bburl||'https://blackboard.uwe.ac.uk';d.querySelector('.uk').focus();
+  d.querySelector('.ux').onclick=()=>d.remove();d.onclick=ev=>{{if(ev.target===d)d.remove()}};
+  d.querySelector('.ugo').onclick=async()=>{{const m=d.querySelector('.umsg');m.textContent='Checking the key…';
+   const r=await pywebview.api.unlock(d.querySelector('.uk').value,d.querySelector('.uu').value);
+   if(r!=='ok'){{m.textContent=r;return}}
+   try{{localStorage.tab='week'}}catch(_){{}}
+   m.textContent='Unlocked. A Blackboard window will open: sign in there, and your week loads after.'}}}}}}
+let t='week';try{{t=localStorage.tab||t}}catch(_){{}};
+if(document.documentElement.classList.contains('locked')&&t!=='online'&&t!=='notebook')t='online';
+show(document.getElementById(t)?t:'week',true);
+</script>{CORNER_HTML}<script>window.BB={boot}</script><script>{EXTRA_JS}</script><script>{STUDY_JS}</script><script>{notebook.NB_JS}</script><script>{online.ON_JS}</script></body></html>"""
     path = OUT_DIR / "dashboard.html"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(page, encoding="utf-8")
@@ -3004,32 +5003,40 @@ def open_blackboard(interactive=True):
     return bb
 
 
-def run(sync=True, use_ai=True, interactive=True):
-    """Syncs Blackboard (or reuses the last sync), runs the AI and writes the dashboard."""
+def build_lite():
+    """The app for someone without a Claude key yet: Online and Notebook work, the rest waits."""
+    if following() and (SHARED / "snapshot.json").exists():
+        return run(sync=False, use_ai=False)
+    snapshot = load_json(SNAPSHOT, None) or {"synced": now().isoformat(), "me": {"name": ""},
+                                             "courses": [], "calendar": []}
+    return build_dashboard(snapshot, [], [], [], {})
+
+
+def run(sync=True, use_ai=True, interactive=True, on_ready=None):
+    """Syncs Blackboard (or reuses the last sync), runs the AI and writes the dashboard.
+    on_ready(path) is called as soon as the Blackboard part is on the page, before the AI writes."""
     ai_wanted = use_ai and bool(os.getenv("ANTHROPIC_API_KEY"))
     if use_ai and not ai_wanted:
         log("No Claude API key yet, so building the dashboard without AI.")
 
     if not sync:
-        snapshot = load_json(SNAPSHOT, None)
+        snapshot = load_json(snap_file(), None)
         if not snapshot:
             log("No previous sync found.")
             return None
         deadlines, announcements, grades = (collect_deadlines(snapshot),
                                             recent_announcements(snapshot), released_grades(snapshot))
-        ai_results = rehydrate_dates(load_json(DATA_DIR / "ai-latest.json", {}))
+        ai_results = rehydrate_dates(load_json(ai_file(), {}))
     else:
         bb = open_blackboard(interactive)
         try:
             me = bb.me
-            courses = [c for c in bb.courses() if c["current"]]
-            log(f"Reading your {len(courses)} modules")
-            for c in courses:
-                log(f"Reading {c['name']}")
-                c["gradebook"] = bb.gradebook(c["id"])
-                c["announcements"] = bb.announcements(c["id"])
-                c["contents"] = bb.contents(c["id"])
-            sync_materials(bb, courses, load_json(SNAPSHOT, None))
+            courses = bb.courses()
+            n_old = sum(not c["current"] for c in courses)
+            log(f"Reading your {len(courses)} modules" + (f" ({n_old} from earlier years)" if n_old else ""))
+            bb.read_courses(courses)
+            old_snap = load_json(SNAPSHOT, None)
+            sync_materials(bb, courses, old_snap)
             snapshot = {"synced": now().isoformat(),
                         "me": {"id": me.get("id"), "userName": me.get("userName"),
                                "name": (me.get("name") or {}).get("given", "")},
@@ -3038,7 +5045,11 @@ def run(sync=True, use_ai=True, interactive=True):
             deadlines, announcements, grades = (collect_deadlines(snapshot),
                                                 recent_announcements(snapshot), released_grades(snapshot))
             log(f"{len(deadlines)} deadlines, {len(announcements)} recent announcements, {len(grades)} marks")
-            ai_results = run_ai(snapshot, bb, deadlines, announcements, grades) if ai_wanted \
+            if ai_wanted and on_ready:   # show what's new on Blackboard now; the AI's writing follows
+                write_ics(deadlines)
+                on_ready(build_dashboard(snapshot, deadlines, announcements, grades,
+                                         rehydrate_dates(load_json(DATA_DIR / "ai-latest.json", {}))))
+            ai_results = run_ai(snapshot, bb, deadlines, announcements, grades, old_snap) if ai_wanted \
                 else rehydrate_dates(load_json(DATA_DIR / "ai-latest.json", {}))
         finally:
             bb.__exit__()

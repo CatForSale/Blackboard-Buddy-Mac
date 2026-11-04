@@ -55,43 +55,17 @@ with sync_playwright() as pw:
         pg.evaluate(f"() => bbOnline.view({{x: 60, y: 40, k: {k}}})")
         pg.wait_for_timeout(400)
 
-    far(0.8)
-    check("close in, a block shows what is written on it",
+    dots = lambda: pg.evaluate("(() => { const s = getComputedStyle(document.querySelector('.ol-board')); return [s.backgroundSize, s.backgroundPosition] })()")
+    far(0.8); d1 = dots()
+    far(0.25); d2 = dots()
+    check("zoomed far out, nothing swaps itself for a name",
           not pg.evaluate("document.querySelector('.ol').classList.contains('far')"))
-    far(0.25)
-    check("far out, the board knows it",
-          pg.evaluate("document.querySelector('.ol').classList.contains('far')"))
-
-    def tag(k):
-        return pg.evaluate(f"""() => {{ const d = document.querySelector('.ol-b[data-id="{ids[k]}"]');
-            const t = d.querySelector('.ol-tag');
-            return {{text: t.textContent, shown: getComputedStyle(t).display !== 'none',
-                     px: parseFloat(getComputedStyle(t).fontSize),
-                     fits: t.getBoundingClientRect().right <= d.getBoundingClientRect().right + 1,
-                     inner: [...d.children].filter(c => !c.classList.contains('ol-tag')
-                        && !c.classList.contains('ol-rs') && !c.classList.contains('ol-srim')
-                        && getComputedStyle(c).display !== 'none').length}}; }}""")
-
-    n = tag('note')
-    check("each block shows its name instead of a smudge", n["shown"] and "Dijkstra" in n["text"], n["text"])
-    check("and the writing underneath is out of the way", n["inner"] == 0, str(n["inner"]))
-    check("the name stays inside the block", n["fits"])
-    check("and is the same size on screen however far out you are",
-          abs(n["px"] * 0.25 - 13) < 1.5, f'{n["px"]:.0f}px at 25%')
-
-    t = tag('todo')
-    check("a checklist names what is still to do", t["text"].strip() == "revise graphs", t["text"])
-    c = tag('code')
-    check("code shows its first line", c["text"].strip() == "def main():", c["text"])
-
-    sh = pg.evaluate(f"""() => {{ const d = document.querySelector('.ol-b[data-id="{ids['shape']}"]');
-        return {{bg: getComputedStyle(d).backgroundColor,
-                 rims: [...d.querySelectorAll('.ol-srim')].filter(r => getComputedStyle(r).display !== 'none').length,
-                 name: d.querySelector('.ol-tag').textContent}}; }}""")
-    check("a box stays a box rather than turning into a card",
-          sh["bg"] in ("rgba(0, 0, 0, 0)", "transparent") and sh["rims"] > 0,
-          f'{sh["bg"]} rims={sh["rims"]}')
-    check("and keeps its name on", sh["name"].strip() == "ALPHA", sh["name"])
+    inner = pg.evaluate(f"""() => {{ const d = document.querySelector('.ol-b[data-id="{ids['note']}"]');
+        return [getComputedStyle(d.querySelector('.ol-tag')).display, [...d.children].filter(c => !c.classList.contains('ol-tag')
+          && !c.classList.contains('ol-rs') && !c.classList.contains('ol-srim') && getComputedStyle(c).display !== 'none').length]; }}""")
+    check("the block still shows what is written on it", inner[0] == "none" and inner[1] > 0, inner)
+    pg.evaluate("() => bbOnline.view({x: 333, y: 171, k: 1.7})"); pg.wait_for_timeout(300); d3 = dots()
+    check("the dots behind stay the same size and don't move", d1 == d2 == d3, (d1, d2, d3))
 
     far(1)
 

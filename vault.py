@@ -606,6 +606,7 @@ $('.nb-tags').onclick = e => { const b = e.target.closest('.nb-tag'); if (b) { f
 
 // ================= open, save, rename =================
 async function load(openName) {
+  if (window.bbApiReady) await window.bbApiReady;
   const a = api(); if (!a) { ED.innerHTML = '<p>The notebook works inside the Blackboard Buddy app.</p>'; return; }
   notes = await a.nb_list();
   drawList();
@@ -641,6 +642,7 @@ async function save() {
   if (!tracked.has(n.name)) { tracked.add(n.name); a.track('note'); }
 }
 async function flush() { if (saveT) await save(); }
+(window.bbBeforeLeave = window.bbBeforeLeave || []).push(flush);
 async function rename() {
   const n = note(), a = api(), want = TITLE.value.trim();
   if (!n || !a || !want || want === base(n.name)) { TITLE.value = n ? base(n.name) : ''; return; }

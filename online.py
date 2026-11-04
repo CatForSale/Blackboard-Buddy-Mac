@@ -136,6 +136,110 @@ grant execute on function public.join_group(text, text, text) to authenticated;
 revoke execute on function public.create_group(text, text, text) from anon;
 revoke execute on function public.join_group(text, text, text) from anon;
 
+-- rename a group: anyone in it may
+create or replace function public.rename_group(p_group uuid, p_name text) returns json
+language plpgsql security definer set search_path = public as $$
+declare g groups;
+begin
+  if not public.is_member(p_group) then raise exception 'You are not in that group'; end if;
+  update groups set name = left(coalesce(nullif(trim(p_name), ''), name), 60) where id = p_group returning * into g;
+  return json_build_object('id', g.id, 'name', g.name, 'code', g.code);
+end $$;
+
+-- delete a group for everyone: only whoever made it may. Its board and member list go with it.
+create or replace function public.delete_group(p_group uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from groups where id = p_group and created_by = auth.uid();
+  if not found then raise exception 'Only whoever made the group can delete it'; end if;
+end $$;
+
+grant execute on function public.rename_group(uuid, text) to authenticated;
+grant execute on function public.delete_group(uuid) to authenticated;
+revoke execute on function public.rename_group(uuid, text) from anon;
+revoke execute on function public.delete_group(uuid) from anon;
+
+-- messages on a group: to everyone in it, or private to one person
+create table if not exists public.messages (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid not null references public.groups on delete cascade,
+  from_id uuid not null default auth.uid(),
+  from_name text,
+  to_id uuid,
+  to_name text,
+  text text not null check (length(text) <= 2000),
+  created_at timestamptz default now()
+);
+grant select, insert on public.messages to authenticated;
+revoke all on public.messages from anon;
+alter table public.messages enable row level security;
+drop policy if exists "read messages" on public.messages;
+create policy "read messages" on public.messages for select to authenticated
+  using (public.is_member(group_id) and (to_id is null or to_id = auth.uid() or from_id = auth.uid()));
+drop policy if exists "send messages" on public.messages;
+create policy "send messages" on public.messages for insert to authenticated
+  with check (public.is_member(group_id) and from_id = auth.uid());
+
+-- shared notes: one person's This week, deadlines, notes and plans, readable by anyone with the code.
+-- Only the person who made the code (who holds its key) can change or remove it. Nobody can list them.
+create table if not exists public.shares (
+  code text primary key,
+  secret text not null,
+  name text,
+  data text not null default '',
+  size int not null default 0,
+  updated_at timestamptz default now(),
+  created_at timestamptz default now()
+);
+revoke all on public.shares from anon, authenticated;
+alter table public.shares enable row level security;
+
+create or replace function public.share_create(p_secret text, p_name text)
+returns text language plpgsql security definer set search_path = public as $$
+declare c text;
+begin
+  if length(coalesce(p_secret, '')) < 24 then raise exception 'bad key'; end if;
+  loop
+    c := '';
+    for i in 1..8 loop c := c || substr('ABCDEFGHJKMNPQRSTUVWXYZ23456789', 1 + floor(random() * 31)::int, 1); end loop;
+    exit when not exists (select 1 from public.shares where code = c);
+  end loop;
+  insert into public.shares (code, secret, name) values (c, encode(sha256(convert_to(p_secret, 'UTF8')), 'hex'), left(p_name, 40));
+  return c;
+end $$;
+
+create or replace function public.share_put(p_code text, p_secret text, p_name text, p_data text)
+returns timestamptz language plpgsql security definer set search_path = public as $$
+declare t timestamptz;
+begin
+  if length(p_data) > 8000000 then raise exception 'too big'; end if;
+  update public.shares set data = p_data, name = left(p_name, 40), size = length(p_data), updated_at = now()
+    where code = p_code and secret = encode(sha256(convert_to(p_secret, 'UTF8')), 'hex')
+    returning updated_at into t;
+  if t is null then raise exception 'not yours'; end if;
+  return t;
+end $$;
+
+create or replace function public.share_stop(p_code text, p_secret text)
+returns boolean language plpgsql security definer set search_path = public as $$
+begin
+  delete from public.shares where code = p_code and secret = encode(sha256(convert_to(p_secret, 'UTF8')), 'hex');
+  return found;
+end $$;
+
+create or replace function public.share_get(p_code text)
+returns table (name text, data text, updated_at timestamptz) language sql stable security definer set search_path = public as $$
+  select s.name, s.data, s.updated_at from public.shares s where s.code = upper(regexp_replace(p_code, '[^A-Za-z0-9]', '', 'g'));
+$$;
+
+create or replace function public.share_when(p_code text)
+returns timestamptz language sql stable security definer set search_path = public as $$
+  select s.updated_at from public.shares s where s.code = upper(regexp_replace(p_code, '[^A-Za-z0-9]', '', 'g'));
+$$;
+
+grant execute on function public.share_create(text, text), public.share_put(text, text, text, text),
+  public.share_stop(text, text), public.share_get(text), public.share_when(text) to anon, authenticated;
+
 -- live updates
 do $$ begin
   if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'blocks') then
@@ -143,6 +247,9 @@ do $$ begin
   end if;
   if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'members') then
     alter publication supabase_realtime add table public.members;
+  end if;
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'messages') then
+    alter publication supabase_realtime add table public.messages;
   end if;
 end $$;
 """
@@ -154,10 +261,9 @@ def _icon(d):
 
 TOOLS = [
     ("select", "Pick things out \u00b7 drag to look around \u00b7 Shift-drag to pick out several (V)", '<path d="M5 3l14 8-6 1.6L10 19z"/>'),
-    ("hand", "Move around the board (H, or hold space)", '<path d="M8 12V5.5a1.5 1.5 0 013 0V11m0-6.5a1.5 1.5 0 013 0V11m0-5a1.5 1.5 0 013 0v7a7 7 0 01-7 7 6 6 0 01-5-2.6L3.6 13a1.5 1.5 0 012.4-1.8L8 13"/>'),
+    ("hand", "Move around the board (H, or hold space)", '<path stroke-linecap="square" stroke-linejoin="miter" d="M8 12V6M11 11V3.5M14 11V4.5M17 12V7M8 14 5.5 11.5 4 13l4.5 7h8l1.5-4V12"/>'),
     ("|", "", ""),
     ("note", "Note (N)", '<path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/>'),
-    ("sticky", "Sticky note (S)", '<path d="M4 4h16v10l-6 6H4z"/><path d="M14 20v-6h6"/>'),
     ("text", "Big text (T)", '<path d="M5 6V4.5h14V6M12 4.5V20M9 20h6"/>'),
     ("code", "Code (C)", '<path d="M8.5 7L3.5 12l5 5M15.5 7l5 5-5 5"/>'),
     ("proj", "Code project: files, run, like a mini VS Code (K)", '<path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2h8.5A1.5 1.5 0 0121 8.5v9a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 17.5z"/><path d="M10 11l-2 2 2 2M14 11l2 2-2 2"/>'),
@@ -193,8 +299,17 @@ ON_HTML = f"""
   </button>
   <button class="ol-code" title="Copy the invite code"></button>
   <span class="ol-people"></span>
+  <button class="ol-chatb ghost" hidden title="Messages" aria-label="Messages"><b class="ol-here"></b><span>Chat</span><i class="ol-unread"></i></button>
   <button class="ol-more ghost" aria-label="Board menu">•••</button>
   <div class="ol-menu glass"></div>
+ </div>
+ <div class="ol-chat glass" hidden>
+  <div class="ol-chh"><b>Messages</b><button class="ol-chx ghost" aria-label="Close messages">✕</button></div>
+  <div class="ol-chn"></div>
+  <div class="ol-chlist" aria-live="polite"></div>
+  <div class="ol-chtyping" aria-live="polite"></div>
+  <div class="ol-chin"><select class="ol-chto" aria-label="Send to"></select>
+   <textarea class="ol-cht" rows="1" maxlength="1000" placeholder="Message · Enter sends, Shift+Enter for a new line" aria-label="Message" spellcheck="true"></textarea><button class="ol-chsend">Send</button></div>
  </div>
  <div class="ol-zoom glass">
   <button data-z="-" aria-label="Zoom out">−</button><button data-z="0" class="ol-zv" title="Back to 100%">100%</button>
@@ -205,11 +320,11 @@ ON_HTML = f"""
    <canvas width="260" height="170"></canvas><i class="ol-mapv"></i>
   </div>
   <div class="ol-hunt glass">
-   <button class="ol-mapb ghost" title="Map of the board (M)" aria-label="Map of the board">▦</button>
+   <button class="ol-mapb ghost" title="Map of the board (M)" aria-label="Map of the board"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5zM9 4v13.5M15 6.5V20"/></svg></button>
    <input class="ol-huntq" placeholder="Find on the board" aria-label="Find on the board">
    <span class="ol-huntn"></span>
-   <button class="ol-huntp ghost" aria-label="Previous">↑</button>
-   <button class="ol-huntx ghost" aria-label="Next">↓</button>
+   <button class="ol-huntp ghost" title="Previous match (Shift+Enter)" aria-label="Previous"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg></button>
+   <button class="ol-huntx ghost" title="Next match (Enter)" aria-label="Next"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
   </div>
  </div>
  <div class="ol-fix glass" hidden>
@@ -243,6 +358,7 @@ main:has(#online.on)::after{height:0}
 .ol-links{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
 .ol-links path{fill:none;stroke:var(--text);stroke-width:2;pointer-events:stroke;cursor:pointer}
 .ol-links path.hit{stroke:transparent;stroke-width:18}
+.ol-links marker path{fill:var(--text);fill:context-stroke;stroke:none;pointer-events:none}
 .ol-links path.sel{stroke:var(--sel)}
 /* a word written on the line, on a patch of background so the line doesn't run through it */
 .ol-links text{fill:var(--text);font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;
@@ -265,7 +381,7 @@ main:has(#online.on)::after{height:0}
  letter-spacing:.08em;text-transform:uppercase;pointer-events:auto;overflow:hidden;white-space:nowrap;z-index:3}
 .ol-b[data-kind=shape][data-form=ellipse] .ol-c{left:50%;transform:translateX(-50%)}
 .ol-b[data-kind=shape] .ol-rs{pointer-events:auto}
-.ol-b.locked .ol-rs{display:none}
+.ol-b.locked .ol-rs,.ol-b.sel.locked .ol-rs{display:none}
 .ol-b.locked::before{content:"\1F512";position:absolute;right:6px;top:4px;z-index:4;font-size:11px;opacity:.5}
 .ol-draft{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 .ol-draft path{fill:none;stroke:var(--text);stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
@@ -296,13 +412,17 @@ main:has(#online.on)::after{height:0}
 .ol-b[data-kind=text]{background:transparent;border-color:transparent;box-shadow:none}
 .ol-b[data-kind=text] .ol-c{font:800 var(--fs,40px)/1.05 var(--dotf);letter-spacing:.01em;padding:4px 6px;overflow:hidden;text-transform:uppercase}
 .ol-b[data-kind=text].sel,.ol-b[data-kind=text]:hover{border-color:var(--line)}
-.ol-b[data-kind=sticky]{background:var(--sc,#fff4b8);color:#111;border-color:transparent;border-radius:6px 6px 22px 6px}
+.ol-b[data-kind=sticky]{background:var(--sc,#fff4b8);color:#111;border-color:transparent}
 .ol-b[data-kind=sticky] .ol-c{font-size:16px} .ol-b[data-kind=sticky] .ol-c:empty::before{color:#0006}
 /* whatever has been chosen for this one block, laid over the usual look of its kind */
 .ol-b .ol-c,.ol-b .ol-todo{font-family:var(--tf,inherit);color:var(--tc,inherit)}
 .ol-b:not([data-kind=text]):not([data-kind=code]):not([data-kind=term]) .ol-c,
 .ol-b .ol-todo span{font-size:var(--fs2,inherit)}
 .ol-b[data-kind=code] .ol-c,.ol-b[data-kind=term] .ol-c{font-size:var(--fs2,12.5px)}
+/* a project's text follows its size too: the code, the file list and what it printed */
+.ol-b[data-kind=proj] .ol-peek{font-size:var(--fs2,11.5px)}
+.ol-b[data-kind=proj] .ol-pfiles{font-size:calc(var(--fs2,11.5px) + 1.5px)}
+.ol-b[data-kind=proj] .ol-out,.ol-b[data-kind=code] .ol-out{font-size:var(--fs2,12px)}
 .ol-b[data-kind=text] .ol-c{font-family:var(--tf,var(--dotf));text-transform:var(--caps,uppercase)}
 .ol-b[data-kind=text].editing .ol-c{text-transform:none}
 .ol-b.bold .ol-c,.ol-b.bold .ol-todo{font-weight:700}
@@ -348,8 +468,15 @@ main:has(#online.on)::after{height:0}
 .ol-lnk b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .ol-lnk small{font:11px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ol-lnk input{border:1px solid var(--line);background:var(--inset);color:inherit;border-radius:8px;padding:6px 9px;font:inherit;font-size:13px}
-.ol-rs{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;display:none;z-index:4}
-.ol-rs::after{content:"";position:absolute;right:5px;bottom:5px;width:7px;height:7px;border-right:2px solid var(--sel);border-bottom:2px solid var(--sel)}
+.ol-rs{position:absolute;width:24px;height:24px;display:none;z-index:4}
+.ol-rs[data-c=se]{right:0;bottom:0;cursor:nwse-resize} .ol-rs[data-c=nw]{left:0;top:0;cursor:nwse-resize}
+.ol-rs[data-c=ne]{right:0;top:0;cursor:nesw-resize}   .ol-rs[data-c=sw]{left:0;bottom:0;cursor:nesw-resize}
+.ol-rs::after{content:"";position:absolute;width:11px;height:11px;border:0 solid var(--sel);transition:width .15s,height .15s}
+.ol-rs[data-c=se]::after{right:5px;bottom:5px;border-right-width:3px;border-bottom-width:3px;border-bottom-right-radius:4px}
+.ol-rs[data-c=nw]::after{left:5px;top:5px;border-left-width:3px;border-top-width:3px;border-top-left-radius:4px}
+.ol-rs[data-c=ne]::after{right:5px;top:5px;border-right-width:3px;border-top-width:3px;border-top-right-radius:4px}
+.ol-rs[data-c=sw]::after{left:5px;bottom:5px;border-left-width:3px;border-bottom-width:3px;border-bottom-left-radius:4px}
+.ol-rs:hover::after{width:15px;height:15px}
 .ol-b.sel .ol-rs{display:block}
 .ol-flash{animation:olflash .9s ease-out}
 @keyframes olflash{0%{outline-color:var(--sel)}100%{outline-color:transparent}}
@@ -375,6 +502,46 @@ main:has(#online.on)::after{height:0}
 .ol-people i{width:24px;height:24px;border-radius:50%;margin-left:-6px;border:2px solid var(--bg);display:grid;place-items:center;
  font:700 10px/1 var(--mono);color:#fff;font-style:normal;background:var(--pc)} .ol-people i.away{opacity:.35}
 .ol-more{padding:6px 12px;font-size:12px;letter-spacing:.05em}
+.ol-chatb{display:flex;align-items:center;gap:6px;padding:5px 11px 5px 6px;font-size:12px;letter-spacing:.05em;position:relative}
+.ol-chatb[hidden]{display:none}
+.ol-here{min-width:20px;height:20px;border-radius:10px;background:#2f9e5b;color:#fff;font:700 10px/20px var(--mono);text-align:center;padding:0 5px;box-sizing:border-box}
+.ol-unread{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;border-radius:9px;background:var(--red);color:#fff;font:700 9px/17px var(--mono);font-style:normal;text-align:center;padding:0 4px;box-sizing:border-box}
+.ol-unread:empty{display:none}
+.ol-chat{position:absolute;top:64px;right:12px;width:340px;max-width:calc(100% - 24px);height:min(470px,calc(100% - 150px));display:flex;flex-direction:column;border-radius:18px;z-index:4;overflow:hidden}
+.ol-chat[hidden]{display:none}
+.ol-chh{display:flex;align-items:center;gap:8px;padding:10px 10px 8px 16px;border-bottom:1px solid var(--line)}
+.ol-chh b{font-size:13px;flex:1}
+.ol-chn{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:7px 12px;border-bottom:1px solid var(--line);font:11px var(--mono);color:var(--muted)}
+.ol-chip{border:0;border-radius:999px;padding:3px 9px 3px 7px;font:11px var(--mono);background:var(--inset);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+.ol-chip::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--pc)} .ol-chip:hover{background:color-mix(in srgb,var(--pc) 22%,var(--inset))}
+.ol-chday{align-self:center;font:10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:4px 10px}
+.ol-chnew{display:flex;align-items:center;gap:8px;font:10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--red)}
+.ol-chnew::before,.ol-chnew::after{content:"";flex:1;height:1px;background:var(--red);opacity:.5}
+.ol-msg{position:relative} .ol-msg[title]{cursor:pointer} .ol-msg.cont{margin-top:-5px} .ol-msg.cont small{display:none}
+.ol-msg.tome{box-shadow:inset 3px 0 0 #f2c200}
+.ol-mbody a{color:inherit;text-decoration:underline;overflow-wrap:anywhere}
+.ol-ment{font-weight:700;color:#0a84ff} .ol-ment.me{color:#000;background:#f2c200;border-radius:4px;padding:0 3px}
+.ol-macts{position:absolute;top:-12px;right:6px;display:none;gap:2px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:2px;z-index:1}
+.ol-msg:hover .ol-macts{display:flex} .ol-msg.mine .ol-macts{right:auto;left:6px}
+.ol-macts button{border:0;background:transparent;color:var(--text);font:10.5px var(--mono);padding:3px 6px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.ol-macts button:hover{background:var(--inset)}
+.ol-retry{border:0;background:none;color:var(--red);font:inherit;text-decoration:underline;cursor:pointer;padding:0}
+.ol-chtyping{min-height:18px;padding:0 14px;font:11px var(--mono);color:var(--muted)}
+.ol-chin.priv{box-shadow:inset 0 2px 0 var(--red)}
+.ol-cht{resize:none;max-height:120px;line-height:1.4;font-family:inherit}
+.ol-chatb.ment .ol-unread{background:#f2c200;color:#000}
+.ol-chx{padding:3px 9px;font-size:12px}
+.ol-chlist{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+.ol-msg{max-width:85%;align-self:flex-start;background:var(--inset);border-radius:14px 14px 14px 4px;padding:7px 11px;font-size:13px;line-height:1.4;overflow-wrap:anywhere;white-space:pre-wrap}
+.ol-msg.mine{align-self:flex-end;border-radius:14px 14px 4px 14px;background:color-mix(in srgb,var(--text) 14%,transparent)}
+.ol-msg.priv{box-shadow:inset 0 0 0 1px var(--red)}
+.ol-msg small{display:block;font:10.5px var(--mono);color:var(--muted);margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ol-msg.failed{opacity:.5}
+.ol-chnote{color:var(--muted);font-size:12.5px;text-align:center;margin:auto 10px;line-height:1.5}
+.ol-chin{display:flex;gap:6px;padding:8px;border-top:1px solid var(--line);flex-wrap:wrap}
+.ol-chto,.ol-cht{border:1px solid var(--line);background:var(--inset);color:var(--text);border-radius:10px;padding:7px 10px;font:inherit;font-size:13px;outline:none}
+.ol-chto{flex:1 1 100%} .ol-cht{flex:1;min-width:0}
+.ol-chsend{padding:6px 14px;font-size:12px}
 /* Which board you are on, and the way to change it - one control, so it reads as something
    you can press rather than a label that happens to be clickable. */
 .ol-switch{display:flex;align-items:center;gap:8px;max-width:330px;padding:5px 9px 5px 11px;border-radius:999px;
@@ -432,12 +599,16 @@ main:has(#online.on)::after{height:0}
 .ol-map canvas{width:260px;height:170px;border-radius:9px;cursor:pointer;display:block}
 .ol-mapv{position:absolute;border:1.5px solid var(--sel);border-radius:4px;pointer-events:none;
  background:color-mix(in srgb,var(--sel) 12%,transparent)}
-.ol-hunt{display:flex;align-items:center;gap:4px;padding:4px 6px 4px 4px;border-radius:999px}
-.ol-hunt input{border:0;background:transparent;color:var(--text);outline:none;width:150px;
- font:12.5px var(--mono);padding:4px 2px}
+.ol-hunt{display:flex;align-items:center;gap:2px;height:40px;box-sizing:border-box;padding:0 5px;border-radius:999px}
+.ol-hunt input{border:0;background:transparent;color:var(--text);outline:none;width:150px;height:30px;
+ font:12.5px/30px var(--mono);padding:0 6px;margin:0}
 .ol-hunt input::placeholder{color:var(--muted)}
-.ol-huntn{color:var(--muted);font:10.5px var(--mono);min-width:38px;text-align:center}
-.ol-hunt button{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:11px;flex:none}
+.ol-huntn{color:var(--muted);font:10.5px/30px var(--mono);min-width:38px;text-align:center}
+.ol-huntn:empty{display:none}
+.ol-hunt button{width:30px;height:30px;padding:0;margin:0;border-radius:50%;display:grid;place-items:center;flex:none;line-height:0}
+.ol-hunt button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:block}
+.ol-hunt .ol-huntp,.ol-hunt .ol-huntx{border-color:transparent}
+.ol-hunt .ol-huntp:hover,.ol-hunt .ol-huntx:hover{background:var(--inset)}
 .ol-mapb.on{background:var(--text);color:var(--bg)}
 /* zoomed far out, the writing is too small to read, so each one shows its name instead */
 .ol.far .ol-b > *:not(.ol-tag):not(.ol-rs):not(.ol-srim){display:none}
@@ -460,6 +631,7 @@ main:has(#online.on)::after{height:0}
 html.cur-live .ol-board.linking,html.cur-live .ol-board.linking *{cursor:none!important}
 .ol-board.linking{cursor:crosshair}
 .ol-board{cursor:default}
+.ol-board[data-rz=se],.ol-board[data-rz=nw]{cursor:nwse-resize} .ol-board[data-rz=ne],.ol-board[data-rz=sw]{cursor:nesw-resize}
 .ol-board.grab,.ol-board.grab *{cursor:grab!important}
 .ol-board.panning,.ol-board.panning *{cursor:grabbing!important}
 html.cur-live .ol-board.grab,html.cur-live .ol-board.grab *,
@@ -479,11 +651,80 @@ html.no-anim .ol-ctx.on{animation:none}
 .ol-ctx .cols{display:flex;flex-wrap:wrap;gap:6px;padding:6px 12px 8px}
 .ol-ctx .cols i{width:22px;height:22px;border-radius:50%;cursor:pointer;border:1.5px solid rgba(0,0,0,.18)}
 .ol-ctx .cols i:hover{transform:scale(1.14)}
+/* the extra dressing a block can have, laid over everything above */
+.ol-b{opacity:var(--op,1)}
+.ol-b .ol-c,.ol-b .ol-todo span{text-decoration-line:var(--deco,none)}
+.ol-b .ol-todo li.done span{text-decoration-line:line-through}
+.ol-b.lh .ol-c,.ol-b.lh[data-kind] .ol-c{line-height:var(--lh)}
+.ol-b.ls .ol-c,.ol-b.ls[data-kind] .ol-c{letter-spacing:var(--ls)}
+.ol-b.rad:not([data-kind=shape]){border-radius:var(--rad)}
+.ol-b[data-kind=shape].rad:not([data-form=ellipse])::after{border-radius:var(--rad)}
+.ol-b.bd:not([data-kind=shape]){border-color:var(--bd);border-width:var(--bw,1px)}
+.ol-b.flat{box-shadow:none} .ol-b.lifted{box-shadow:0 2px 4px rgba(0,0,0,.06),0 20px 48px rgba(0,0,0,.2)}
+.ol-b.glow{box-shadow:0 0 0 1px color-mix(in srgb,var(--glow,var(--red)) 40%,transparent),0 0 26px color-mix(in srgb,var(--glow,var(--red)) 45%,transparent)}
+.ol-b[data-kind=shape].thick::after{border-width:4px}
+.ol-b[data-kind=shape].dots::after{border-style:dotted}
+.ol-b[data-kind=shape].solid::after{background:color-mix(in srgb,var(--sh,var(--text)) 28%,transparent)}
+
+/* the bar that floats over whatever is picked out */
+.ol-fmt{position:absolute;left:0;top:0;z-index:6;display:none;align-items:center;gap:3px;padding:5px;border-radius:16px;
+ max-width:calc(100% - 16px);flex-wrap:wrap;font:13px var(--mono);color:var(--text);user-select:none}
+.ol-fmt.on{display:flex;animation:ctxin .14s var(--spring) both}
+html.no-anim .ol-fmt.on{animation:none}
+.ol-fmt .sep{width:1px;align-self:stretch;margin:4px 3px;background:var(--line)}
+.ol-fmt button{height:34px;min-width:34px;padding:0 8px;margin:0;border:0;border-radius:9px;background:transparent;color:inherit;
+ display:inline-flex;align-items:center;justify-content:center;gap:5px;cursor:pointer;font:inherit;line-height:0;flex:none}
+.ol-fmt button:hover{background:var(--inset)}
+.ol-fmt button.on{background:var(--text);color:var(--bg)}
+.ol-fmt button svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:block}
+.ol-fmt button b,.ol-fmt button i,.ol-fmt button u,.ol-fmt button s{font:inherit;font-size:14px;line-height:1}
+.ol-fmt button b{font-weight:800} .ol-fmt button i{font-style:italic;font-family:Georgia,serif}
+.ol-fmt .chip{width:16px;height:16px;min-width:16px;max-width:16px;box-sizing:border-box;padding:0;border-radius:4px;border:1.5px solid rgba(128,128,128,.45);flex:0 0 16px;display:block}
+.ol-fmt .chip.none{background:linear-gradient(135deg,transparent 45%,var(--red) 45% 55%,transparent 55%)}
+.ol-fmt .lbl{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.ol-fmt select{height:30px;border:0;border-radius:9px;background:transparent;color:inherit;font:inherit;padding:0 4px;cursor:pointer;max-width:118px}
+.ol-fmt select:hover{background:var(--inset)}
+.ol-fmt select option{background:var(--bg);color:var(--text)}
+.ol-fmt .num{width:34px;height:26px;border:1px solid var(--line);border-radius:7px;background:transparent;color:inherit;
+ font:inherit;text-align:center;padding:0;-moz-appearance:textfield}
+.ol-fmt .num::-webkit-inner-spin-button{display:none}
+.ol-fmtpop{position:absolute;z-index:7;display:none;flex-direction:column;gap:10px;padding:14px;border-radius:16px;width:292px;
+ font:12.5px var(--mono);color:var(--text)}
+.ol-fmtpop.on{display:flex;animation:ctxin .14s var(--spring) both}
+.ol-fmtpop>*{flex:none} .ol-fmtpop{max-height:calc(100% - 120px);overflow:auto;background:var(--glass-strong)}
+html.no-anim .ol-fmtpop.on{animation:none}
+.ol-fmtpop small{color:var(--muted);font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+.ol-fmtpop .sw{display:grid;grid-template-columns:repeat(8,26px);gap:7px;justify-content:space-between;
+ width:auto;height:auto;min-height:0;border:0;border-radius:0;background:none;box-shadow:none;padding:0;margin:0}
+.ol-fmtpop .sw::before,.ol-fmtpop .sw::after{content:none;display:none}
+.ol-fmtpop .sw i{display:block;width:26px;height:26px;box-sizing:border-box;border-radius:50%;cursor:pointer;border:1.5px solid rgba(128,128,128,.35);transition:transform .15s}
+.ol-fmtpop .sw i:hover{transform:scale(1.15)} .ol-fmtpop .sw i.on{outline:2px solid var(--text);outline-offset:1px}
+.ol-fmtpop .row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ol-fmtpop .row button{border:1px solid var(--line);background:transparent;color:inherit;border-radius:999px;padding:7px 12px;font:inherit;cursor:pointer}
+.ol-fmtpop .row button:hover{background:var(--inset)} .ol-fmtpop .row button.on{background:var(--text);color:var(--bg);border-color:var(--text)}
+.ol-fmtpop input[type=color]{width:38px;height:30px;border:1px solid var(--line);border-radius:7px;padding:0;background:transparent;cursor:pointer}
+.ol-fmtpop input[type=range]{flex:1;accent-color:var(--red)}
+
+/* hover pop-outs: what a button does */
+.ol-tip{position:absolute;z-index:80;pointer-events:none;max-width:260px;padding:6px 9px;border-radius:8px;
+ background:var(--text);color:var(--bg);font:11px/1.4 var(--mono);letter-spacing:.02em;opacity:0;transform:translateY(3px);
+ transition:opacity .12s,transform .12s;white-space:normal}
+.ol-tip.on{opacity:1;transform:none}
+.ol-tip b{font-weight:400;opacity:.6;margin-left:6px}
+/* how the board itself looks, a choice for this computer only */
+.ol[data-grid=lines] .ol-board{background-image:linear-gradient(var(--dot) 1px,transparent 1px),linear-gradient(90deg,var(--dot) 1px,transparent 1px)}
+.ol[data-grid=none] .ol-board{background-image:none}
+.ol[data-grid=big] .ol-board{background-image:radial-gradient(var(--dot) 1.8px,transparent 2.3px);background-size:calc(var(--g,22px) * 2) calc(var(--g,22px) * 2)}
+.ol[data-paper=warm]{background:color-mix(in srgb,var(--bg) 90%,#f2c200)}
+.ol[data-paper=cool]{background:color-mix(in srgb,var(--bg) 90%,#0a84ff)}
+.ol[data-paper=green]{background:color-mix(in srgb,var(--bg) 90%,#2f9e5b)}
+.ol[data-paper=dark]{background:color-mix(in srgb,var(--bg) 70%,#000)}
 .ol-zoom{position:absolute;right:12px;bottom:12px;display:flex;gap:2px;padding:4px;border-radius:999px;z-index:5}
 .ol-zoom button{border:0;background:transparent;color:var(--text);min-width:32px;height:30px;border-radius:999px;cursor:pointer;font:11px var(--mono);letter-spacing:.06em}
 .ol-zoom button:hover{background:var(--inset)} .ol-zv{min-width:54px!important}
 .ol-cursors{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:4}
-.ol-cur{position:absolute;left:0;top:0;transition:transform .12s linear;color:var(--pc)}
+.ol-cur{position:absolute;left:0;top:0;transition:transform .09s linear;color:var(--pc)}
+.ol-b.glide{transition:left .09s linear,top .09s linear,width .09s linear,height .09s linear}
 .ol-cur svg{width:18px;height:18px;display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.3))}
 .ol-cur span{position:absolute;left:14px;top:16px;background:var(--pc);color:#fff;font:10px/1 var(--mono);letter-spacing:.06em;
  padding:4px 7px;border-radius:999px;white-space:nowrap;text-transform:uppercase}
@@ -529,7 +770,7 @@ html.no-anim .ol-ctx.on{animation:none}
 .ide-title{flex:1;min-width:60px;border:0;background:transparent;color:var(--text);font:700 15px/1.2 var(--mono);outline:none;padding:4px 0}
 .ide-who{font:11px var(--mono);color:var(--muted);letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ide-who button{margin-left:6px}
-.ol-ide button,.ide-lang{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 12px;cursor:pointer;
+.ol-ide button,.ide-lang,.ide-where{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 12px;cursor:pointer;
  font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;white-space:nowrap}
 .ol-ide button:hover{background:var(--inset)}
 .ol-ide .ide-run{background:var(--text);color:var(--bg);border-color:var(--text);padding:6px 16px}
@@ -547,6 +788,23 @@ html.no-anim .ol-ctx.on{animation:none}
 .ol-ide .ide-files li button{border:0;padding:0 4px;opacity:0;font-size:12px;border-radius:4px} .ide-files li:hover button{opacity:.7}
 .ide-tip{margin:0;padding:10px 16px 14px;font-size:11.5px;color:var(--muted);line-height:1.45}
 .ide-main{flex:1;min-width:0;display:flex;flex-direction:column}
+.ide-live{display:none;flex:none;width:var(--lw,44%);min-width:240px;max-width:75%;border-left:1px solid var(--line);flex-direction:column;position:relative;min-height:0}
+.ol-ide.live .ide-live{display:flex}
+.ide-lgrip{position:absolute;top:0;bottom:0;left:-4px;width:8px;cursor:ew-resize;z-index:2}
+.ide-lgrip:hover{background:linear-gradient(90deg,transparent 3px,var(--red) 3px,var(--red) 5px,transparent 5px)}
+.ide-lh{display:flex;align-items:center;gap:8px;padding:8px 10px 6px 14px;font:10.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--line);min-height:36px;box-sizing:border-box}
+.ide-lh .ide-lst{flex:1;text-transform:none;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ol-ide .ide-lh button{padding:2px 9px;font-size:13px;line-height:1}
+.ide-lbody{flex:1;min-height:0;display:flex}
+.ide-lv,.ide-lout,.ide-lpc{display:none;flex:1;min-width:0}
+.ide-lv{border:0;background:#fff}
+.ide-lout{margin:0;padding:10px 14px;overflow:auto;font:12.5px/1.55 "Cascadia Code",Consolas,var(--mono);white-space:pre-wrap}
+.ide-lout .e{color:var(--red)} .ide-lout .n{color:var(--muted);font-style:italic}
+.ide-lpc{flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:20px;text-align:center;color:var(--muted);font-size:13px;line-height:1.5}
+.ol-ide[data-lmode=web] .ide-lv,.ol-ide[data-lmode=out] .ide-lout{display:block}
+.ol-ide[data-lmode=pc] .ide-lpc,.ol-ide[data-lmode=none] .ide-lpc{display:flex}
+.ol-ide[data-lmode=none] .ide-lgo{display:none}
+.ol-ide .ide-disp.on{background:var(--text);color:var(--bg);border-color:var(--text)}
 .ide-tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--line);overflow-x:auto;flex:none;scrollbar-width:none;min-height:36px}
 .ol-ide .ide-tabs .tab{display:flex;align-items:center;gap:7px;border:0;border-radius:10px 10px 0 0;padding:7px 12px;text-transform:none;letter-spacing:0;
  font:13px -apple-system,"Segoe UI Variable","Segoe UI",system-ui,sans-serif;color:var(--muted)}
@@ -589,14 +847,19 @@ html.no-anim .ol-ctx.on{animation:none}
 .ide-grip:hover{background:linear-gradient(transparent 3px,var(--red) 3px,var(--red) 5px,transparent 5px)}
 .ide-pane{display:none;flex:1;min-height:0}
 .ol-ide[data-panel=out] .ide-out,.ol-ide[data-panel=view] .ide-view{display:block}
-.ol-ide[data-panel=con] .ide-con,.ol-ide[data-panel=find] .ide-find,.ol-ide[data-panel=ai] .ide-ai{display:flex;flex-direction:column}
+.ol-ide[data-panel=con] .ide-con,.ol-ide[data-panel=find] .ide-find,.ol-ide[data-panel=ai] .ide-ai,.ol-ide[data-panel=term] .ide-term{display:flex;flex-direction:column}
+.ide-tbar{display:flex;align-items:center;gap:8px;padding:0 10px 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.ide-tbar input{flex:1;min-width:80px;text-transform:none;letter-spacing:0}
+.ide-tbar .ide-tst{text-transform:none;letter-spacing:0;white-space:nowrap}
+.ide-tin{margin:0 10px 10px}
+.ol-ide.pcbusy .ide-tin{border-color:var(--red)}
 .ol-ide:not([data-panel=out]) .ide-in{visibility:hidden}
 .ol-ide[data-panel=view] .ide-clear,.ol-ide[data-panel=find] .ide-clear{visibility:hidden}
 .ide-out a.ide-loc{color:inherit;text-decoration:underline;cursor:pointer}
 .ide-img{display:block;max-width:min(100%,560px);margin:8px 0;border-radius:10px;background:#fff}
-.ide-cout{flex:1;margin:0;padding:8px 16px;overflow:auto;font:12.5px/1.55 "Cascadia Code",Consolas,var(--mono);white-space:pre-wrap}
-.ide-cout .cmd{color:var(--muted)} .ide-cout .e{color:var(--red)} .ide-cout .n{color:var(--muted);font-style:italic}
-.ide-cin,.ide-fr input,.ide-ait{border:1px solid var(--line);background:var(--inset);color:var(--text);border-radius:12px;padding:8px 12px;font:12.5px "Cascadia Code",Consolas,var(--mono);outline:none}
+.ide-cout,.ide-tout{flex:1;margin:0;padding:8px 16px;overflow:auto;font:12.5px/1.55 "Cascadia Code",Consolas,var(--mono);white-space:pre-wrap}
+.ide-cout .cmd,.ide-tout .cmd{color:var(--muted)} .ide-cout .e,.ide-tout .e{color:var(--red)} .ide-cout .n,.ide-tout .n{color:var(--muted);font-style:italic}
+.ide-cin,.ide-tin,.ide-tbar input,.ide-fr input,.ide-ait{border:1px solid var(--line);background:var(--inset);color:var(--text);border-radius:12px;padding:8px 12px;font:12.5px "Cascadia Code",Consolas,var(--mono);outline:none}
 .ide-cin{margin:0 10px 10px}
 .ide-fr{display:flex;gap:6px;padding:0 10px 6px} .ide-fr input{flex:1;min-width:60px}
 .ide-fres{list-style:none;margin:0;padding:0 6px 8px;overflow:auto;flex:1;font:12px/1.5 "Cascadia Code",Consolas,var(--mono)}
@@ -613,6 +876,7 @@ html.no-anim .ol-ctx.on{animation:none}
 .ide-code>div{display:flex;gap:6px;padding:6px 8px;justify-content:flex-end} .ol-ide .ide-code button{padding:3px 10px;font-size:10px}
 .ide-aiin{display:flex;gap:6px;padding:6px 10px 10px;align-items:flex-end} .ide-ait{flex:1;resize:none;font-family:inherit;font-size:13.5px;max-height:120px}
 .ol-ide .ide-aib{border-color:var(--red);color:var(--red)}
+.ol-ide .ide-x{border-color:var(--red);color:var(--red)} .ol-ide .ide-x:hover{background:var(--red);color:#fff}
 .ide-status .ide-hint{margin-left:auto;opacity:.7} .ide-status .ide-saved{margin-left:0}
 @media (max-width:760px){.ide-files{width:150px} .ol-ide .ide-vs,.ide-status .ide-hint{display:none}}
 @media (max-width:700px){.ol-tools{top:auto;bottom:56px;transform:none;flex-direction:row;left:10px;right:10px;overflow-x:auto} .ol-sep{width:1px;height:auto;margin:8px 4px}
@@ -635,6 +899,9 @@ const PAL = ['#d71921', '#ff6b35', '#e08a00', '#f2c200', '#2f9e5b', '#0f9ea0', '
              '#8e4ec6', '#e0457b', '#8c5a2b', '#5b6b7f',
              '#8f0f16', '#a85500', '#1d6b3c', '#0a6e70', '#064a94', '#2e3a8c', '#5c2f85', '#94203f',
              '#111111', '#555555', '#9a9a9a', '#ffffff'];
+const PEOPLE = PAL.slice(0, 20);
+const personColor = c => { const k = okColor(c); if (!k) return PAL[0]; const n = parseInt(k.slice(1), 16);
+  const l = ((n >> 16) * 299 + ((n >> 8) & 255) * 587 + (n & 255) * 114) / 1000; return l > 215 || l < 40 ? '#5b6b7f' : k; };
 const STICKY = ['#fff4b8', '#ffe9a8', '#ffd6d6', '#ffcfe6', '#d9ecff', '#cfe9f7', '#dcf5dc', '#d8f0cf',
                 '#ece0ff', '#ffe7cc', '#ececec', '#cfcfcf'];
 const PAPER = ['#fff4b8', '#ffd9d9', '#ffd0e8', '#d9ecff', '#cde8f5', '#dcf5dc', '#ece0ff', '#ffe7cc',
@@ -646,6 +913,9 @@ const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xx
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const now = () => new Date().toISOString();
 const okColor = c => /^#[0-9a-f]{6}$/i.test(c || '') ? c : null;
+// White picked in dark mode vanishes in light mode (and black the other way), so those two ends follow the theme
+const themed = c => { const k = okColor(c); if (!k) return null; const n = parseInt(k.slice(1), 16);
+  const l = ((n >> 16) * 299 + ((n >> 8) & 255) * 587 + (n & 255) * 114) / 1000; return l > 225 || l < 30 ? 'var(--text)' : k; };
 const okImg = s => typeof s === 'string' && /^data:image\/(png|jpe?g|gif|webp);base64,[a-z0-9+/=]+$/i.test(s) ? s : '';
 const okUrl = s => { try { const u = new URL(s); return /^https?:$/.test(u.protocol) ? u.href : ''; } catch (_) { return ''; } };
 const throttle = (fn, ms) => { let t = 0, timer = null, last; return (...a) => { last = a; const d = Date.now() - t;
@@ -743,11 +1013,10 @@ function applyView() {
   clearTimeout(settle);
   settle = setTimeout(() => world.classList.remove('moving'), 180);
   world.style.setProperty('--k', v.k);
-  // Below this the writing is a grey smudge, so blocks show their name instead
-  R.classList.toggle('far', v.k < .45);
+  // Zoomed out, blocks stay exactly as they are (Min asked: no swapping them for their names),
+  // and the dots behind stay still and the same size, whatever the view does
   drawMap();
-  const g = 22 * v.k; board.style.setProperty('--g', g + 'px'); board.style.setProperty('--gx', (v.x % g) + 'px'); board.style.setProperty('--gy', (v.y % g) + 'px');
-  $('.ol-zv').textContent = Math.round(v.k * 100) + '%'; placeCursors(); saveView();
+  $('.ol-zv').textContent = Math.round(v.k * 100) + '%'; placeCursors(); saveView(); fmtSoon();
 }
 const saveView = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => store.set('olView', S.view), 400); }; })();
 function toWorld(ev) { const r = board.getBoundingClientRect(), f = r.width / board.clientWidth || 1;
@@ -779,7 +1048,7 @@ function centre() { return {x: (board.clientWidth / 2 - S.view.x) / S.view.k, y:
 // ---------------------------------------------------------------- drawing blocks
 function node(b) {
   let d = S.nodes.get(b.id);
-  if (!d) { d = h('div', 'ol-b'); d.dataset.id = b.id; d.appendChild(h('i', 'ol-rs')); world.appendChild(d); S.nodes.set(b.id, d); }
+  if (!d) { d = h('div', 'ol-b'); d.dataset.id = b.id; ['se', 'nw', 'ne', 'sw'].forEach(c => { const g = d.appendChild(h('i', 'ol-rs')); g.dataset.c = c; }); world.appendChild(d); S.nodes.set(b.id, d); }
   return d;
 }
 function place(b) {
@@ -788,7 +1057,7 @@ function place(b) {
   Object.assign(d.style, {left: b.x + 'px', top: b.y + 'px', width: b.w + 'px', height: b.h + 'px', zIndex: b.z || 0});
   d.classList.toggle('sel', S.sel.has(b.id));
   d.classList.toggle('locked', locked(b));
-  drawLinks();
+  linksSoon();
 }
 // The fonts on offer. Two come with the app; the rest are whatever the computer already has.
 const FONTS = {plain: '', mono: 'var(--mono)', dots: 'var(--dotf)',
@@ -796,6 +1065,8 @@ const FONTS = {plain: '', mono: 'var(--mono)', dots: 'var(--dotf)',
                round: '"Trebuchet MS","Segoe UI",sans-serif'};
 const FONT_NAME = {plain: 'The usual', mono: 'Typewriter', dots: 'Dotted',
                    serif: 'Bookish', round: 'Rounded'};
+const LH = {tight: '1.15', airy: '1.9'}, LS = {tight: '-.02em', wide: '.1em'};
+const RAD = {square: '3px', soft: '9px', round: '26px', pill: '44px'};
 // Everything a block can be dressed in, kept on the block itself so it travels with it.
 function dress(b, d) {
   const D = b.data || {};
@@ -804,17 +1075,29 @@ function dress(b, d) {
   if (D.align) d.dataset.align = D.align; else delete d.dataset.align;
   const set = (k, v) => v ? d.style.setProperty(k, v) : d.style.removeProperty(k);
   set('--tf', FONTS[D.font] || '');
-  set('--tc', okColor(D.tcolor));
+  set('--tc', themed(D.tcolor));
   set('--bgc', okColor(D.bg));
   set('--fs2', D.fs ? clamp(D.fs, 9, 160) + 'px' : '');
   set('--caps', b.kind === 'text' && D.caps === false ? 'none' : '');
+  set('--deco', [D.ul && 'underline', D.strike && 'line-through'].filter(Boolean).join(' '));
+  set('--op', D.op != null && D.op < 1 ? String(clamp(+D.op || 1, .15, 1)) : '');
+  d.classList.toggle('lh', !!LH[D.lh]); set('--lh', LH[D.lh]);
+  d.classList.toggle('ls', !!LS[D.ls]); set('--ls', LS[D.ls]);
+  d.classList.toggle('rad', !!RAD[D.rad]); set('--rad', RAD[D.rad]);
+  const bd = themed(D.bd);
+  d.classList.toggle('bd', !!bd); set('--bd', bd); set('--bw', bd && D.bw ? clamp(+D.bw, 1, 6) + 'px' : '');
+  ['flat', 'lifted', 'glow'].forEach(k => d.classList.toggle(k, D.shadow === k));
+  set('--glow', D.shadow === 'glow' ? okColor(D.glow) : '');
+  d.classList.toggle('thick', b.kind === 'shape' && !!D.thick);
+  d.classList.toggle('dots', b.kind === 'shape' && !!D.dots);
+  d.classList.toggle('solid', b.kind === 'shape' && D.fill === 'solid');
 }
 
 function paint(b) {
   if (b.kind === 'arrow') return drawLinks();
   const d = node(b), rs = d.querySelector('.ol-rs'); place(b);
   if (S.editing === b.id) return;   // never replace what you're typing in
-  [...d.childNodes].forEach(c => c !== rs && c.remove());
+  [...d.childNodes].forEach(c => !(c.classList && c.classList.contains('ol-rs')) && c.remove());
   const add = e => d.insertBefore(e, rs), D = b.data || {};
   dress(b, d);
   const tag = add(h('div', 'ol-tag'));
@@ -824,7 +1107,7 @@ function paint(b) {
   else if (b.kind === 'sticky') { const c = add(h('div', 'ol-c', D.text || '')); c.dataset.ph = 'Idea…'; d.style.setProperty('--sc', okColor(D.color) || STICKY[0]); }
   else if (b.kind === 'shape') {
     d.dataset.form = D.form === 'ellipse' ? 'ellipse' : 'box';
-    d.style.setProperty('--sh', okColor(D.color) || 'var(--text)');
+    d.style.setProperty('--sh', themed(D.color) || 'var(--text)');
     d.classList.toggle('fill', !!D.fill); d.classList.toggle('dash', !!D.dash);
     ['n', 'e', 's', 'w'].forEach(side => add(h('i', 'ol-srim ' + side)));
     const c = add(h('div', 'ol-c', D.text || '')); c.dataset.ph = 'Name it…';
@@ -864,7 +1147,7 @@ function paint(b) {
       li.appendChild(h('span', '', it.t || '')).dataset.i = i;
       const who = S.members.get(it.who), w = li.appendChild(h('button', 'who' + (who ? ' set' : ''), who ? initials(who.name) : '+'));
       w.dataset.who = i; w.title = who ? `${who.name} is doing this. Click to change` : 'Give this to someone';
-      if (who) w.style.setProperty('--wc', okColor(who.color) || PAL[0]);
+      if (who) w.style.setProperty('--wc', personColor(who.color));
       const x = li.appendChild(h('button', 'x', '×')); x.dataset.del = i; x.title = 'Remove'; });
     add(h('button', 'ol-add', '+ Add item')).dataset.act = 'additem';
   }
@@ -879,7 +1162,7 @@ function paint(b) {
   else if (b.kind === 'ink') {
     const ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg'), p = document.createElementNS(ns, 'path');
     svg.setAttribute('viewBox', `0 0 ${D.vw || b.w} ${D.vh || b.h}`); svg.setAttribute('preserveAspectRatio', 'none');
-    p.setAttribute('d', /^[MLQCZ0-9.,\s-]*$/i.test(D.d || '') ? D.d : ''); p.setAttribute('stroke', okColor(D.color) || 'currentColor');
+    p.setAttribute('d', /^[MLQCZ0-9.,\s-]*$/i.test(D.d || '') ? D.d : ''); p.setAttribute('stroke', 'currentColor'); p.style.stroke = themed(D.color) || '';
     p.setAttribute('stroke-width', clamp(D.width || 3, 1, 20)); p.setAttribute('vector-effect', 'non-scaling-stroke');
     svg.appendChild(p); add(svg);
   }
@@ -897,7 +1180,7 @@ function outBox(add, b) {
   o.textContent = (lines.length > 8 ? '…\n' : '') + lines.slice(-8).join('\n') || '(no output)';
   o.dataset.by = `${out.ok ? 'Ran' : 'Error'} · ${out.by || ''}`;
 }
-function unpaint(id) { S.nodes.get(id)?.remove(); S.nodes.delete(id); S.sel.delete(id); drawLinks(); }
+function unpaint(id) { S.nodes.get(id)?.remove(); S.nodes.delete(id); S.sel.delete(id); drawLinks(); fmtSoon(); }
 function paintAll() { S.nodes.forEach((_, id) => { if (!S.blocks.has(id)) unpaint(id); }); S.blocks.forEach(paint); drawLinks(); emptyState(); }
 const emptyState = () => R.classList.toggle('has-blocks', S.blocks.size > 0);
 
@@ -927,13 +1210,15 @@ function linkPath(a, c, form) {
   return {d: `M${p1.x},${p1.y} Q${qx},${qy} ${p2.x},${p2.y}`,
           mid: {x: (p1.x + 2 * qx + p2.x) / 4, y: (p1.y + 2 * qy + p2.y) / 4}};   // halfway along the curve
 }
+let linksT = 0;
+function linksSoon() { if (!linksT) linksT = requestAnimationFrame(() => { linksT = 0; drawLinks(); }); }
 function drawLinks() {
   const ns = 'http://www.w3.org/2000/svg';
-  [...links.querySelectorAll('path,text,rect')].forEach(p => p.remove());
+  [...links.querySelectorAll(':scope > path, :scope > text, :scope > rect')].forEach(p => p.remove());   // not the arrowhead inside <defs>
   S.blocks.forEach(b => {
     if (b.kind !== 'arrow') return;
     const a = S.blocks.get(b.data?.from), c = S.blocks.get(b.data?.to); if (!a || !c) return;
-    const D = b.data || {}, {d, mid} = linkPath(a, c, D.form), on = S.sel.has(b.id), col = okColor(D.color);
+    const D = b.data || {}, {d, mid} = linkPath(a, c, D.form), on = S.sel.has(b.id), col = themed(D.color);
     const line = document.createElementNS(ns, 'path');
     line.setAttribute('d', d);
     const ends = D.ends || 'to';
@@ -966,12 +1251,18 @@ function record(steps) { if (!steps.length) return; history.push(steps); if (his
 function put(b, {send = true, soon = false} = {}) {
   b.updated_at = now(); S.blocks.set(b.id, b); paint(b); emptyState();
   if (send) Sync.save(b, soon);
+  if (S.sel.has(b.id)) fmtSoon();
 }
 function change(id, fn, opts) { const b = S.blocks.get(id); if (!b) return; const before = snap(b); fn(b); record([{before, after: snap(b)}]); put(b, opts); }
 // New lines come out the way the last one you liked was set, if you said so.
-const lineLook = () => store.get('olLine', null);
+const LINE_DEFAULT = {ends: 'none', form: 'elbow', dash: true, thick: false, color: null};
+const lineLook = () => store.get('olLine', null) || LINE_DEFAULT;
+function rememberLine(D) {
+  store.set('olLine', {ends: D.ends || 'to', form: D.form || 'curve', dash: !!D.dash, thick: !!D.thick, color: okColor(D.color)});
+}
 function add(kind, x, y, data = {}, opts = {}) {
-  if (kind === 'arrow') data = {...(lineLook() || {}), ...data};
+  if (kind === 'arrow') data = {...lineLook(), ...data};
+  else data = {...(store.get('olLooks', {})[kind] || {}), ...data};     // the look picked for new ones of this kind
   const [w, hgt] = opts.size || SIZES[kind] || [260, 160];
   const top = Math.max(0, ...[...S.blocks.values()].map(b => b.z || 0)) + 1;
   const b = {id: uuid(), kind, x: Math.round(x - (opts.centre === false ? 0 : w / 2)), y: Math.round(y - (opts.centre === false ? 0 : hgt / 2)), w, h: hgt, z: top, data};
@@ -997,7 +1288,7 @@ function undo(redo) {
 }
 function select(ids, keep) {
   if (!keep) S.sel.clear(); ids.forEach(id => S.sel.add(id));
-  S.nodes.forEach((d, id) => d.classList.toggle('sel', S.sel.has(id))); drawLinks();
+  S.nodes.forEach((d, id) => d.classList.toggle('sel', S.sel.has(id))); drawLinks(); fmtSoon(true);
 }
 // Shapes are meant to sit behind what they group, so they go to the back when made.
 function toBack(ids) {
@@ -1189,6 +1480,32 @@ function mainOf(D) {
 }
 const mainFile = b => b.kind === 'proj' ? mainOf(b.data) : filesOf(b)[0].n;
 const canRun = b => !!RUN_EXT[ext(mainFile(b))];
+// "On this PC": the app writes the files to the project's folder and runs a command there with whatever is installed
+const whereOf = b => b.data.where || (RUN_EXT[ext(mainFile(b))] ? 'app' : 'pc');
+const projTitle = b => b.data.title || (b.kind === 'proj' ? 'Project' : 'Code');
+const qn = s => /[\s&()]/.test(s) ? `"${s}"` : s;
+const MAC = /Mac/.test(navigator.platform), OUT = MAC ? 'app' : 'app.exe', BIN = MAC ? './app' : 'app.exe';
+function autoCmd(b) {
+  const fs = filesOf(b).map(f => f.n), main = mainFile(b) || '', e = ext(main), all = x => fs.filter(n => ext(n) === x).map(qn).join(' ');
+  const stem = main.split('/').pop().replace(/\.[^.]+$/, '');
+  switch (e) {
+    case 'py': return (MAC ? 'python3 ' : 'python ') + qn(main);
+    case 'js': case 'mjs': case 'cjs': return 'node ' + qn(main);
+    case 'ts': return 'npx --yes tsx ' + qn(main);
+    case 'java': return fs.filter(n => ext(n) === 'java').length > 1 ? `javac -d out ${all('java')} && java -cp out ${stem}` : 'java ' + qn(main);
+    case 'c': return `gcc ${all('c')} -o ${OUT} && ${BIN}`;
+    case 'cpp': case 'cc': return `g++ ${all(e)} -o ${OUT} && ${BIN}`;
+    case 'cs': return 'dotnet run';
+    case 'go': return 'go run .';
+    case 'rs': return fs.includes('Cargo.toml') ? 'cargo run' : `rustc ${qn(main)} -o ${OUT} && ${BIN}`;
+    case 'html': case 'htm': return (MAC ? 'open ' : 'start "" ') + qn(main);
+    case 'bat': case 'cmd': return qn(main);
+    case 'rb': return 'ruby ' + qn(main);
+    case 'php': return 'php ' + qn(main);
+    default: return '';
+  }
+}
+const runCmd = b => (b.data.cmd || '').trim() || autoCmd(b);
 
 // Python runs in Pyodide (Python compiled for the browser) inside a worker: no access to the computer or the page
 const PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
@@ -1298,7 +1615,7 @@ async function run(b, stdin, sink, img) {
   if (running.has(b.id)) { running.get(b.id)(); return; }
   const files = filesOf(b), main = mainFile(b), kind = RUN_EXT[ext(main)];
   if (!kind) {
-    const msg = `${main ? ext(main).toUpperCase() || 'This' : 'This'} code can't run inside the app. Click "Open in VS Code" to run it there.`;
+    const msg = `${main ? ext(main).toUpperCase() || 'This' : 'This'} code can't run inside the app. Pick "On this PC" next to Run to run it on your computer.`;
     sink && sink(msg + '\n', true); return finish(b.id, {text: msg, ok: false});
   }
   let text = '';
@@ -1320,7 +1637,7 @@ function finish(id, out) {
 }
 const paintRun = id => { const b = S.blocks.get(id); if (b && S.editing !== id) paint(b); };
 function boardRun(b) {
-  if (RUN_EXT[ext(mainFile(b))] === 'html') { startEdit(b.id); (IDE.ready || Promise.resolve()).then(() => IDE.go()); return; }
+  if (RUN_EXT[ext(mainFile(b))] === 'html' || whereOf(b) === 'pc') { startEdit(b.id); (IDE.ready || Promise.resolve()).then(() => IDE.go()); return; }
   run(b, '', null);
 }
 
@@ -1352,7 +1669,12 @@ const TEMPLATES = {
     {n: 'marks.csv', t: 'module,mark\nSDGP,68\nWeb,74\nDatabases,61\nMaths,79\n'}],
   'JavaScript': [{n: 'main.js', t: "const {average} = require('./stats');\n\nconst marks = [62, 71, 58, 80];\nconsole.log('Average:', average(marks));\n"},
     {n: 'stats.js', t: 'function average(xs) {\n  return xs.reduce((a, b) => a + b, 0) / xs.length;\n}\n\nmodule.exports = {average};\n'}],
-  'Java': [{n: 'Main.java', t: 'public class Main {\n    public static void main(String[] args) {\n        System.out.println("Hello, group!");\n    }\n}\n'}],
+  'Java': [{n: 'Main.java', t: 'public class Main {\n    public static void main(String[] args) {\n        Student s = new Student("Min", 72);\n        System.out.println(s.name + " got " + s.mark + " (" + s.grade() + ")");\n    }\n}\n'},
+    {n: 'Student.java', t: 'public class Student {\n    final String name;\n    final int mark;\n\n    Student(String name, int mark) {\n        this.name = name;\n        this.mark = mark;\n    }\n\n    String grade() {\n        return mark >= 70 ? "First" : mark >= 60 ? "2:1" : mark >= 50 ? "2:2" : "Third";\n    }\n}\n'}],
+  'C': [{n: 'main.c', t: '#include <stdio.h>\n#include "maths.h"\n\nint main(void) {\n    int marks[] = {62, 71, 58, 80};\n    printf("Average: %.1f\\n", average(marks, 4));\n    return 0;\n}\n'},
+    {n: 'maths.h', t: '#ifndef MATHS_H\n#define MATHS_H\n\ndouble average(const int *xs, int n);\n\n#endif\n'},
+    {n: 'maths.c', t: '#include "maths.h"\n\ndouble average(const int *xs, int n) {\n    double total = 0;\n    for (int i = 0; i < n; i++) total += xs[i];\n    return n ? total / n : 0;\n}\n'}],
+  'C++': [{n: 'main.cpp', t: '#include <iostream>\n#include <string>\n#include <vector>\n\nint main() {\n    std::vector<std::string> team = {"Min", "Alex", "Sam"};\n    std::cout << "Team of " << team.size() << ":\\n";\n    for (const auto &name : team) std::cout << " - " << name << "\\n";\n    std::string you;\n    std::cout << "Your name: ";\n    std::getline(std::cin, you);\n    std::cout << "Hello, " << you << "!\\n";\n}\n'}],
   'Empty': [{n: 'README.md', t: '# Our project\n'}],
 };
 // typing one of these words in Python offers the whole shape
@@ -1380,7 +1702,7 @@ const IDE = (() => {
   const el = h('div', 'ol-ide'); R.appendChild(el);
   el.innerHTML = `<div class="ide-top"><i class="ide-dot"></i><input class="ide-title" maxlength="80" placeholder="Untitled" aria-label="Name">
     <span class="ide-who"></span><select class="ide-lang" aria-label="Language"></select>
-    <button class="ide-run" title="Run (Ctrl+Enter or F5)">▶ Run</button><button class="ide-aib" title="Ask AI about your code (Ctrl+I)">Ask AI</button>
+    <button class="ide-run" title="Run (Ctrl+Enter or F5)">▶ Run</button><select class="ide-where" title="Where Run runs it" aria-label="Where to run"><option value="app">In the app</option><option value="pc">On this PC</option></select><button class="ide-disp" title="Show what you're making beside the code">Display</button><button class="ide-aib" title="Ask AI about your code (Ctrl+I)">Ask AI</button>
     <button class="ide-vs" title="Save these files to a folder and open it in VS Code">Open in VS Code</button>
     <button class="ide-more" title="All commands and shortcuts (Ctrl+Shift+P)" aria-label="All commands">⋯</button>
     <button class="ide-x" title="Back to the board (Esc)" aria-label="Back to the board">✕</button></div>
@@ -1391,13 +1713,17 @@ const IDE = (() => {
     <div class="ide-main"><div class="ide-tabs"></div><div class="ide-note" hidden></div><div class="ide-ed"></div>
      <div class="ide-pick" hidden><input aria-label="Search" spellcheck="false"><ul></ul></div>
      <div class="ide-panel"><i class="ide-grip" title="Drag to resize"></i><div class="ide-ph"><button data-p="out" class="on">Output</button><button data-p="view">Preview</button>
-       <button data-p="con">Console</button><button data-p="find">Search</button><button data-p="ai">AI</button>
+       <button data-p="term">Terminal</button><button data-p="con">Console</button><button data-p="find">Search</button><button data-p="ai">AI</button>
        <input class="ide-in" placeholder="Input for input() — one line each, separate with  |  " aria-label="Program input"><button class="ide-clear">Clear</button></div>
       <pre class="ide-out ide-pane"></pre><iframe class="ide-view ide-pane" sandbox="allow-scripts allow-modals" title="Preview"></iframe>
+      <div class="ide-term ide-pane"><div class="ide-tbar"><span>Run command</span><input class="ide-cmd" spellcheck="false" aria-label="Run command"><span class="ide-tst"></span><button class="ide-fold" title="Open this project's folder on your computer">Folder</button></div>
+       <pre class="ide-tout"></pre><input class="ide-tin" spellcheck="false" placeholder="A command, Enter runs it in the project folder: pip install requests · git status · javac Main.java" aria-label="Terminal"></div>
       <div class="ide-con ide-pane"><pre class="ide-cout"></pre><input class="ide-cin" spellcheck="false" placeholder=">>> Python here, Enter runs it. Your last run's variables are still here" aria-label="Python console"></div>
       <div class="ide-find ide-pane"><div class="ide-fr"><input class="ide-fq" spellcheck="false" placeholder="Search all files" aria-label="Search all files"><input class="ide-fw" spellcheck="false" placeholder="Replace with" aria-label="Replace with"><button class="ide-frep">Replace all</button></div><ul class="ide-fres"></ul></div>
       <div class="ide-ai ide-pane"><div class="ide-ans"></div>
-        <div class="ide-aiin"><textarea class="ide-ait" rows="1" placeholder="Ask about your code… (select lines first to ask about just those)" aria-label="Ask AI"></textarea><button class="ide-aisend">Ask</button></div></div></div></div></div>
+        <div class="ide-aiin"><textarea class="ide-ait" rows="1" placeholder="Ask about your code… (select lines first to ask about just those)" aria-label="Ask AI"></textarea><button class="ide-aisend">Ask</button></div></div></div></div>
+    <div class="ide-live"><i class="ide-lgrip" title="Drag to resize"></i><div class="ide-lh"><span>Display</span><span class="ide-lst"></span><button class="ide-lre" title="Show it again" aria-label="Show it again">↻</button></div>
+     <div class="ide-lbody"><iframe class="ide-lv" sandbox="allow-scripts allow-modals" title="Display"></iframe><pre class="ide-lout"></pre><div class="ide-lpc"><p></p><button class="btn ide-lgo">▶ Run on this PC</button></div></div></div></div>
    <div class="ide-status"><span class="ide-pos">Ln 1, Col 1</span><span class="ide-lg"></span><span class="ide-hint">Ctrl+P files · Ctrl+Shift+P all commands</span><span class="ide-saved"></span></div>
    <div class="ide-start"><div><h3>Start a project</h3><p>Pick a starting point. You can add, upload, link and delete files after.</p><div class="ide-tpl"></div></div></div>`;
   const q = s => el.querySelector(s);
@@ -1482,6 +1808,7 @@ const IDE = (() => {
     if (isProj()) { if ((b.data.files || []).some(f => f.n === n && f.link)) return; typed(b, {files: (b.data.files || []).map(f => f.n === n ? {...f, t: text} : f)}); }
     else typed(b, {text});
     saved('Saving…'); clearTimeout(savedT); savedT = setTimeout(() => saved('Saved'), 900);
+    live();
   }
   function show(n) {
     if (!b) return;
@@ -1658,6 +1985,58 @@ const IDE = (() => {
     sp.append(s.slice(last));
   }
   function write(s, err) { if (s === null) { outEl.textContent = ''; return; } const sp = outEl.appendChild(h('span', err ? 'e' : '')); linked(sp, s); outEl.scrollTop = outEl.scrollHeight; return sp; }
+  // ------------------------------------------------ the display: what you're making, beside the code
+  // A web page redraws as you type. Python and JavaScript run again once you stop typing and show what they print
+  // (charts too). A project that runs on this computer opens its own window there, so the display offers to run it.
+  let liveOn = !!store.get('bbDisplay', false), liveT = null, liveBusy = false, liveAgain = false;
+  if (P.lw) q('.ide-live').style.setProperty('--lw', P.lw + 'px');
+  function livePage(blk) {
+    const m = mainFile(blk); if (RUN_EXT[ext(m)] === 'html') return m;
+    const fs = filesOf(blk), f = fs.find(x => /(^|\/)index\.html?$/i.test(x.n)) || fs.find(x => /\.html?$/i.test(x.n));
+    return f ? f.n : null;
+  }
+  function liveMode(blk) {
+    const k = RUN_EXT[ext(mainFile(blk))];
+    if (k === 'html') return 'web';
+    if (whereOf(blk) === 'pc') return 'pc';
+    if (k) return 'out';
+    return livePage(blk) ? 'web' : 'none';
+  }
+  function live(now) {
+    clearTimeout(liveT); if (!liveOn || !b) return;
+    const blk = b, mode = liveMode(blk); el.dataset.lmode = mode;
+    if (mode === 'pc' || mode === 'none') {
+      q('.ide-lst').textContent = mode === 'pc' ? 'on this PC' : '';
+      q('.ide-lpc p').textContent = mode === 'pc'
+        ? 'This runs on your computer, so an app opens in its own window and anything it prints shows in the Terminal. Run it to see it.'
+        : `${(ext(mainFile(blk)) || 'This').toUpperCase()} code needs your computer to run. Pick "On this PC" next to Run, or add an index.html to see a page here.`;
+      return;
+    }
+    liveT = setTimeout(() => mode === 'web' ? liveWeb(blk) : liveRun(blk), now ? 0 : mode === 'web' ? 300 : 900);
+  }
+  function liveWeb(blk) {
+    const pg = livePage(blk); q('.ide-lst').textContent = pg;
+    // a fresh frame each time (see view()); it must have its page before it goes in, or Chromium leaves it white
+    const old = q('.ide-lv'), v = old.cloneNode(false); v.srcdoc = webPage(filesOf(blk), pg); old.replaceWith(v);
+  }
+  async function liveRun(blk) {
+    if (liveBusy || running.size) { liveAgain = true; return; }
+    liveBusy = true; liveAgain = false;
+    const box = q('.ide-lout'), main = mainFile(blk); q('.ide-lst').textContent = main + ' \u00b7 running\u2026';
+    const guard = setTimeout(() => { liveBusy = false; }, 100000);   // never stay stuck if the worker was taken over
+    let fresh = true;
+    const sink = (t, err) => { if (fresh) { box.replaceChildren(); fresh = false; } if (t === null) return box.replaceChildren(); box.appendChild(h('span', err ? 'e' : '', t)); };
+    const ok = await runIn(RUN_EXT[ext(main)], filesOf(blk), main, q('.ide-in').value.split(/\s*\|\s*/).join('\n'), sink, {img: src => picture(box, src)});
+    clearTimeout(guard);
+    if (fresh) box.replaceChildren(h('span', 'n', '(it ran, and printed nothing)'));
+    q('.ide-lst').textContent = main + (ok ? '' : ' \u00b7 stopped with an error');
+    liveBusy = false;
+    if (liveAgain && b && b.id === blk.id) live(true);
+  }
+  function setLive(on) {
+    liveOn = on; store.set('bbDisplay', on); el.classList.toggle('live', on); q('.ide-disp').classList.toggle('on', on);
+    if (on) live(true); else { clearTimeout(liveT); const old = q('.ide-lv'); old.replaceWith(old.cloneNode(false)); }
+  }
   function picture(box, src) { const i = box.appendChild(h('img', 'ide-img')); i.src = src; i.alt = 'Chart'; box.scrollTop = box.scrollHeight; }
   function jump(n, line, col = 1, len = 0) {
     if (!b) return;
@@ -1683,8 +2062,10 @@ const IDE = (() => {
     if (running.has(blk.id)) { running.get(blk.id)(); return; }
     if (running.has('console')) return toast('The console is still busy');
     unmark();
+    if (whereOf(blk) === 'pc') return pcRun(runCmd(blk), true);
     const main = mainFile(blk);
     if (RUN_EXT[ext(main)] === 'html') { panel('view'); outEl.textContent = ''; view(webPage(filesOf(blk), main)); sfx('send'); return; }
+    while (liveBusy) await new Promise(r => setTimeout(r, 100));
     panel('out'); outEl.textContent = '';
     await run(blk, q('.ide-in').value.split(/\s*\|\s*/).join('\n'), (s, err) => { if (b && b.id === blk.id) write(s, err); }, src => { if (b && b.id === blk.id) picture(outEl, src); });
     const out = (S.blocks.get(blk.id) || blk).data.out;
@@ -1707,6 +2088,73 @@ const IDE = (() => {
   function openConsole() {
     panel('con'); q('.ide-cin').focus();
     if (!cout.childNodes.length) cwrite('Python console. Run your program first and its variables are here to look at, e.g. type a name and press Enter.\n', 'n');
+  }
+
+  // ------------------------------------------------ terminal: a real command line in the project's folder
+  const tout = q('.ide-tout'), procs = new Map(), synced = new Map(), thist = [];
+  let thi = 0;
+  const twrite = (s, cls) => { tout.appendChild(h('span', cls || '', s)); while (tout.childNodes.length > 3000) tout.firstChild.remove(); tout.scrollTop = tout.scrollHeight; };
+  // the app sends what the program prints here, a bit at a time, and the exit code at the end
+  window.bbTerm = (key, text, code) => {
+    const p = procs.get(key); if (!p) return;
+    if (text != null) { const t = noAnsi(text).replace(/\r\n?/g, '\n'); p.text = (p.text + t).slice(-40000); if (b && b.id === key) twrite(t); return; }
+    procs.delete(key); running.delete(key); busy(key, false); el.classList.toggle('pcbusy', !!(b && procs.has(b.id)));
+    if (b && b.id === key) twrite(`\n[finished${code ? ', exit code ' + code : ''}]\n`, code ? 'e' : 'n');
+    p.done({code, text: p.text});
+  };
+  // On a group board the code comes from other people, so the first time a block runs a command it asks
+  async function trusted(blk, cmd) {
+    if (S.mode !== 'live') return true;
+    const k = blk.id + '|' + cmd, ok = store.get('bbPcOk', []);
+    if (ok.includes(k)) return true;
+    if (!confirm(`This runs on your computer, with the same access as any program you start:\n\n${cmd}\n\nin the folder for "${projTitle(blk)}". The code comes from your group board, so only carry on if you trust what is in it.`)) return false;
+    store.set('bbPcOk', [...ok, k].slice(-200)); return true;
+  }
+  async function pcRun(cmd, asRun) {
+    if (!b) return; const blk = b;
+    cmd = (cmd || '').trim();
+    if (procs.has(blk.id)) { if (asRun) return; twrite(cmd + '\n', 'cmd'); api().term_input(blk.id, cmd); return; }   // the program is waiting for input
+    openTerm();
+    if (!cmd) { twrite(asRun ? 'Type the command that runs this project in "Run command" above (e.g. python main.py).\n' : '', 'n'); return; }
+    if (/^(cls|clear)$/i.test(cmd)) { tout.replaceChildren(); return; }
+    if (/^cd(\s|$)/i.test(cmd)) { twrite('Each command starts in the project folder. Put cd in the same line, e.g. cd src && python app.py\n', 'n'); return; }
+    if (!api() || !api().term_start) { twrite('This works in the Blackboard Buddy app.\n', 'e'); return; }
+    if (!(await trusted(blk, cmd))) return;
+    const files = filesOf(blk).filter(f => !f.link || f.t != null).map(f => ({n: f.n, t: f.t || ''}));
+    twrite((asRun ? '▶ ' : '> ') + cmd + '\n', 'cmd');
+    const done = new Promise(ok => procs.set(blk.id, {text: '', done: ok}));
+    let r; try { r = await api().term_start(blk.id, projTitle(blk), files, cmd); } catch (e) { r = {error: String(e)}; }
+    if (!r || r.error) { procs.delete(blk.id); twrite(((r && r.error) || "Couldn't start it") + '\n', 'e'); if (asRun) finish(blk.id, {text: (r && r.error) || '', ok: false}); return; }
+    synced.set(blk.id, new Map(files.map(f => [f.n, f.t])));
+    running.set(blk.id, () => api().term_stop(blk.id)); busy(blk.id, true); el.classList.add('pcbusy');
+    if (asRun) sfx('send');
+    q('.ide-tin').focus();
+    const end = await done;
+    if (asRun) { finish(blk.id, {text: end.text.length > 20000 ? '…\n' + end.text.slice(-20000) : end.text, ok: !end.code}); sfx(end.code ? 'error' : 'done'); }
+    await pullBack(blk.id, r.started);
+  }
+  // what the program wrote, or what a command made, comes back into the project (text files only)
+  async function pullBack(id, since) {
+    let got; try { got = await api().proj_pull(projTitle(S.blocks.get(id) || {data: {}}), since); } catch (_) { return; }
+    const cur = S.blocks.get(id); if (!Array.isArray(got) || !got.length || !cur || cur.kind !== 'proj') return;
+    const was = synced.get(id) || new Map(), list = filesOf(cur).map(f => ({...f})), added = [], changed = [];
+    for (const f of got) {
+      const mine = list.find(x => x.n === f.n);
+      if (!mine) { list.push({n: f.n, t: f.t}); added.push(f.n); }
+      else if (!mine.link && mine.t !== f.t && was.get(f.n) === mine.t) { mine.t = f.t; changed.push(f.n); }   // changed there, not here
+    }
+    if (!added.length && !changed.length) return;
+    typed(cur, {files: list});
+    if (b && b.id === id) { refresh(cur); drawFiles(); twrite(`Brought back from the folder: ${[...added.map(n => n + ' (new)'), ...changed].join(', ')}\n`, 'n'); }
+  }
+  function openTerm() {
+    panel('term');
+    if (b) { q('.ide-cmd').placeholder = autoCmd(b) || 'e.g. python main.py'; q('.ide-cmd').value = b.data.cmd || ''; }
+    if (!tout.childNodes.length) twrite('Commands run in this project\'s own folder on your computer (Documents\\Blackboard Buddy projects), with whatever you have installed. Ctrl+C stops a program.\n', 'n');
+    if (api() && api().pc_tools && !openTerm.told) { openTerm.told = true;
+      api().pc_tools().then(t => { if (!t) return; const have = Object.entries(t).filter(([, v]) => v).map(([k]) => k);
+        q('.ide-tst').textContent = have.length ? 'Has: ' + have.filter(k => !['py', 'javac', 'g++', 'rustc', 'npm'].includes(k)).join(', ') : 'Nothing to run code with is installed yet'; }).catch(() => {}); }
+    q('.ide-tin').focus();
   }
 
   // ------------------------------------------------ search and replace in every file
@@ -1840,6 +2288,8 @@ const IDE = (() => {
     const C = [
       ['Run', 'Ctrl+Enter · F5', go], ['Go to a file', 'Ctrl+P', quick], ['Search in all files', 'Ctrl+Shift+F', openFind],
       ['Python console', 'Ctrl+`', openConsole], ['Ask AI about the code', 'Ctrl+I', openAI],
+      ['Run on this computer', '', () => b && pcRun(runCmd(b), true)], ['Display: show what you\u2019re making beside the code', '', () => setLive(!liveOn)], ['Terminal (this computer)', '', openTerm],
+      ['Open the project folder', '', () => exportTo('folder')],
       ['Explain the last error (AI)', '', () => quickAsk('error')], ['Find bugs in this file (AI)', '', () => quickAsk('bugs')],
       ['Go to line…', 'Ctrl+G', () => act('editor.action.gotoLine')], ['Find in this file', 'Ctrl+F', () => act('actions.find')],
       ['Replace in this file', 'Ctrl+H', () => act('editor.action.startFindReplaceAction')], ['Comment / uncomment lines', 'Ctrl+/', () => act('editor.action.commentLine')],
@@ -1875,16 +2325,19 @@ const IDE = (() => {
   // ------------------------------------------------ opening, closing, other people
   async function open(blk, readOnly, who) {
     b = blk; ro = !!readOnly; tabs = []; file = null;
-    if (lastId !== blk.id) { lastId = blk.id; resetChat(); closed.clear(); cout.replaceChildren(); }
+    if (lastId !== blk.id) { lastId = blk.id; resetChat(); closed.clear(); cout.replaceChildren(); tout.replaceChildren(); }
     el.classList.add('on'); el.classList.toggle('proj', isProj()); el.classList.toggle('ro', ro);
     q('.ide-who').textContent = ro ? `${(who && who.name) || 'Someone'} is editing. You're watching live` : '';
     q('.ide-title').value = b.data.title || ''; q('.ide-title').readOnly = ro;
     q('.ide-lang').hidden = b.kind !== 'code'; q('.ide-lang').value = b.data.lang || 'auto'; q('.ide-lang').disabled = ro;
+    q('.ide-where').value = whereOf(b); q('.ide-where').disabled = ro; q('.ide-cmd').readOnly = ro;
+    el.classList.toggle('pcbusy', procs.has(b.id));
     outEl.textContent = ''; outEl.classList.remove('bad'); if (b.data.out) write(b.data.out.text, !b.data.out.ok);
     panel('out'); busy(b.id, running.has(b.id)); view(''); q('.ide-pick').hidden = true; q('.ide-note').hidden = true;
     if (P.ph) q('.ide-panel').style.height = P.ph + 'px';
     q('.ide-start').classList.toggle('on', isProj() && !filesOf(b).length && !ro);
     saved(ro ? 'Read only' : 'Saved');
+    el.classList.toggle('live', liveOn); q('.ide-disp').classList.toggle('on', liveOn); live(true);
     sfx('open');
     await ensure(); if (b !== blk) return;
     if (mon) mon.editor.setTheme(theme());
@@ -1908,6 +2361,7 @@ const IDE = (() => {
     if (isProj() && !filesOf(b).some(f => f.n === file)) file = mainOf(b.data);
     show(isProj() ? file : '');
     if (b.data.out && !running.has(b.id)) { outEl.textContent = ''; write(b.data.out.text, !b.data.out.ok); }
+    live();
   }
   function peers() {
     if (!b || !ro || !el.classList.contains('on')) return;
@@ -1921,8 +2375,8 @@ const IDE = (() => {
   q('.ide-run').onclick = () => go();
   q('.ide-aib').onclick = openAI;
   q('.ide-more').onclick = commands;
-  q('.ide-clear').onclick = () => { const p = el.dataset.panel; if (p === 'con') cout.replaceChildren(); else if (p === 'ai') resetChat(); else outEl.textContent = ''; };
-  el.querySelectorAll('.ide-ph [data-p]').forEach(x => x.onclick = () => ({con: openConsole, find: openFind, ai: openAI}[x.dataset.p] || (() => panel(x.dataset.p)))());
+  q('.ide-clear').onclick = () => { const p = el.dataset.panel; if (p === 'term') tout.replaceChildren(); else if (p === 'con') cout.replaceChildren(); else if (p === 'ai') resetChat(); else outEl.textContent = ''; };
+  el.querySelectorAll('.ide-ph [data-p]').forEach(x => x.onclick = () => ({con: openConsole, find: openFind, ai: openAI, term: openTerm}[x.dataset.p] || (() => panel(x.dataset.p)))());
   q('.ide-title').oninput = () => { if (b && !ro) typed(b, {title: q('.ide-title').value}); };
   q('.ide-lang').onchange = () => { if (b && !ro) { typed(b, {lang: q('.ide-lang').value}); show(''); } };
   q('.ide-new').onclick = () => newFile();
@@ -1930,6 +2384,28 @@ const IDE = (() => {
   q('.ide-up').onclick = upload;
   q('.ide-ln').onclick = linkPick;
   q('.ide-vs').onclick = () => exportTo('code');
+  q('.ide-fold').onclick = () => exportTo('folder');
+  q('.ide-where').onchange = () => { if (b && !ro) { typed(b, {where: q('.ide-where').value}); if (q('.ide-where').value === 'pc') openTerm(); live(true); } };
+  q('.ide-disp').onclick = () => { setLive(!liveOn); sfx('tap', .7); };
+  q('.ide-lre').onclick = () => live(true);
+  q('.ide-lgo').onclick = () => go();
+  q('.ide-lgrip').onpointerdown = ev => {
+    ev.preventDefault(); const z = (window.uiZoom && uiZoom()) || 1, right = q('.ide-body').getBoundingClientRect().right;
+    const box = q('.ide-live'), max = q('.ide-body').offsetWidth * .75;
+    const mv = e => { P.lw = Math.round(clamp((right - e.clientX) / z, 240, max)); box.style.setProperty('--lw', P.lw + 'px'); };
+    const done = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', done); keepP(); };
+    addEventListener('pointermove', mv); addEventListener('pointerup', done);
+  };
+  q('.ide-cmd').oninput = () => { if (b && !ro) typed(b, {cmd: q('.ide-cmd').value}); };
+  q('.ide-cmd').onkeydown = ev => { if (ev.key === 'Enter') { ev.preventDefault(); b && pcRun(runCmd(b), true); } };
+  q('.ide-tin').onkeydown = ev => {
+    const t = ev.target;
+    if (ev.key === 'Enter') { ev.preventDefault(); const v = t.value; t.value = ''; if (v.trim()) { thist.push(v); thi = thist.length; } pcRun(v, false); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); if (thi > 0) t.value = thist[--thi]; }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); thi = Math.min(thist.length, thi + 1); t.value = thist[thi] || ''; }
+    else if (ev.ctrlKey && ev.key.toLowerCase() === 'c' && t.selectionStart === t.selectionEnd && b && procs.has(b.id)) {
+      ev.preventDefault(); twrite('^C\n', 'e'); api().term_stop(b.id); }
+  };
   q('.ide-in').onkeydown = ev => { if (ev.key === 'Enter') { ev.preventDefault(); go(); } };
   q('.ide-cin').onkeydown = ev => {
     if (ev.key === 'Enter') { ev.preventDefault(); consoleRun(); }
@@ -1979,10 +2455,11 @@ board.addEventListener('pointerdown', ev => {
   const t = ev.target, blockEl = t.closest('.ol-b'), id = blockEl?.dataset.id || t.dataset?.id, p = toWorld(ev);
   if (linkFrom && ev.button === 0) { if (linkClick(blockEl?.dataset.id)) { ev.preventDefault(); return; } }
   closeMenu(); closeCtx();
-  // a click inside the block being typed in is just typing
-  if (S.editing && blockEl && blockEl.dataset.id === S.editing) return;
-  if (S.editing) stopEdit();
-  R.focus({preventScroll: true});
+  // a click inside the block being typed in is just typing, except on its corners, which resize it and carry on typing
+  const inEdit = S.editing && blockEl && blockEl.dataset.id === S.editing;
+  if (inEdit && !t.classList.contains('ol-rs')) return;
+  if (S.editing && !inEdit) stopEdit();
+  if (!inEdit) R.focus({preventScroll: true});
   if (ev.button === 1 || S.tool === 'hand' || spaceDown || (ev.button === 0 && ev.altKey)) return startPan(ev);
   if (S.tool === 'pen') { drag = {kind: 'pen', pts: [p]}; board.setPointerCapture(ev.pointerId); drawDraft(); return; }
   if (S.tool === 'arrow') {
@@ -2018,10 +2495,14 @@ board.addEventListener('pointerdown', ev => {
   }
   if (t.classList.contains('ol-rs')) {
     const b = S.blocks.get(id);
+    if (locked(b)) { ev.preventDefault(); return; }
     const n = b.kind === 'shape' ? needs(b) : null;
-    drag = {kind: 'resize', id, p, before: snap(b), w: b.w, h: b.h, ratio: b.w / b.h,
-            floor: n ? {w: Math.max(80, Math.round(n.x1 - b.x)), h: Math.max(60, Math.round(n.y1 - b.y))} : null};
-    board.setPointerCapture(ev.pointerId); ev.preventDefault(); return;
+    const c = t.dataset.c || 'se';
+    drag = {kind: 'resize', id, p, c, before: snap(b), x: b.x, y: b.y, w: b.w, h: b.h, ratio: b.w / b.h,
+            // never smaller than what is in it, whichever corner pulls
+            floor: n ? {w: Math.max(80, Math.round(c.includes('w') ? b.x + b.w - n.x0 : n.x1 - b.x)),
+                        h: Math.max(60, Math.round(c.includes('n') ? b.y + b.h - n.y0 : n.y1 - b.y))} : null};
+    board.dataset.rz = c; board.setPointerCapture(ev.pointerId); ev.preventDefault(); return;
   }
   if (id && S.blocks.has(id)) {
     if (ev.shiftKey || ev.ctrlKey) { S.sel.has(id) ? S.sel.delete(id) : S.sel.add(id); select([...S.sel]); }
@@ -2079,11 +2560,14 @@ board.addEventListener('pointermove', ev => {
     drag.items.forEach(i => { i.b.x = Math.round(i.x + dx); i.b.y = Math.round(i.y + dy); place(i.b); Sync.live(i.b, true); });
     return;
   }
-  if (drag.kind === 'resize') { const b = S.blocks.get(drag.id);
-    b.w = Math.max(80, Math.round(drag.w + p.x - drag.p.x)); b.h = Math.max(b.kind === 'text' ? 36 : 60, Math.round(drag.h + p.y - drag.p.y));
+  if (drag.kind === 'resize') { const b = S.blocks.get(drag.id), c = drag.c, dx = p.x - drag.p.x, dy = p.y - drag.p.y;
+    b.w = Math.max(80, Math.round(drag.w + (c.includes('w') ? -dx : dx)));
+    b.h = Math.max(b.kind === 'text' ? 36 : 60, Math.round(drag.h + (c.includes('n') ? -dy : dy)));
     if (b.kind === 'shape' && drag.floor) {            // never smaller than what is in it
       b.w = Math.max(b.w, drag.floor.w); b.h = Math.max(b.h, drag.floor.h); }
     if (b.kind === 'image') b.h = Math.round(b.w / drag.ratio);
+    // the opposite corner stays put
+    b.x = c.includes('w') ? drag.x + drag.w - b.w : drag.x; b.y = c.includes('n') ? drag.y + drag.h - b.h : drag.y;
     if (b.kind === 'text') b.data = {...b.data, size: Math.round(clamp(b.h * .62, 14, 160))}, node(b).style.setProperty('--fs', b.data.size + 'px');
     place(b); Sync.live(b, true); return; }
   if (drag.kind === 'pen') { const last = drag.pts[drag.pts.length - 1]; if (Math.hypot(p.x - last.x, p.y - last.y) * S.view.k > 1.5) { drag.pts.push(p); drawDraft(); } return; }
@@ -2113,7 +2597,7 @@ board.addEventListener('pointerup', ev => {
       sfx('tap', .6);
     }
   }
-  if (d.kind === 'resize') { const b = S.blocks.get(d.id); record([{before: d.before, after: snap(b)}]); put(b, {soon: true}); }
+  if (d.kind === 'resize') { delete board.dataset.rz; const b = S.blocks.get(d.id); record([{before: d.before, after: snap(b)}]); put(b, {soon: true}); }
   if (d.kind === 'make') {
     setTool('select');
     const q = d.at || d.p;
@@ -2126,8 +2610,11 @@ board.addEventListener('pointerup', ev => {
     toBack([b.id]);
     setTimeout(() => startEdit(b.id), 10);
   }
-  if (d.kind === 'pen' && d.pts.length > 1) {
-    const xs = d.pts.map(p => p.x), ys = d.pts.map(p => p.y), pad = 6;
+  const penXs = d.kind === 'pen' ? d.pts.map(p => p.x) : [], penYs = d.kind === 'pen' ? d.pts.map(p => p.y) : [];
+  const scribble = d.kind === 'pen' && d.pts.length > 2
+    && Math.max(Math.max(...penXs) - Math.min(...penXs), Math.max(...penYs) - Math.min(...penYs)) * S.view.k > 6;
+  if (scribble) {
+    const xs = penXs, ys = penYs, pad = 6;
     const x0 = Math.min(...xs) - pad, y0 = Math.min(...ys) - pad, w = Math.max(...xs) - x0 + pad, hh = Math.max(...ys) - y0 + pad;
     const path = d.pts.map((p, i) => (i ? 'L' : 'M') + (p.x - x0).toFixed(1) + ',' + (p.y - y0).toFixed(1)).join(' ');
     add('ink', x0, y0, {d: path, vw: Math.round(w), vh: Math.round(hh), color: S.ink === 'auto' ? null : S.ink, width: 3}, {size: [Math.round(w), Math.round(hh)], centre: false});
@@ -2169,6 +2656,7 @@ const onBoard = ev => document.getElementById('online')?.classList.contains('on'
   && (R.contains(ev.target) || !ev.target.closest?.('input,textarea,select,[contenteditable="true"],[contenteditable="plaintext-only"]'));
 addEventListener('keydown', ev => {
   if (!onBoard(ev)) return;
+  if (ev.target.closest && ev.target.closest('.ol-chat')) return;   // the message box has its own keys
   if (ev.target.closest && ev.target.closest('.ol-ide')) {
     if (IDE.keys(ev)) { ev.preventDefault(); ev.stopPropagation(); return; }
     const inEd = ev.target.closest('.monaco-editor');   // Monaco handles its own keys (Ctrl+Enter, F5, Ctrl+S, Esc)
@@ -2195,6 +2683,7 @@ addEventListener('keydown', ev => {
     if (k === 'l') { ev.preventDefault(); lookMenu([...S.sel], ctxWas); return; }
     if (k === 'b') return dress_(b => CAN_STYLE.includes(b.kind) ? {bold: !b.data.bold} : {});
     if (k === 'i') return dress_(b => CAN_STYLE.includes(b.kind) ? {italic: !b.data.italic} : {});
+    if (k === 'u') return dress_(b => CAN_STYLE.includes(b.kind) ? {ul: !b.data.ul} : {});
     if (ev.key === '+' || ev.key === '=')
       return dress_(b => CAN_SIZE.includes(b.kind) ? sizePatch(b, Math.round(clamp(baseSize(b) * 1.2, 9, 160))) : {});
     if (ev.key === '-' || ev.key === '_')
@@ -2222,7 +2711,7 @@ addEventListener('keydown', ev => {
   if (ev.key === 'F2' && S.sel.size === 1) { ev.preventDefault(); renameBlock(S.blocks.get([...S.sel][0])); return; }
   if (ev.key.startsWith('Arrow') && S.sel.size) { ev.preventDefault(); const n = ev.shiftKey ? 20 : 2, dx = {ArrowLeft: -n, ArrowRight: n}[ev.key] || 0, dy = {ArrowUp: -n, ArrowDown: n}[ev.key] || 0;
     const steps = []; S.sel.forEach(id => { const b = S.blocks.get(id); if (!b || b.kind === 'arrow') return; const before = snap(b); b.x += dx; b.y += dy; steps.push({before, after: snap(b)}); put(b); }); record(steps); return; }
-  const tools = {v: 'select', h: 'hand', n: 'note', s: 'sticky', t: 'text', c: 'code', k: 'proj', r: 'term', l: 'todo', u: 'link', p: 'pen', a: 'arrow', o: 'shape'};
+  const tools = {v: 'select', h: 'hand', n: 'note', t: 'text', c: 'code', k: 'proj', r: 'term', l: 'todo', u: 'link', p: 'pen', a: 'arrow', o: 'shape'};
   if (tools[k]) { setTool(tools[k]); return; }
   if (k === 'i') { $('.ol-file').click(); return; }
   if (k === 'f') { fit(S.sel.size ? [...S.sel].map(id => S.blocks.get(id)).filter(Boolean) : null); return; }
@@ -2300,7 +2789,7 @@ function placeCursors() {
     let el = cursLayer.querySelector(`[data-u="${CSS.escape(id)}"]`);
     if (!p.cur || t - p.seen > 15000) { el && el.remove(); return; }
     if (!el) { el = h('div', 'ol-cur'); el.dataset.u = id; el.innerHTML = CURSOR; el.appendChild(h('span')); cursLayer.appendChild(el); }
-    el.style.setProperty('--pc', okColor(p.color) || PAL[0]); el.querySelector('span').textContent = p.name || 'Someone';
+    el.style.setProperty('--pc', personColor(p.color)); el.querySelector('span').textContent = p.name || 'Someone';
     el.style.transform = `translate(${p.cur.x * v.k + v.x}px,${p.cur.y * v.k + v.y}px)`;
   });
   [...cursLayer.children].forEach(el => S.peers.has(el.dataset.u) || el.remove());
@@ -2309,77 +2798,304 @@ setInterval(placeCursors, 3000);
 function peerOn(id) { for (const p of S.peers.values()) if (p.editing === id) return p; return null; }
 function markPeers() {
   S.nodes.forEach((d, id) => { const p = peerOn(id); d.classList.toggle('peer', !!p);
-    if (p) { d.dataset.who = (p.name || 'Someone') + ' is typing'; d.style.setProperty('--pc', okColor(p.color) || PAL[0]); } });
+    if (p) { d.dataset.who = (p.name || 'Someone') + ' is typing'; d.style.setProperty('--pc', personColor(p.color)); } });
   IDE.peers();
 }
 function drawPeople() {
+  drawHere();
   const box = $('.ol-people'); box.replaceChildren(); if (S.mode === 'local') return;
   const online = new Set([...S.peers.values()].map(p => p.uid));
   [...S.members.values()].sort((a, b) => (online.has(b.id) - online.has(a.id))).slice(0, 8).forEach(m => {
     const i = h('i', online.has(m.id) || m.id === S.me?.id ? '' : 'away', initials(m.name)); i.title = m.name + (m.id === S.me?.id ? ' (you)' : online.has(m.id) ? ', here now' : '');
-    i.style.setProperty('--pc', okColor(m.color) || PAL[0]); box.appendChild(i); });
+    i.style.setProperty('--pc', personColor(m.color)); box.appendChild(i); });
 }
+
+// ---------------------------------------------------------------- messages: to everyone on the group, or to one person
+// They live on the server in `messages`, whose rules only hand a private one to the two people in it, so it never
+// reaches anyone else's computer. A server set up before messages existed says so in the box. Who is typing goes
+// over the board's live channel and is never stored.
+let chatChan = null, lastSend = 0;
+const htmlOf = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]).replace(/\n/g, '<br>');
+function chatState() { return S.chat || (S.chat = {list: [], unread: 0, missing: false, readAt: 0, typing: new Map()}); }
+const seeable = m => !!m && (!m.to_id || m.to_id === S.me?.id || m.from_id === S.me?.id);
+const byTime = (a, b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id));
+const mentionsMe = m => !!S.me?.name && m.from_id !== S.me.id && new RegExp('(^|\\W)@' + S.me.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\W|$)', 'i').test(m.text || '');
+function drawHere() {
+  const live = S.mode === 'live' && !!S.group, btn = $('.ol-chatb');
+  btn.hidden = !live;
+  if (!live) { $('.ol-chat').hidden = true; return; }
+  const C = chatState(), here = [...S.peers.values()].filter(p => p.uid && p.uid !== S.me?.id);
+  const n = here.length + 1;
+  $('.ol-here').textContent = n; btn.title = `${n} here now · messages`;
+  $('.ol-unread').textContent = C.unread > 9 ? '9+' : C.unread || '';
+  btn.classList.toggle('ment', !!C.mention);
+  // who's here: click a name to write to them privately
+  const chips = $('.ol-chn'); chips.replaceChildren(h('span', '', n === 1 ? 'only you here' : `${n} here:`));
+  here.forEach(p => { const c = h('button', 'ol-chip', p.name || 'someone'); c.style.setProperty('--pc', personColor(p.color));
+    c.title = `Write to ${p.name || 'them'} privately`; c.onclick = () => { $('.ol-chto').value = p.uid; drawTo(); $('.ol-cht').focus(); }; chips.appendChild(c); });
+  const to = $('.ol-chto'), was = to.value, on = new Set(here.map(p => p.uid));
+  to.replaceChildren(Object.assign(h('option', '', 'To everyone'), {value: ''}));
+  [...S.members.values()].filter(m => m.id !== S.me?.id)
+    .sort((a, b) => on.has(b.id) - on.has(a.id) || String(a.name).localeCompare(String(b.name)))
+    .forEach(m => to.appendChild(Object.assign(h('option', '', `Only ${m.name || 'them'}${on.has(m.id) ? ' ● here' : ''} (private)`), {value: m.id})));
+  to.value = [...to.options].some(o => o.value === was) ? was : '';
+  drawTo();
+}
+function drawTo() { $('.ol-chin').classList.toggle('priv', !!$('.ol-chto').value); }
+// the words of a message: links you can open and @names picked out, never HTML
+function msgBody(text) {
+  const out = document.createDocumentFragment(), names = [...S.members.values()].map(m => m.name).filter(Boolean).sort((a, b) => b.length - a.length);
+  String(text).split(/(https?:\/\/[^\s<>"]+)/g).forEach((part, i) => {
+    if (i % 2) {
+      const u = okUrl(part.replace(/[.,;:!?)]+$/, '')), a = h('a', '', part);
+      if (u) { a.href = u; a.onclick = ev => { ev.preventDefault(); ev.stopPropagation(); api()?.open_inside ? api().open_inside(u, u) : window.open(u, '_blank', 'noopener'); }; }
+      out.appendChild(a); return;
+    }
+    let rest = part;
+    while (rest) {
+      const at = rest.indexOf('@'); if (at < 0) { out.appendChild(document.createTextNode(rest)); break; }
+      const who = names.find(n => rest.slice(at + 1, at + 1 + n.length).toLowerCase() === n.toLowerCase());
+      if (!who) { out.appendChild(document.createTextNode(rest.slice(0, at + 1))); rest = rest.slice(at + 1); continue; }
+      out.appendChild(document.createTextNode(rest.slice(0, at)));
+      out.appendChild(h('b', 'ol-ment' + (who.toLowerCase() === (S.me?.name || '').toLowerCase() ? ' me' : ''), '@' + who));
+      rest = rest.slice(at + 1 + who.length);
+    }
+  });
+  return out;
+}
+function dayName(d) {
+  const t = new Date(); t.setHours(0, 0, 0, 0); const x = new Date(d); x.setHours(0, 0, 0, 0);
+  const days = Math.round((t - x) / 864e5);
+  return days === 0 ? 'Today' : days === 1 ? 'Yesterday' : x.toLocaleDateString([], {weekday: 'long', day: 'numeric', month: 'short'});
+}
+function drawChat() {
+  const C = chatState(), box = $('.ol-chlist'), atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.replaceChildren();
+  if (C.missing) box.appendChild(h('p', 'ol-chnote', 'Messages need a one-off update to the group server: open "Online setup.sql" from the app folder, paste all of it into Supabase > SQL Editor and press Run.'));
+  else if (!C.list.length) box.appendChild(h('p', 'ol-chnote', 'No messages yet. Write to everyone, or pick one person below for a private message. Type @ and a name to get someone’s attention.'));
+  let prev = null, day = '', newShown = false;
+  C.list.forEach(m => {
+    const at = new Date(m.created_at || Date.now()), mine = m.from_id === S.me?.id, dn = dayName(at);
+    if (dn !== day) { box.appendChild(h('div', 'ol-chday', dn)); day = dn; prev = null; }
+    if (!newShown && C.readAt && !mine && Date.parse(m.created_at) > C.readAt) { box.appendChild(h('div', 'ol-chnew', 'New')); newShown = true; prev = null; }
+    const cont = prev && prev.from_id === m.from_id && (prev.to_id || '') === (m.to_id || '') && at - new Date(prev.created_at) < 180000;
+    const d = h('div', 'ol-msg' + (mine ? ' mine' : '') + (m.to_id ? ' priv' : '') + (m.failed ? ' failed' : '') + (cont ? ' cont' : '') + (mentionsMe(m) ? ' tome' : ''));
+    d.dataset.id = m.id;
+    const when = at.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    const who = mine ? (m.to_id ? `You → ${m.to_name || 'them'} · private` : 'You') : (m.to_id ? `${m.from_name || 'Someone'} → you · private` : m.from_name || 'Someone');
+    const meta = h('small', '', `${who} · ${when}`);
+    if (m.failed) { const r = h('button', 'ol-retry', 'Not sent · try again'); r.onclick = ev => { ev.stopPropagation(); resend(m); }; meta.append(' ', r); }
+    const acts = h('span', 'ol-macts');
+    const act = (t, fn) => { const b = h('button', '', t); b.onclick = ev => { ev.stopPropagation(); fn(); }; acts.appendChild(b); };
+    if (!mine && S.members.has(m.from_id)) act('Reply privately', () => { $('.ol-chto').value = m.from_id; drawTo(); $('.ol-cht').focus(); });
+    if (!mine && S.members.has(m.from_id)) { d.title = `Click to answer ${m.from_name || 'them'} privately`;
+      d.onclick = ev => { if (ev.target.closest('a,button') || getSelection().toString()) return; $('.ol-chto').value = m.from_id; drawTo(); $('.ol-cht').focus(); }; }
+    act('Copy', () => navigator.clipboard.writeText(m.text).then(() => toast('Copied')).catch(() => {}));
+    act('Put on board', () => { const c = centre(); const b = add('sticky', c.x - 100, c.y - 90, {color: STICKY[0], text: m.text}); select([b.id]); toast('Put on the board'); });
+    const body = h('div', 'ol-mbody'); body.appendChild(msgBody(m.text));
+    d.append(meta, body, acts);
+    box.appendChild(d); prev = m;
+  });
+  if (atEnd || C.jump) box.scrollTop = box.scrollHeight; C.jump = false;
+  drawTyping(); drawHere();
+}
+function drawTyping() {
+  const C = chatState(), t = Date.now();
+  const names = [...C.typing.values()].filter(x => t - x.at < 3500).map(x => x.name || 'Someone');
+  $('.ol-chtyping').textContent = !names.length ? '' : names.length === 1 ? `${names[0]} is typing…`
+    : names.length === 2 ? `${names[0]} and ${names[1]} are typing…` : `${names.length} people are typing…`;
+}
+setInterval(() => { if (S.chat && S.chat.typing.size) { const t = Date.now(); S.chat.typing.forEach((v, k) => t - v.at > 3500 && S.chat.typing.delete(k)); drawTyping(); } }, 1000);
+function chatTyping(p) {
+  if (!p || !p.uid || p.uid === S.me?.id || (p.to && p.to !== S.me?.id)) return;
+  const C = chatState(); if (p.stop) C.typing.delete(p.uid); else C.typing.set(p.uid, {name: p.name, at: Date.now()});
+  drawTyping();
+}
+const sayTyping = throttle(() => { if (S.mode === 'live' && chan) chan.send({type: 'broadcast', event: 'typing', payload: {uid: S.me.id, name: S.me.name, to: $('.ol-chto').value || null}}); }, 1500);
+function gotMessage(m) {
+  const C = chatState();
+  if (!m || m.group_id !== groupId || !seeable(m)) return;
+  const had = C.list.findIndex(x => x.id === m.id);
+  if (had >= 0) { if (C.list[had].failed && !m.failed) { C.list[had] = m; drawChat(); } return; }
+  C.list.push(m); C.list.sort(byTime); if (C.list.length > 300) C.list.shift();
+  C.typing.delete(m.from_id);
+  if (m.from_id !== S.me?.id) {
+    const shut = $('.ol-chat').hidden, me = mentionsMe(m);
+    if (shut) { C.unread++; if (me) C.mention = true; }
+    if (shut || me) { toast(`${m.from_name || 'Someone'}${me ? ' mentioned you' : m.to_id ? ' (to you)' : ''}: ${m.text.slice(0, 80)}`); sfx('tap', me ? 1 : .7); }
+  } else C.jump = true;
+  drawChat();
+}
+async function stopChat() {
+  const C = chatState(); C.list = []; C.unread = 0; C.mention = false; C.missing = false; C.typing.clear();
+  if (chatChan) { const c = chatChan; chatChan = null; try { await sb.removeChannel(c); } catch (_) {} }
+}
+async function loadChat(gid) {
+  await stopChat(); drawChat();
+  const C = chatState(); C.readAt = store.get('olChatRead:' + gid, 0);
+  const {data, error} = await sb.from('messages').select('*').eq('group_id', gid).order('created_at', {ascending: false}).limit(200);
+  if (gid !== groupId) return;
+  if (error) { C.missing = true; drawChat(); return; }
+  C.list = (data || []).filter(seeable).sort(byTime);
+  C.unread = C.list.filter(m => m.from_id !== S.me?.id && Date.parse(m.created_at) > C.readAt).length;
+  C.mention = C.list.some(m => Date.parse(m.created_at) > C.readAt && mentionsMe(m));
+  C.jump = true; drawChat();
+  // its own channel, so a server without the table can't upset the board's live connection
+  chatChan = sb.channel('chat:' + gid)
+    .on('postgres_changes', {event: 'INSERT', schema: 'public', table: 'messages', filter: 'group_id=eq.' + gid}, ev => gotMessage(ev.new))
+    .subscribe();
+}
+async function post(m) {
+  const {failed, ...row} = m;
+  const {error} = await sb.from('messages').insert(row);
+  if (error) { m.failed = true; drawChat(); toast(/relation|schema cache|PGRST205|42P01/i.test(error.message || '') ? 'Messages need the one-off server update' : "Couldn't send that. Click it to try again"); }
+  else if (m.failed) { m.failed = false; drawChat(); }
+}
+function resend(m) { if (S.mode === 'live' && m.group_id === groupId) { m.failed = false; drawChat(); post(m); } }
+async function sendChat() {
+  const inp = $('.ol-cht'), text = inp.value.trim(), C = chatState();
+  if (!text || S.mode !== 'live' || !groupId) return;
+  if (C.missing) return drawChat();
+  if (Date.now() - lastSend < 400) return;                 // a held-down Enter doesn't flood the group
+  lastSend = Date.now();
+  const to = $('.ol-chto').value || null;
+  const m = {id: uuid(), group_id: groupId, from_id: S.me.id, from_name: S.me.name, to_id: to,
+             to_name: to ? (S.members.get(to) || {}).name || null : null, text: text.slice(0, 1000), created_at: new Date().toISOString()};
+  inp.value = ''; grow(inp); gotMessage(m); sfx('send', .6);
+  if (chan) chan.send({type: 'broadcast', event: 'typing', payload: {uid: S.me.id, stop: true, to}});
+  post(m);
+}
+function grow(t) { t.style.height = ''; t.style.height = Math.min(t.scrollHeight, 120) + 'px'; }
+function openChat(show = true) {
+  const box = $('.ol-chat'); box.hidden = !show;
+  const C = chatState();
+  if (show) { C.unread = 0; C.mention = false; C.jump = true; drawChat(); $('.ol-cht').focus(); }
+  else if (groupId) { C.readAt = Date.now(); store.set('olChatRead:' + groupId, C.readAt); }
+  drawHere(); fmtSoon();
+}
+$('.ol-chatb').onclick = ev => { ev.stopPropagation(); openChat($('.ol-chat').hidden); sfx('tap', .7); };
+$('.ol-chx').onclick = () => openChat(false);
+$('.ol-chsend').onclick = sendChat;
+$('.ol-chto').onchange = drawTo;
+$('.ol-cht').addEventListener('keydown', ev => {
+  ev.stopPropagation();
+  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); sendChat(); }
+  if (ev.key === 'Escape') openChat(false);
+});
+$('.ol-cht').addEventListener('input', ev => { grow(ev.target); if (ev.target.value.trim()) sayTyping(); });
+$('.ol-chat').addEventListener('pointerdown', ev => ev.stopPropagation());
 
 // ---------------------------------------------------------------- saving: this computer only, or live with the group
 // The file on the computer is the real copy. Writing it goes through the app, which takes a
 // moment, so every change is also mirrored into the browser's own storage straight away -
 // that one cannot be beaten by closing the window, and the two are compared on the way back in.
+// Several offline boards: the first is 'main' (the file it always had), the rest have ids of their own.
+// Nothing is on screen until the first board has loaded, so nothing may be saved over a board before then.
+S.swapping = true;
 const Local = {
+  board: store.get('olLocalBoard', 'main'),
+  boards: [{id: 'main', name: 'Offline board'}],
+  key(k) { return this.board === 'main' ? k : k + ':' + this.board; },
+  name() { return (this.boards.find(b => b.id === this.board) || {}).name || 'Offline board'; },
+  async list() {
+    try { const got = api()?.ol_boards ? await api().ol_boards() : null; if (Array.isArray(got) && got.length) this.boards = got; } catch (_) {}
+    if (!this.boards.some(b => b.id === this.board)) this.board = 'main';
+    return this.boards;
+  },
   async load() {
+    await window.bbApiReady;
+    await this.list();
+    const board = this.board;
     let rows = [];
-    try { rows = api()?.ol_local_load ? await api().ol_local_load() : store.get('olBoard', []); } catch (_) {}
+    try { rows = api()?.ol_local_load ? await api().ol_local_load(this.board) : store.get(this.key('olBoard'), []); } catch (_) {}
     if (!Array.isArray(rows)) rows = [];
-    const kept = store.get('olBoardMirror', null);
+    const kept = store.get(this.key('olBoardMirror'), null);
     if (kept && Array.isArray(kept.rows)) {
       let fileAt = 0;
-      try { fileAt = api()?.ol_local_saved_at ? await api().ol_local_saved_at() : 0; } catch (_) {}
+      try { fileAt = api()?.ol_local_saved_at ? await api().ol_local_saved_at(this.board) : 0; } catch (_) {}
       // a second's grace: the mirror is written first, the file a moment later
-      if (kept.at > fileAt + 1500) {
+      if (kept.at > fileAt + 1500 && board === this.board && !kept.rows.some(r => r && r.group_id)) {
         setTimeout(() => toast('Picked up the last few changes from before'), 900);
         return kept.rows;
       }
     }
     return rows;
   },
-  mirror() { store.set('olBoardMirror', {at: Date.now(), rows: [...S.blocks.values()]}); },
-  write: (() => {
-    let t;
-    return () => {
-      Local.mirror();                                  // instant, and survives a quick close
-      clearTimeout(t);
-      t = setTimeout(Local.now, 250);
-    };
-  })(),
+  // Offline and group boards never share a save. Each of these checks the offline board is the one on screen and
+  // settled (not halfway through a switch), so a save can't carry a group's blocks into it, or one board's into another.
+  here() { return S.mode === 'local' && !S.swapping; },
+  mirror() { if (!window.bbFrozen && this.here()) store.set(this.key('olBoardMirror'), {at: Date.now(), rows: [...S.blocks.values()]}); },
+  t: null,
+  write() {
+    if (!Local.here()) return;
+    Local.mirror();                                    // instant, and survives a quick close
+    clearTimeout(Local.t);
+    const board = Local.board, gen = S.gen;
+    Local.t = setTimeout(() => { Local.t = null; if (Local.board === board && S.gen === gen) Local.now(); }, 250);
+  },
+  // whatever is waiting, saved now: for stepping off this board
+  flush() { if (Local.t) { clearTimeout(Local.t); Local.t = null; Local.now(); } },
   now() {
+    if (window.bbFrozen || !Local.here()) return;
     const rows = [...S.blocks.values()];
-    if (api()?.ol_local_save) api().ol_local_save(rows); else store.set('olBoard', rows);
+    if (api()?.ol_local_save) api().ol_local_save(rows, Local.board); else store.set(Local.key('olBoard'), rows);
   },
 };
 let sb = null, chan = null, groupId = null;
 const pending = new Map(), timers = new Map();
+// The newest stamp seen for each block. A copy saved a moment ago and coming back from the server is often older than
+// what the live messages have already shown, and used to jump the block back for a moment (the stutter).
+const revs = new Map();
+function stamp(b) {
+  const r = Math.max(Date.now(), ((b.data && b.data._rev) || 0) + 1);
+  b.data = {...(b.data || {}), _rev: r}; revs.set(b.id, r);
+}
+const stale = (id, r) => !!r && r <= (revs.get(id) || 0);
 const Sync = {
   save(b, soon) {
     if (S.mode === 'local') return Local.write();
-    pending.set(b.id, b); clearTimeout(timers.get(b.id));
+    if (S.swapping || !groupId) return;
+    if (!b.deleted) stamp(b);
+    pending.set(b.id, {b, g: groupId}); clearTimeout(timers.get(b.id));
     timers.set(b.id, setTimeout(() => Sync.flush(b.id), soon ? 30 : 600));
   },
   async flush(id) {
-    const b = pending.get(id); if (!b || !sb) return; pending.delete(id); timers.delete(id);
-    const row = {id: b.id, group_id: groupId, kind: b.kind, x: b.x, y: b.y, w: b.w, h: b.h, z: b.z || 0, data: b.data || {}, deleted: !!b.deleted};
+    const it = pending.get(id); if (!it || !sb) return; pending.delete(id); timers.delete(id);
+    const {b, g} = it;
+    const row = {id: b.id, group_id: g, kind: b.kind, x: b.x, y: b.y, w: b.w, h: b.h, z: b.z || 0, data: b.data || {}, deleted: !!b.deleted};
     const {error} = await sb.from('blocks').upsert(row);
-    if (error) { pending.set(id, b); setState('off', "Can't save. Trying again"); setTimeout(() => Sync.flush(id), 5000); }
+    if (error) { pending.set(id, it); if (g === groupId) setState('off', "Can't save. Trying again"); setTimeout(() => Sync.flush(id), 5000); }
     else if (S.mode === 'live' && R.querySelector('.ol-state.off')) setState('live');
   },
   remove(b) { if (S.mode === 'local') return Local.write(); Sync.save({...b, deleted: true}, true); },
   // Everything waiting, sent at once: for closing the window, or stepping away from it.
   flushAll() {
-    if (S.mode === 'local') { Local.now(); return; }
+    if (S.mode === 'local') { Local.flush(); Local.now(); return; }
     [...pending.keys()].forEach(id => { clearTimeout(timers.get(id)); timers.delete(id); Sync.flush(id); });
   },
-  live: throttle((b, posOnly) => { if (S.mode !== 'live' || !chan) return;
-    chan.send({type: 'broadcast', event: 'live', payload: posOnly ? {id: b.id, x: b.x, y: b.y, w: b.w, h: b.h} : {id: b.id, block: b}}); }, 70),
-  cursor: throttle(p => { if (S.mode !== 'live' || !chan) return;
-    chan.send({type: 'broadcast', event: 'cur', payload: {uid: S.me.id, x: Math.round(p.x), y: Math.round(p.y)}}); }, 50),
+  // Live changes and the cursor go out together, at most one message every 80 ms per person. The server only takes
+  // so many messages a second for the whole group, and five people each sending blocks and a cursor separately
+  // went over it, so some were dropped and things jumped. Moving several blocks at once now sends all of them.
+  live(b, posOnly) {
+    if (S.mode !== 'live' || !chan) return;
+    stamp(b);
+    const was = Sync.out.get(b.id);
+    Sync.out.set(b.id, posOnly && (!was || was.p) ? {p: 1, id: b.id, x: b.x, y: b.y, w: b.w, h: b.h, rev: b.data._rev} : {p: 0, id: b.id});
+    Sync.tick();
+  },
+  cursor(p) { if (S.mode !== 'live' || !chan) return; Sync.cur = {x: Math.round(p.x), y: Math.round(p.y)}; Sync.tick(); },
+  out: new Map(), cur: null,
+  tick: throttle(() => {
+    if (S.mode !== 'live' || !chan || (!Sync.out.size && !Sync.cur)) return;
+    const items = [...Sync.out.values()].map(o => {
+      if (o.p) return o;
+      const b = S.blocks.get(o.id); return b ? {id: b.id, block: b} : null;
+    }).filter(Boolean);
+    const payload = {uid: S.me.id, items};
+    if (Sync.cur) payload.cur = Sync.cur;
+    Sync.out.clear(); Sync.cur = null;
+    chan.send({type: 'broadcast', event: 'tick', payload});
+  }, 80),
   presence() { if (S.mode === 'live' && chan) chan.track({uid: S.me.id, name: S.me.name, color: S.me.color, editing: S.editing}); },
 };
 // whatever gets moved live is held separately per block so a slow save never jumps it back
@@ -2388,9 +3104,31 @@ function incoming(row) {
   if (row.deleted) { if (S.blocks.has(row.id)) { S.blocks.delete(row.id); unpaint(row.id); emptyState(); } return; }
   // what you're typing in, dragging or still sending wins over the copy coming back
   if (S.editing === row.id || pending.has(row.id) || (drag && drag.items && drag.items.some(i => i.b.id === row.id))) return;
+  // and so does anything newer that has already arrived live (or that you made yourself)
+  const r = row.data && row.data._rev; if (stale(row.id, r)) return; if (r) revs.set(row.id, r);
   const b = {id: row.id, kind: row.kind, x: row.x, y: row.y, w: row.w, h: row.h, z: row.z, data: row.data || {}, updated_at: row.updated_at, _remote: true};
   S.blocks.set(b.id, b); paint(b); emptyState(); IDE.refresh(b);
 }
+// One block from someone's live message. Moves glide over the 80 ms between messages instead of hopping.
+function liveIn(p) {
+  if (!p || !p.id || S.editing === p.id) return;
+  if (drag && drag.items && drag.items.some(i => i.b.id === p.id)) return;
+  if (p.block && p.block.id === p.id) {
+    if (stale(p.id, p.block.data && p.block.data._rev)) return;
+    if (p.block.data && p.block.data._rev) revs.set(p.id, p.block.data._rev);
+    const nb = {...p.block, data: p.block.data || {}}; S.blocks.set(nb.id, nb); glide(nb.id); paint(nb); emptyState(); IDE.refresh(nb);
+    return;
+  }
+  const b = S.blocks.get(p.id); if (!b || stale(p.id, p.rev)) return;
+  if (p.rev) { revs.set(p.id, p.rev); b.data = {...b.data, _rev: p.rev}; }
+  Object.assign(b, {x: +p.x, y: +p.y, w: +p.w, h: +p.h}); glide(b.id); place(b);
+}
+function glide(id) {
+  const d = S.nodes.get(id); if (!d) return;
+  d.classList.add('glide'); clearTimeout(d._glide); d._glide = setTimeout(() => d.classList.remove('glide'), 160);
+}
+let cursT = 0;
+function cursorsSoon() { if (!cursT) cursT = requestAnimationFrame(() => { cursT = 0; placeCursors(); }); }
 function setState(cls, text) {
   const s = $('.ol-state'); s.className = 'ol-state ' + cls;
   s.querySelector('b').textContent = text || {live: 'Live', wait: 'Connecting', off: 'Offline', local: 'This computer'}[cls];
@@ -2402,7 +3140,7 @@ async function connect() {
   if (!sb) sb = window.supabase.createClient(CFG.url, CFG.key, {auth: {persistSession: true, autoRefreshToken: true, storageKey: 'bb-online-auth'}});
   let {data: {session}} = await sb.auth.getSession();
   if (!session) { const r = await sb.auth.signInAnonymously(); if (r.error) { setState('off', 'Sign-in failed'); gateMsg(r.error.message); return false; } session = r.data.session; }
-  const color = store.get('olColor', null) || PAL[parseInt(session.user.id.slice(0, 6), 16) % PAL.length];
+  const color = store.get('olColor', null) || PEOPLE[parseInt(session.user.id.slice(0, 6), 16) % PEOPLE.length];
   S.me = {id: session.user.id, name: meName(), color};
   return true;
 }
@@ -2410,8 +3148,21 @@ async function myGroups() {
   const {data, error} = await sb.from('members').select('group_id, groups(name, code)').eq('user_id', S.me.id);
   return error ? [] : (data || []).filter(r => r.groups).map(r => ({id: r.group_id, name: r.groups.name, code: r.groups.code}));
 }
+// Before a board is swapped for another, whatever is open on the old one is finished and saved there.
+function leaveBoard() {
+  if (S.editing) stopEdit();
+  if (IDE.id) IDE.close();
+  drag = null;
+  Sync.flushAll();
+  revs.clear(); Sync.out.clear(); Sync.cur = null;
+  stopChat(); $('.ol-chat').hidden = true;
+  S.gen = (S.gen || 0) + 1; S.swapping = true;
+  return S.gen;
+}
 async function openGroup(g) {
+  const gen = leaveBoard();
   if (chan) { await sb.removeChannel(chan); chan = null; }
+  if (gen !== S.gen) return;
   S.group = g; groupId = g.id; store.set('olGroup', g); S.mode = 'live'; setState('wait');
   $('.ol-gname').textContent = g.name; $('.ol-code').textContent = g.code; gate.classList.remove('on');
   store.set('olLast', g.id);
@@ -2420,13 +3171,18 @@ async function openGroup(g) {
     const [{data: rows, error}, {data: mem}] = await Promise.all([
       sb.from('blocks').select('*').eq('group_id', g.id).eq('deleted', false),
       sb.from('members').select('user_id,name,color').eq('group_id', g.id)]);
+    if (groupId !== g.id || S.mode !== 'live') return;   // moved on to another board meanwhile
     if (error) { setState('off', 'Not a member'); return; }
     S.members = new Map((mem || []).map(m => [m.user_id, {id: m.user_id, name: m.name, color: m.color}]));
     const keep = new Set(rows.map(r => r.id));
     [...S.blocks.keys()].forEach(id => keep.has(id) || pending.has(id) || (S.blocks.delete(id), unpaint(id)));
     rows.forEach(incoming); drawPeople(); emptyState(); return rows;
   };
-  const rows = await load(); if (rows && rows.length && !store.get('olView:' + g.id, null)) fit(null, false);
+  const rows = await load();
+  if (gen !== S.gen) return;
+  S.swapping = false;
+  loadChat(g.id);
+  if (rows && rows.length && !store.get('olView:' + g.id, null)) fit(null, false);
   chan = sb.channel('board:' + g.id, {config: {presence: {key: S.me.id}, broadcast: {self: false}}})
     .on('postgres_changes', {event: '*', schema: 'public', table: 'blocks', filter: 'group_id=eq.' + g.id}, ev => {
       const row = ev.new; if (!row) return;
@@ -2435,15 +3191,27 @@ async function openGroup(g) {
       incoming(row); })
     .on('postgres_changes', {event: '*', schema: 'public', table: 'members', filter: 'group_id=eq.' + g.id}, ev => {
       const m = ev.new; if (m && m.user_id) { S.members.set(m.user_id, {id: m.user_id, name: m.name, color: m.color}); drawPeople(); } })
+    .on('broadcast', {event: 'typing'}, ({payload: p}) => chatTyping(p))
+    .on('broadcast', {event: 'tick'}, ({payload: p}) => {
+      if (!p || !p.uid) return;
+      (p.items || []).forEach(liveIn);
+      if (p.cur) { const peer = S.peers.get(p.uid) || {uid: p.uid, ...(S.members.get(p.uid) || {})};
+        peer.cur = {x: +p.cur.x, y: +p.cur.y}; peer.seen = Date.now(); S.peers.set(p.uid, peer); cursorsSoon(); }
+    })
     .on('broadcast', {event: 'live'}, ({payload: p}) => {
       if (!p || S.editing === p.id) return;
       const b = S.blocks.get(p.id);
       if (p.block && p.block.id === p.id) { const nb = {...p.block, data: p.block.data || {}}; S.blocks.set(nb.id, nb); paint(nb); emptyState(); IDE.refresh(nb); }
       else if (b) { Object.assign(b, {x: +p.x, y: +p.y, w: +p.w, h: +p.h}); place(b); }
     })
+    .on('broadcast', {event: 'group'}, ({payload: p}) => {
+      if (!p || !S.group || p.id !== S.group.id) return;
+      if (p.gone) { toast(`${S.group.name} was deleted by whoever made it`); store.set('olGroup', null); useLocal(true); return; }
+      if (p.name) { S.group.name = p.name; store.set('olGroup', S.group); $('.ol-gname').textContent = p.name; }
+    })
     .on('broadcast', {event: 'cur'}, ({payload: p}) => {
       if (!p || !p.uid) return; const peer = S.peers.get(p.uid) || {uid: p.uid, ...(S.members.get(p.uid) || {})};
-      peer.cur = {x: +p.x, y: +p.y}; peer.seen = Date.now(); S.peers.set(p.uid, peer); placeCursors(); })
+      peer.cur = {x: +p.x, y: +p.y}; peer.seen = Date.now(); S.peers.set(p.uid, peer); cursorsSoon(); })
     .on('presence', {event: 'sync'}, () => {
       const st = chan.presenceState(), seen = new Set();
       Object.values(st).forEach(list => list.forEach(p => { if (!p.uid || p.uid === S.me.id) return; seen.add(p.uid);
@@ -2456,12 +3224,84 @@ async function openGroup(g) {
     });
   sfx('on');
 }
-async function useLocal(remember = true) {
+async function useLocal(remember = true, board) {
+  if (S.mode === 'local' && !S.swapping && board && board !== Local.board) {
+    Local.flush(); Local.now(); Local.mirror();
+    if (api()?.ol_local_save) await api().ol_local_save([...S.blocks.values()], Local.board);
+  }
+  const gen = leaveBoard();
+  if (board) { Local.board = board; store.set('olLocalBoard', board); }
+  S.sel.clear();
   if (chan) { await sb.removeChannel(chan); chan = null; }
   S.mode = 'local'; S.group = null; groupId = null; if (remember) store.set('olGroup', 'local'); setState('local');
   $('.ol-gname').textContent = ''; $('.ol-code').textContent = ''; gate.classList.remove('on');
   S.blocks.clear(); S.members.clear(); S.peers.clear(); history.length = future.length = 0;
-  (await Local.load()).forEach(b => b && b.id && S.blocks.set(b.id, b)); paintAll(); drawPeople(); placeCursors();
+  const rows = await Local.load();
+  if (gen !== S.gen) return;                           // moved on to another board meanwhile
+  rows.forEach(b => b && b.id && S.blocks.set(b.id, b)); S.swapping = false; paintAll(); drawPeople(); placeCursors();
+  if (Local.boards.length > 1) $('.ol-gname').textContent = Local.name();
+}
+async function newLocalBoard() {
+  const name = prompt('Name the new offline board', 'Board ' + (Local.boards.length + 1));
+  if (name === null) return;
+  if (!api()?.ol_board_new) return toast('This needs the app');
+  const b = await api().ol_board_new(name);
+  await Local.list(); await useLocal(true, b.id); fit(); toast('Made ' + b.name);
+}
+async function renameLocalBoard() {
+  const name = prompt('Rename this board', Local.name());
+  if (!name || !api()?.ol_board_rename) return;
+  Local.boards = await api().ol_board_rename(Local.board, name);
+  $('.ol-gname').textContent = Local.name(); toast('Renamed');
+}
+async function removeLocalBoard() {
+  if (Local.board === 'main') return toast('The first board stays');
+  if (!confirm(`Take "${Local.name()}" off the list? A copy is kept in the backups folder.`)) return;
+  Local.now(); const gone = Local.board;
+  if (api()?.ol_local_save) await api().ol_local_save([...S.blocks.values()], gone);
+  const r = api()?.ol_board_remove ? await api().ol_board_remove(gone) : null;
+  await useLocal(true, 'main'); await Local.list(); toast((r && r.msg) || 'Removed');
+}
+
+// Renaming and deleting a group are done by the server, which checks who is asking. A server set up before
+// these were added says it can't find them, and only whoever looks after the server can fix that.
+function oldServer(error) {
+  if (!/PGRST202|Could not find the function|does not exist/i.test(error.message || '') && error.code !== 'PGRST202') return false;
+  alert('The group server needs a one-off update first.\n\nOpen "Online setup.sql" from the app folder, paste all of it into Supabase > SQL Editor and press Run. Running it again is safe.');
+  return true;
+}
+async function renameGroup() {
+  const name = prompt('Rename this group (everyone in it sees the new name)', S.group.name);
+  if (!name || !name.trim() || name.trim() === S.group.name) return;
+  const {data, error} = await sb.rpc('rename_group', {p_group: groupId, p_name: name.trim()});
+  if (error) return oldServer(error) || toast(error.message);
+  S.group.name = data.name; store.set('olGroup', S.group); $('.ol-gname').textContent = data.name;
+  chan?.send({type: 'broadcast', event: 'group', payload: {id: groupId, name: data.name}}); toast('Renamed');
+}
+async function leaveGroup() {
+  if (!confirm(`Leave ${S.group.name}? The board stays for everyone else, and you can join again with the code.`)) return;
+  await sb.from('members').delete().eq('group_id', groupId).eq('user_id', S.me.id); store.set('olGroup', null); showGate();
+}
+async function deleteGroup() {
+  const g = S.group;
+  const typed = prompt(`This deletes ${g.name} and its whole board for everyone in it. It can't be undone.\n\nA copy of the board is kept on this computer as an offline board.\n\nType the group's name to delete it:`);
+  if (typed === null) return;
+  if (typed.trim().toLowerCase() !== g.name.trim().toLowerCase()) return toast("That isn't the group's name, so nothing was deleted");
+  // keep a copy first, so a slip of the hand isn't the end of everyone's work
+  const rows = [...S.blocks.values()].filter(b => !b.deleted).map(({_remote, ...b}) => b);
+  let copy = null;
+  if (api()?.ol_board_new && api()?.ol_local_save) {
+    copy = await api().ol_board_new(g.name + ' (copy)'); await api().ol_local_save(rows, copy.id);
+  }
+  const {error} = await sb.rpc('delete_group', {p_group: g.id});
+  if (error) {
+    if (copy) await api().ol_board_remove?.(copy.id);
+    return oldServer(error) || toast(/Only whoever/.test(error.message) ? 'Only whoever made the group can delete it. You can leave it instead' : error.message);
+  }
+  chan?.send({type: 'broadcast', event: 'group', payload: {id: g.id, gone: true}});
+  store.set('olGroup', null); store.set('olLast', null);
+  if (copy) { await Local.list(); await useLocal(true, copy.id); toast(`Deleted ${g.name}. Its board is kept here as "${copy.name}"`); }
+  else { await useLocal(true); toast(`Deleted ${g.name}`); }
 }
 
 // ---------------------------------------------------------------- the start card: make or join a group
@@ -2494,7 +3334,7 @@ async function showGate(view) {
     <div class="ol-groups"></div>
     <label>Join a group</label><div class="row2"><input class="cd" placeholder="Invite code, like K7QM-2XPA" maxlength="12"><button class="btn jn">Join</button></div>
     <div class="or">OR</div>
-    <label>Start a new group</label><div class="row2"><input class="gn" placeholder="Group name, like SDGP Team 7" maxlength="60"><button class="btn mk">Create</button></div>
+    <label>Start a new group</label><div class="row2"><input class="gn" placeholder="Group name, like SDGP Team 7" maxlength="60"><button class="btn mkgroup">Create</button></div>
     <p class="msg"></p>`;
   const nm = card.querySelector('.nm'); nm.value = S.me.name;
   const name = () => { const v = nm.value.trim() || 'Me'; store.set('olName', v); S.me.name = v; return v; };
@@ -2506,14 +3346,14 @@ async function showGate(view) {
     if (error) return gateMsg(/No group/.test(error.message) ? "No group has that code. Check it with whoever sent it" : error.message);
     openGroup(data); toast(`You've joined ${data.name}`);
   };
-  card.querySelector('.mk').onclick = async () => {
+  card.querySelector('.mkgroup').onclick = async () => {
     const gn = card.querySelector('.gn').value.trim(); if (!gn) return gateMsg('Give the group a name');
     gateMsg(''); const {data, error} = await sb.rpc('create_group', {p_name: gn, p_member: name(), p_color: S.me.color});
     if (error) return gateMsg(error.message);
     openGroup(data); copyCode(); toast(`Made ${data.name}. The invite code ${data.code} is copied, send it to your group`);
   };
-  card.querySelector('.cd').onkeydown = ev => ev.key === 'Enter' && card.querySelector('.jn').click();
-  card.querySelector('.gn').onkeydown = ev => ev.key === 'Enter' && card.querySelector('.mk').click();
+  card.querySelector('.cd').onkeydown = ev => { if (ev.key === 'Enter') card.querySelector('.jn').click(); };   // returning false here would eat every key
+  card.querySelector('.gn').onkeydown = ev => { if (ev.key === 'Enter') card.querySelector('.mkgroup').click(); };   // returning false here would eat every key
   card.appendChild(local);
   if (view === 'join') card.querySelector('.cd').focus();
   else if (view === 'new') card.querySelector('.gn').focus();
@@ -2536,11 +3376,17 @@ async function showBoards(anchor) {
   const build = (gs, loading) => {
     const list = Array.isArray(gs) ? gs : [];
     const items = [{head: 'on your own'},
-      {label: tick(here === 'local') + 'Offline board', key: 'only here',
-       go: () => { if (here !== 'local') useLocal(); }},
-      {head: loading ? 'groups \u2014 looking\u2026' : 'with a group'}];
+      ...Local.boards.map(b => ({label: tick(here === 'local' && Local.board === b.id) + b.name, key: b.id === 'main' ? 'only here' : '',
+        go: () => { if (here !== 'local' || Local.board !== b.id) useLocal(true, b.id); }})),
+      {label: '\u00a0\u00a0\u00a0 New offline board\u2026', go: newLocalBoard},
+      here === 'local' && {label: '\u00a0\u00a0\u00a0 Rename this board\u2026', go: renameLocalBoard},
+      here === 'local' && Local.board !== 'main' && {label: '\u00a0\u00a0\u00a0 Remove this board\u2026', go: removeLocalBoard},
+      {head: loading ? 'groups \u2014 looking\u2026' : 'with a group'}].filter(Boolean);
     list.forEach(g => items.push({label: tick(here === g.id) + g.name, key: g.code,
                                   go: () => { if (here !== g.id) openGroup(g); }}));
+    if (here !== 'local') items.push({label: '\u00a0\u00a0\u00a0 Rename this group\u2026', go: renameGroup},
+                                     {label: '\u00a0\u00a0\u00a0 Leave this group\u2026', go: leaveGroup},
+                                     {label: '\u00a0\u00a0\u00a0 Delete this group\u2026', go: deleteGroup});
     if (!loading && Array.isArray(gs) && !gs.length)
       items.push({label: '\u00a0\u00a0\u00a0 You are not in a group yet', go: () => showGate('join')});
     if (!loading && gs === null)
@@ -2557,6 +3403,7 @@ async function showBoards(anchor) {
     const r = anchor.getBoundingClientRect();
     ctxOpen(r.left, r.bottom + 6);
   };
+  await Local.list();
   build(null, true);
   build(await knownGroups(), false);
 }
@@ -2580,17 +3427,21 @@ function fillMenu() {
   if (S.mode === 'live') {
     menu.appendChild(h('small', '', S.group.name));
     item('Copy invite code', () => { copyCode(); toast('Invite code copied'); });
+    item('Messages', () => openChat(true));
     item('Change my name', async () => { const v = prompt('Your name on the board', S.me.name); if (!v || !v.trim()) return;
       S.me.name = v.trim().slice(0, 40); store.set('olName', S.me.name); Sync.presence();
       await sb.from('members').update({name: S.me.name}).eq('group_id', groupId).eq('user_id', S.me.id); });
     item('Switch board or group', () => showBoards($('.ol-switch')));
     item('Join another group with a code', () => showGate('join'));
     item('Start a new group', () => showGate('new'));
-    item('Leave this group', async () => { if (!confirm(`Leave ${S.group.name}? You can join again with the code.`)) return;
-      await sb.from('members').delete().eq('group_id', groupId).eq('user_id', S.me.id); store.set('olGroup', null); showGate(); });
+    item('Rename this group\u2026', renameGroup);
+    item('Leave this group\u2026', leaveGroup);
+    item('Delete this group for everyone\u2026', deleteGroup);
   } else {
     menu.appendChild(h('small', '', 'This computer only'));
     item('Switch board or group', () => showBoards($('.ol-switch')));
+    item('Rename this board\u2026', renameLocalBoard);
+    if (Local.board !== 'main') item('Remove this board\u2026', removeLocalBoard);
     item('Go online with a group', () => showGate());
   }
   menu.appendChild(h('small', '', 'Board'));
@@ -2599,12 +3450,100 @@ function fillMenu() {
   item('Add: Revision plan', () => dropLayout('revision', centre()));
   item('Show everything', () => fit());
   item('Save the board as a file', exportBoard);
+  menu.appendChild(h('small', '', 'Code'));
+  item('Bring in code files or a zip\u2026', () => importCode('files'));
+  item('Bring in a code folder\u2026', () => importCode('folder'));
+  item('Save all the code on the board\u2026', () => exportCode([...S.blocks.values()]));
   item('Clear my selection', () => select([]));
 }
 function exportBoard() {
   const rows = [...S.blocks.values()].map(({_remote, ...b}) => b);
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify({board: S.group?.name || 'Board', saved: now(), blocks: rows}, null, 1)], {type: 'application/json'}));
   a.download = (S.group?.name || 'board').replace(/[^\w -]/g, '') + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+// ---------------------------------------------------------------- code in and out of the board
+// In the app, Windows' own Open and Save boxes do it (zips included); in a plain browser it falls
+// back to the browser's file picker and a download.
+const LANG_OF = {...Object.fromEntries(Object.entries(EXT_FOR).map(([l, e]) => [e, l])),
+  mjs: 'javascript', jsx: 'javascript', tsx: 'typescript', htm: 'html', h: 'c', hpp: 'cpp', cc: 'cpp', bat: 'powershell', txt: 'plaintext', md: 'plaintext'};
+const fileSlug = t => (t || '').trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '').slice(0, 60);
+// What a block holds, as files: a project's own, or one file named after a code or terminal block.
+function codeFiles(b) {
+  if (b.kind === 'proj') return filesOf(b).map(({n, t}) => ({n, t: t || ''}));
+  if (b.kind === 'code') {
+    const e = EXT_FOR[codeLang(b)] || 'txt', t = fileSlug(b.data.title);
+    return [{n: t ? (ext(t) ? t : t + '.' + e) : linkName(b), t: b.data.text || ''}];
+  }
+  if (b.kind === 'term') return [{n: (fileSlug(b.data.title) || 'terminal') + '.txt', t: noAnsi(b.data.text || '')}];
+  return [];
+}
+async function exportCode(list, name) {
+  const coded = list.filter(b => ['code', 'proj', 'term'].includes(b.kind));
+  if (!coded.length) return toast('There is no code on the board to save yet');
+  let files;
+  if (coded.length === 1) files = codeFiles(coded[0]);
+  else {                                  // several blocks: each project gets a folder, loose files sit beside them
+    files = []; const used = new Set();
+    coded.forEach(b => {
+      const dir = b.kind === 'proj' ? (fileSlug(b.data.title) || 'project') : '';
+      codeFiles(b).forEach(f => {
+        let n = (dir ? dir + '/' : '') + f.n;
+        const [stem, e] = [n.replace(/\.[^./]+$/, ''), ext(n)];
+        for (let i = 2; used.has(n); i++) n = stem + '_' + i + (e ? '.' + e : '');
+        used.add(n); files.push({n, t: f.t});
+      });
+    });
+  }
+  if (!files.length) return toast('There is no code in there to save');
+  name = fileSlug(name || (coded.length === 1 && coded[0].data.title) || S.group?.name || 'code') || 'code';
+  if (api()?.ol_export) {
+    const r = await api().ol_export(name, files);
+    if (r && r.error) toast(r.error); else if (r && r.msg) { toast(r.msg); sfx('done'); }
+    return;
+  }
+  // a plain browser: one file downloads as itself, several as one bundle of files
+  const one = files.length === 1, a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([one ? files[0].t : JSON.stringify({files}, null, 1)], {type: 'text/plain'}));
+  a.download = one ? files[0].n.split('/').pop() : name + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+// One file comes in as a code block; several, a folder or a zip come in as a project.
+function placeCode(name, files, at) {
+  files = (files || []).filter(f => f && f.n && typeof f.t === 'string');
+  if (!files.length) return toast('Nothing to bring in: only text and code files up to 400 KB');
+  const p = at || centre();
+  let b;
+  if (files.length === 1) {
+    const f = files[0], lang = LANG_OF[ext(f.n)] || 'auto';
+    b = add('code', p.x, p.y, {lang: lang === 'plaintext' ? 'auto' : lang, text: f.t, title: f.n.split('/').pop()});
+  } else {
+    b = add('proj', p.x, p.y, {title: fileSlug(name) || 'Imported code', files: files.map(f => ({n: cleanName(f.n), t: f.t}))});
+  }
+  select([b.id]); sfx('done');
+  toast(files.length === 1 ? 'Brought in ' + files[0].n.split('/').pop() : `Brought in ${files.length} files as a project`);
+  return b;
+}
+const codePick = (() => { const i = document.createElement('input'); i.type = 'file'; i.multiple = true; i.hidden = true; return i; })();
+async function importCode(how, at) {
+  if (api()?.ol_import) {
+    const r = await api().ol_import(how || 'files');
+    if (!r || r.cancelled) return;
+    if (r.error) return toast(r.error);
+    placeCode(r.name, r.files, at);
+    if (r.skipped) setTimeout(() => toast(`Left out ${r.skipped} (pictures, build folders, binaries or too big)`), 2700);
+    return;
+  }
+  codePick.webkitdirectory = how === 'folder';
+  codePick.onchange = async () => {
+    const out = [];
+    for (const f of [...codePick.files].slice(0, 300)) {
+      if (f.size > 400000 || /^(image|video|audio)\//.test(f.type)) continue;
+      const t = await f.text(); if (!/\x00/.test(t)) out.push({n: f.webkitRelativePath || f.name, t});
+    }
+    codePick.value = '';
+    placeCode(how === 'folder' && out[0] ? out[0].n.split('/')[0] : (out.length > 1 ? 'Imported code' : ''), out, at);
+  };
+  codePick.click();
 }
 document.addEventListener('pointerdown', ev => { if (!ev.target.closest('.ol-menu,.ol-more')) closeMenu(); });
 
@@ -2930,7 +3869,7 @@ const Writing = (() => {
 // The group board lives on the server, so without this there would be nothing on the laptop to
 // fall back on. Both boards are copied the same way, under their own name.
 const Backup = {
-  name() { return S.mode === 'local' ? 'offline' : ((S.group && S.group.name) || groupId || 'group'); },
+  name() { return S.mode === 'local' ? (Local.board === 'main' ? 'offline' : 'offline ' + Local.name()) : ((S.group && S.group.name) || groupId || 'group'); },
   last: 0,
   async take(force) {
     if (!api()?.board_backup) return false;
@@ -2958,6 +3897,10 @@ function saveEverything(backupToo) {
   if (backupToo) Backup.take(false);
 }
 addEventListener('pagehide', () => saveEverything(true));
+(window.bbBeforeLeave = window.bbBeforeLeave || []).push(async () => {
+  saveEverything(false);
+  if (S.mode === 'local' && api()?.ol_local_save) await api().ol_local_save([...S.blocks.values()], Local.board);
+});
 addEventListener('beforeunload', () => saveEverything(true));
 addEventListener('blur', () => saveEverything(false));
 document.addEventListener('visibilitychange', () => { if (document.hidden) saveEverything(true); });
@@ -2967,7 +3910,7 @@ setInterval(() => saveEverything(true), 120000);
 // a save cannot be outrun by the window going away.
 window.bbRows = () => {
   try { Sync.flushAll(); } catch (_) {}
-  return {name: Backup.name(), mode: S.mode, rows: [...S.blocks.values()]};
+  return {name: Backup.name(), mode: S.mode, board: Local.board, rows: [...S.blocks.values()]};
 };
 
 // Put a copy back. A group board is never written over from here - its copy is opened on the
@@ -3171,6 +4114,7 @@ function ctxKeys(ev) {
 let ctxWas = null;          // where the last menu was opened, so the next one follows it
 function ctxOpen(cx, cy, focusFirst) {
   ctxWas = {x: cx, y: cy};
+  fpopClose();
   const r = board.getBoundingClientRect();
   ctx.classList.add('on');
   ctx.style.left = '0px'; ctx.style.top = '0px';
@@ -3210,7 +4154,10 @@ board.addEventListener('contextmenu', ev => {
 
 // Everything you can do to a line joining two blocks.
 function linkItems(b) {
-  const D = b.data || {}, set = patch => change(b.id, x => { x.data = {...x.data, ...patch}; });
+  const D = b.data || {}, set = patch => {
+    change(b.id, x => { x.data = {...x.data, ...patch}; });
+    if (!('from' in patch) && !('label' in patch)) rememberLine(S.blocks.get(b.id).data);
+  };
   const ends = D.ends || 'to', form = D.form || 'curve';
   const pick = (label, on, patch) => ({label: (on ? '\u2713  ' : '\u00a0\u00a0\u00a0 ') + label, go: () => set(patch)});
   return [
@@ -3233,11 +4180,8 @@ function linkItems(b) {
     {label: 'Back to the plain colour', go: () => set({color: null})},
     {rule: 1},
     {rule: 1},
-    {label: 'Use this look for new lines', go: () => {
-      store.set('olLine', {ends, form, dash: !!D.dash, thick: !!D.thick, color: D.color || null});
-      toast('New lines will look like this one'); }},
-    lineLook() && {label: 'New lines back to the plain one', go: () => {
-      store.set('olLine', null); toast('New lines go back to the usual'); }},
+    {label: 'New lines go back to the usual look', go: () => {
+      store.set('olLine', null); toast('New lines: right angle, no arrow, dashed'); }},
     {rule: 1},
     {label: 'Swap which end points', go: () => set({from: D.to, to: D.from})},
     {label: 'Delete the line', key: 'Del', warn: 1, go: () => remove([b.id])},
@@ -3257,10 +4201,10 @@ function renameBlock(b) {
 }
 
 // Which blocks can be dressed up, and in what.
-const CAN_SIZE = ['note', 'sticky', 'text', 'todo', 'shape', 'link', 'code', 'term'];
+const CAN_SIZE = ['note', 'sticky', 'text', 'todo', 'shape', 'link', 'code', 'term', 'proj'];
 const CAN_STYLE = ['note', 'sticky', 'text', 'todo', 'shape', 'link'];
 const baseSize = b => b.kind === 'text' ? (b.data.size || 40)
-  : (b.data.fs || (b.kind === 'sticky' ? 16 : b.kind === 'code' || b.kind === 'term' ? 12.5 : 15));
+  : (b.data.fs || (b.kind === 'sticky' ? 16 : b.kind === 'code' || b.kind === 'term' ? 12.5 : b.kind === 'proj' ? 11.5 : 15));
 const sizePatch = (b, px) => b.kind === 'text' ? {size: px} : {fs: px};
 
 // Everything about how a block looks, in its own menu so the main one stays short. It works on
@@ -3315,6 +4259,7 @@ function lookMenu(ids, at) {
     items.push({rule: 1}, {head: 'the note itself'}, {colours: c => each(list, () => ({color: c})), palette: STICKY});
   items.push({rule: 1}, {label: 'Back to how it started', warn: 1, go: () => each(list, () => ({
     font: null, bold: null, italic: null, align: null, tcolor: null, bg: null, fs: null, caps: null,
+    ul: null, strike: null, op: null, rad: null, bd: null, bw: null, shadow: null, glow: null, lh: null, ls: null,
     ...(first.kind === 'text' ? {size: 40} : {}),
   }))});
   ctxBuild(items);
@@ -3347,6 +4292,9 @@ function blockItems(b, sel) {
     (CAN_STYLE.includes(b.kind) || CAN_SIZE.includes(b.kind)) &&
       {label: 'How it looks…', key: 'Ctrl L', go: () => lookMenu(sel, ctxWas)},
     !many && Writing.minds(b) && {label: 'Check the writing\u2026', key: 'F7', go: () => Writing.open([b.id])},
+    sel.some(i => ['code', 'proj', 'term'].includes(S.blocks.get(i)?.kind)) &&
+      {label: many ? 'Save their code\u2026' : b.kind === 'proj' ? 'Save as a zip\u2026' : 'Save as a file\u2026',
+       go: () => exportCode(sel.map(i => S.blocks.get(i)).filter(Boolean))},
     !many && !!text() && {label: 'Copy the text',
       go: () => navigator.clipboard.writeText(text()).then(() => toast('Copied'))},
     {rule: 1},
@@ -3385,6 +4333,408 @@ function blockItems(b, sel) {
      go: () => fit(sel.map(i => S.blocks.get(i)).filter(Boolean))},
     {label: many ? `Delete ${sel.length} blocks` : 'Delete', key: 'Del', warn: 1, go: () => remove(sel)},
   ];
+}
+
+// ---------------------------------------------------------------- the style bar
+// Pick something out and a bar of how it looks floats just above it, so nothing needs hunting
+// for in the right-click menu. It works on the whole selection at once, and one undo takes
+// back one click whatever it changed.
+const fmt = h('div', 'ol-fmt glass'), fpop = h('div', 'ol-fmtpop glass');
+fmt.setAttribute('role', 'toolbar'); fmt.setAttribute('aria-label', 'How it looks');
+R.append(fmt, fpop);
+const LOOK_KEYS = ['font', 'bold', 'italic', 'ul', 'strike', 'align', 'tcolor', 'bg', 'fs', 'op', 'rad', 'bd', 'bw',
+                   'shadow', 'glow', 'lh', 'ls', 'caps'];
+const BACKED = ['note', 'todo', 'link', 'text'];
+const FMT_ICON = {
+  left: 'M4 6h16M4 12h10M4 18h14', centre: 'M4 6h16M7 12h10M5 18h14', right: 'M4 6h16M10 12h10M6 18h14',
+  box: 'M7 4h10a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3z',
+  circle: 'M12 4a8 8 0 1 0 0 16a8 8 0 1 0 0-16z',
+  to: 'M4 12h15M14 7l5 5-5 5', both: 'M5 12h14M9 7l-5 5 5 5M15 7l5 5-5 5', none: 'M4 12h16',
+  curve: 'M4 18Q12 0 20 18', straight: 'M4 20 20 4', elbow: 'M4 18h8V6h8',
+  dash: 'M3 12h4M10 12h4M17 12h4', dots: 'M4 12h.01M9 12h.01M14 12h.01M19 12h.01', plain: 'M4 12h16',
+  brush: 'M15 4l5 5-7 7-5-5zM8 11l-4 9 9-4', paste: 'M9 3h6v4H9zM7 5H5v16h14V5h-2',
+  lock: 'M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z', unlock: 'M7 11V8a5 5 0 0 1 9.6-2M5 11h14v10H5z',
+  reset: 'M4 12a8 8 0 1 0 3-6.2M4 4v4h4', more: 'M5 12h.01M12 12h.01M19 12h.01',
+  star: 'M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.4 6.7 19.4l1.2-6L3.4 9.3l6-.7z',
+};
+const svgIcon = (k, w) => `<svg viewBox="0 0 24 24" aria-hidden="true"${w ? ` style="stroke-width:${w}"` : ''}><path d="${FMT_ICON[k]}"/></svg>`;
+var fmtRaf = 0, fmtKey = '', fmtLook = null;
+const fmtOn = () => store.get('olFmt', true) !== false;
+
+// Change these blocks in one go, as one undo step.
+function restyle(blocks, fn) {
+  const steps = [];
+  const lines = blocks.filter(b => b.kind === 'arrow');
+  blocks.forEach(b => {
+    if (locked(b) && b.kind !== 'arrow') return;
+    const before = snap(b);
+    b.data = {...b.data, ...fn(b)};
+    steps.push({before, after: snap(b)});
+    put(b);
+    if (S.editing === b.id) dress(b, node(b));      // the text being typed in is left alone, but its look still changes
+  });
+  record(steps);
+  if (lines.length) rememberLine(lines[0].data);       // new lines follow the last one you changed
+  fmtSoon(true);
+}
+
+function fmtSoon(rebuild) {
+  if (rebuild) fmtKey = '';
+  if (fmtRaf) return;
+  fmtRaf = requestAnimationFrame(() => { fmtRaf = 0; fmtSync(); });
+}
+function fmtHide() { fmt.classList.remove('on'); fpopClose(); fmtKey = ''; }
+function fmtSync() {
+  const list = [...S.sel].map(i => S.blocks.get(i)).filter(Boolean);
+  const ed = S.editing && S.blocks.get(S.editing);
+  if (!fmtOn() || !list.length || !R.offsetParent || (drag && (drag.moved || drag.kind !== 'move'))
+      || board.classList.contains('panning') || (ed && (ed.kind === 'code' || ed.kind === 'proj'))
+      || document.querySelector('.ol-ide.on')) return fmtHide();
+  const key = list.map(b => b.id + ':' + b.updated_at).join(',');
+  if (key !== fmtKey && !fmt.contains(document.activeElement)) { fmtKey = key; fmtBuild(list); }
+  fmtPlace(list);
+}
+
+// Sit above what is picked out, or below it when that is off the top, and never off the board.
+function fmtPlace(list) {
+  const rr = R.getBoundingClientRect(), f = rr.width / R.offsetWidth || 1;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  list.forEach(b => {
+    const el = b.kind === 'arrow' ? links.querySelector(`path.hit[data-id="${b.id}"]`) : S.nodes.get(b.id);
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    x0 = Math.min(x0, r.left); y0 = Math.min(y0, r.top); x1 = Math.max(x1, r.right); y1 = Math.max(y1, r.bottom);
+  });
+  if (x0 === Infinity) return fmtHide();
+  const W = R.clientWidth, H = R.clientHeight;
+  const L = (x0 - rr.left) / f - R.clientLeft, T = (y0 - rr.top) / f - R.clientTop;
+  const Rt = (x1 - rr.left) / f - R.clientLeft, B = (y1 - rr.top) / f - R.clientTop;
+  if (B < 0 || T > H || Rt < 0 || L > W) { fmt.classList.remove('on'); fpopClose(); return; }
+  fmt.classList.add('on');
+  const w = fmt.offsetWidth;
+  // along the top of the board, in the middle; with the message box open, in the middle of what's left of it,
+  // or along the bottom when that's too narrow, so neither covers the other
+  const chat = $('.ol-chat'), room = chat.hidden ? W : W - chat.offsetWidth - 24;
+  if (w + 16 <= room) { fmt.style.left = Math.max(8, (room - w) / 2) + 'px'; fmt.style.top = '62px'; }
+  else { fmt.style.left = Math.max(8, (W - w) / 2) + 'px'; fmt.style.top = Math.max(62, H - fmt.offsetHeight - 76) + 'px'; }
+  if (fpop.classList.contains('on')) fpopPlace();
+}
+
+// A colour picker: the palette, any colour at all, the ones picked lately, and the usual.
+function swatches(el, label, colours, cur, pick, noneLabel) {
+  el.appendChild(h('small', '', label));
+  const grid = el.appendChild(h('div', 'sw'));
+  const recent = store.get('olRecent', []).filter(okColor);
+  const all = [...colours, ...recent.filter(c => !colours.includes(c))];
+  all.forEach(c => {
+    const i = grid.appendChild(h('i'));
+    i.style.background = c; i.title = c;
+    if ((cur || '').toLowerCase() === c.toLowerCase()) i.classList.add('on');
+    i.onclick = () => pick(c);
+  });
+  const row = el.appendChild(h('div', 'row'));
+  const any = row.appendChild(h('input'));
+  any.type = 'color'; any.value = okColor(cur) || '#d71921'; any.title = 'Any colour';
+  any.onchange = () => {
+    store.set('olRecent', [any.value, ...recent.filter(c => c !== any.value)].slice(0, 8));
+    pick(any.value);
+  };
+  row.appendChild(h('span', '', 'Any colour'));
+  if (noneLabel) {
+    const n = row.appendChild(h('button', cur ? '' : 'on', noneLabel));
+    n.style.marginLeft = 'auto'; n.onclick = () => pick(null);
+  }
+}
+// A row of choices, one of them lit.
+function choices(el, label, opts, cur, pick) {
+  el.appendChild(h('small', '', label));
+  const row = el.appendChild(h('div', 'row'));
+  opts.forEach(([v, name]) => {
+    const b = row.appendChild(h('button', (cur ?? null) === v ? 'on' : '', name));
+    b.onclick = () => pick(v);
+  });
+}
+
+function fpopClose() { fpop.classList.remove('on'); fpop.replaceChildren(); fpop._k = null; }
+function fpopPlace() {
+  const a = fmt.querySelector(`[data-k="${fpop._k}"]`);
+  if (!a) return fpopClose();
+  const W = R.clientWidth, H = R.clientHeight, w = fpop.offsetWidth, hh = fpop.offsetHeight;
+  const ax = a.offsetLeft + fmt.offsetLeft, ay = fmt.offsetTop;
+  let top = ay + fmt.offsetHeight + 8;
+  if (top + hh > H - 8) top = Math.max(8, ay - hh - 8);
+  fpop.style.left = clamp(ax + a.offsetWidth / 2 - w / 2, 8, Math.max(8, W - w - 8)) + 'px';
+  fpop.style.top = top + 'px';
+}
+// Open a panel under one of the bar's buttons; the same button again shuts it.
+function fpopOpen(k, build) {
+  if (fpop._k === k) return fpopClose();
+  fpop._k = k; fpop._build = build;
+  fpop.replaceChildren(); build(fpop);
+  fpop.classList.add('on'); fpopPlace();
+}
+
+function fmtBuild(list) {
+  fmt.replaceChildren();
+  const first = list[0], D = first.data || {};
+  const blocks = list.filter(b => b.kind !== 'arrow');
+  const lines = list.filter(b => b.kind === 'arrow');
+  const styleable = list.filter(b => CAN_STYLE.includes(b.kind));
+  const sizeable = list.filter(b => CAN_SIZE.includes(b.kind));
+  const shapes = list.filter(b => b.kind === 'shape');
+  const inks = list.filter(b => b.kind === 'ink');
+  const boxy = blocks.filter(b => b.kind !== 'ink');
+  const SD = (styleable[0] || first).data || {};
+  let any = false;
+  const sep = () => { if (any) fmt.appendChild(h('i', 'sep')); any = true; };
+  const btn = (html, title, on, go, k) => {
+    const b = fmt.appendChild(h('button', on ? 'on' : ''));
+    b.innerHTML = html; b.title = title; b.setAttribute('aria-label', title.replace(/\s*\(.*\)$/, ''));
+    if (on != null) b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (k) { b.dataset.k = k; b.setAttribute('aria-haspopup', 'true'); }
+    b.onclick = () => { sfx('tap', .5); go(b); };
+    return b;
+  };
+  const chip = c => `<span class="chip${c ? '' : ' none'}" style="background:${c || 'transparent'}"></span>`;
+  // after a change in a panel, draw the panel again so it shows what is now picked
+  const keep = fn => v => { fn(v); requestAnimationFrame(() => { if (fpop._k && fpop._build) {
+    fpop.replaceChildren(); fpop._build(fpop); fpopPlace(); } }); };
+  const shut = fn => v => { fn(v); fpopClose(); };
+
+  if (styleable.length) {
+    sep();
+    const sel = fmt.appendChild(h('select'));
+    sel.title = 'Lettering';
+    Object.keys(FONTS).forEach(f => { const o = sel.appendChild(h('option', '', FONT_NAME[f])); o.value = f;
+      if (FONTS[f]) o.style.fontFamily = FONTS[f]; });
+    sel.value = SD.font || 'plain';
+    sel.onchange = () => { restyle(styleable, () => ({font: sel.value === 'plain' ? null : sel.value})); sel.blur(); };
+  }
+  if (sizeable.length) {
+    const sb = sizeable[0], step = by => restyle(sizeable, b => sizePatch(b, Math.round(clamp(baseSize(b) * by, 9, 160))));
+    btn('<span style="font-size:15px;line-height:1">−</span>', 'Smaller text (Ctrl −)', null, () => step(1 / 1.15));
+    const num = fmt.appendChild(h('input', 'num'));
+    num.type = 'number'; num.min = 9; num.max = 160; num.value = Math.round(baseSize(sb)); num.title = 'Text size';
+    num.onchange = () => { const v = clamp(Math.round(+num.value) || baseSize(sb), 9, 160);
+      num.blur(); restyle(sizeable, b => sizePatch(b, v)); };
+    num.onkeydown = ev => { if (ev.key === 'Enter') num.onchange(); if (ev.key === 'Escape') num.blur(); ev.stopPropagation(); };
+    btn('<span style="font-size:15px;line-height:1">+</span>', 'Bigger text (Ctrl +)', null, () => step(1.15));
+  }
+  if (styleable.length) {
+    sep();
+    btn('<b>B</b>', 'Bold (Ctrl B)', !!SD.bold, () => restyle(styleable, () => ({bold: !SD.bold || null})));
+    btn('<i>I</i>', 'Slanted (Ctrl I)', !!SD.italic, () => restyle(styleable, () => ({italic: !SD.italic || null})));
+    btn('<u>U</u>', 'Underlined (Ctrl U)', !!SD.ul, () => restyle(styleable, () => ({ul: !SD.ul || null})));
+    btn('<s>S</s>', 'Crossed out', !!SD.strike, () => restyle(styleable, () => ({strike: !SD.strike || null})));
+    const al = SD.align || 'left', nextAl = {left: 'centre', centre: 'right', right: 'left'}[al];
+    btn(svgIcon(al), 'Lined up to the ' + al + ' (click for ' + nextAl + ')', null,
+        () => restyle(styleable, () => ({align: nextAl === 'left' ? null : nextAl})));
+    btn('<span style="font-size:13px;font-weight:800;line-height:1">A</span>' + chip(okColor(SD.tcolor) || 'var(--text)'),
+        'Colour of the writing', null, () => fpopOpen('tc', el => swatches(el, 'colour of the writing', PAL, SD.tcolor,
+          shut(c => restyle(styleable, () => ({tcolor: c}))), 'The usual')), 'tc');
+    btn('<span style="font-size:12px;line-height:1">Aa</span>', 'Spacing and capitals', null, () => fpopOpen('sp', el => {
+      const XD = ((styleable[0] || first).data) || {};
+      choices(el, 'gap between lines', [['tight', 'Close'], [null, 'Usual'], ['airy', 'Airy']], XD.lh || null,
+              keep(v => restyle(styleable, () => ({lh: v}))));
+      choices(el, 'gap between letters', [['tight', 'Close'], [null, 'Usual'], ['wide', 'Wide']], XD.ls || null,
+              keep(v => restyle(styleable, () => ({ls: v}))));
+      const texts = styleable.filter(b => b.kind === 'text');
+      if (texts.length) choices(el, 'big text', [[null, 'ALL CAPITALS'], [false, 'As typed']],
+        texts[0].data.caps === false ? false : null, keep(v => restyle(texts, () => ({caps: v}))));
+    }), 'sp');
+  }
+
+  // what fills the block: paper for notes, the note itself for stickies, a tint for boxes
+  const fillers = blocks.filter(b => BACKED.includes(b.kind) || b.kind === 'sticky');
+  if (fillers.length || shapes.length) {
+    sep();
+    if (fillers.length) {
+      const fb = fillers[0], sticky = fb.kind === 'sticky';
+      const cur = sticky ? okColor(fb.data.color) || STICKY[0] : okColor(fb.data.bg);
+      btn(chip(cur) + '<span class="lbl">Fill</span>', 'Colour behind it', null, () => fpopOpen('bg', el =>
+        swatches(el, sticky ? 'colour of the note' : 'colour behind it', sticky ? STICKY : [...PAPER, ...PAL.slice(0, 8)], cur,
+          shut(c => restyle(fillers, b => b.kind === 'sticky' ? {color: c || STICKY[0]} : {bg: c})),
+          sticky ? null : 'None')), 'bg');
+    }
+    if (shapes.length) {
+      const sd = shapes[0].data || {};
+      btn(chip(okColor(sd.color) || 'var(--text)') + '<span class="lbl">Box</span>', 'Colour of the box', null,
+          () => fpopOpen('sh', el => swatches(el, 'colour of the box', PAL, sd.color,
+            shut(c => restyle(shapes, () => ({color: c}))), 'The usual')), 'sh');
+      btn(svgIcon(sd.form === 'ellipse' ? 'circle' : 'box'), sd.form === 'ellipse' ? 'Circle (click for a box)' : 'Box (click for a circle)',
+          null, () => restyle(shapes, () => ({form: sd.form === 'ellipse' ? 'box' : 'ellipse'})));
+      const edge = sd.dots ? 'dots' : sd.dash ? 'dash' : 'plain';
+      const nextEdge = {plain: 'dash', dash: 'dots', dots: 'plain'}[edge];
+      btn(svgIcon(edge, sd.thick ? 3.4 : 2), 'Edge: ' + {plain: 'solid', dash: 'dashed', dots: 'dotted'}[edge] + ' (right-click for thick)',
+          null, () => restyle(shapes, () => ({dash: nextEdge === 'dash' || null, dots: nextEdge === 'dots' || null})))
+        .oncontextmenu = ev => { ev.preventDefault(); restyle(shapes, () => ({thick: !sd.thick || null})); };
+      const fill = sd.fill === 'solid' ? 'solid' : sd.fill ? 'light' : 'none';
+      const nextFill = {none: 'light', light: 'solid', solid: 'none'}[fill];
+      btn('<span class="lbl">' + {none: 'Empty', light: 'Tinted', solid: 'Shaded'}[fill] + '</span>', 'Inside the box (click to change)', null,
+          () => restyle(shapes, () => ({fill: nextFill === 'none' ? false : nextFill === 'solid' ? 'solid' : true})));
+    }
+  }
+
+  if (lines.length) {
+    sep();
+    const ld = lines[0].data || {}, ends = ld.ends || 'to', form = ld.form || 'curve';
+    const nextEnds = {to: 'both', both: 'none', none: 'to', from: 'both'}[ends];
+    const nextForm = {curve: 'straight', straight: 'elbow', elbow: 'curve'}[form];
+    btn(svgIcon(ends === 'from' ? 'to' : ends), 'Arrow heads (click to change)', null, () => restyle(lines, () => ({ends: nextEnds})));
+    btn(svgIcon(form), 'Line shape: ' + form + ' (click to change)', null, () => restyle(lines, () => ({form: nextForm})));
+    btn(svgIcon('dash'), 'Dashed', !!ld.dash, () => restyle(lines, () => ({dash: !ld.dash})));
+    btn(svgIcon('plain', 4), 'Thicker', !!ld.thick, () => restyle(lines, () => ({thick: !ld.thick})));
+    btn(chip(okColor(ld.color) || 'var(--text)'), 'Colour of the line', null, () => fpopOpen('ln', el =>
+      swatches(el, 'colour of the line', PAL, ld.color, shut(c => restyle(lines, () => ({color: c}))), 'The usual')), 'ln');
+    if (lines.length === 1)
+      btn('<span class="lbl">' + (ld.label ? 'Label' : '+ Label') + '</span>', 'Write on the line', null, () => {
+        const v = prompt('A word or two for the middle of the line', ld.label || '');
+        if (v !== null) restyle(lines, () => ({label: v.trim().slice(0, 60)})); });
+  }
+
+  if (inks.length) {
+    sep();
+    const idd = inks[0].data || {}, w = clamp(idd.width || 3, 1, 20);
+    btn(chip(okColor(idd.color) || 'var(--text)'), 'Colour of the drawing', null, () => fpopOpen('ink', el =>
+      swatches(el, 'colour of the drawing', PAL, idd.color, shut(c => restyle(inks, () => ({color: c}))), 'Black/white')), 'ink');
+    const nextW = w < 3 ? 3 : w < 6 ? 6 : w < 10 ? 10 : 2;
+    btn(svgIcon('plain', clamp(w, 1, 6)), 'Pen width ' + w + ' (click to change)', null, () => restyle(inks, () => ({width: nextW})));
+  }
+
+  // the block as a whole: corners, edge, shadow and how see-through it is
+  if (blocks.length) {
+    sep();
+    btn(svgIcon('box') + '<span class="lbl">Style</span>', 'Corners, edge, shadow and see-through', null, () => fpopOpen('box', el => {
+      const BD = (boxy[0] || blocks[0]).data || {};
+      if (boxy.length) {
+        choices(el, 'corners', [['square', 'Sharp'], ['soft', 'Soft'], [null, 'Usual'], ['round', 'Round'], ['pill', 'Very round']],
+                BD.rad || null, keep(v => restyle(boxy, () => ({rad: v}))));
+        const edged = boxy.filter(b => b.kind !== 'shape');
+        if (edged.length) {
+          swatches(el, 'edge colour', PAL, BD.bd, keep(c => restyle(edged, () => ({bd: c}))), 'Usual');
+          if (okColor(BD.bd)) choices(el, 'edge thickness', [[null, 'Thin'], [2, 'Medium'], [4, 'Thick']], BD.bw || null,
+                                      keep(v => restyle(edged, () => ({bw: v}))));
+          choices(el, 'shadow', [[null, 'Usual'], ['flat', 'None'], ['lifted', 'Lifted'], ['glow', 'Glow']], BD.shadow || null,
+                  keep(v => restyle(edged, () => ({shadow: v}))));
+          if (BD.shadow === 'glow') swatches(el, 'glow colour', PAL.slice(0, 12), BD.glow,
+                                             keep(c => restyle(edged, () => ({glow: c}))), 'Red');
+        }
+      }
+      el.appendChild(h('small', '', 'see-through'));
+      const row = el.appendChild(h('div', 'row')), r = row.appendChild(h('input')), out = row.appendChild(h('span'));
+      r.type = 'range'; r.min = 15; r.max = 100; r.step = 5;
+      r.value = Math.round((BD.op == null ? 1 : BD.op) * 100); out.textContent = r.value + '%';
+      // show it while sliding, but only save it once you let go
+      r.oninput = () => { out.textContent = r.value + '%';
+        blocks.forEach(b => S.nodes.get(b.id)?.style.setProperty('--op', r.value / 100)); };
+      r.onchange = () => restyle(blocks, () => ({op: +r.value >= 100 ? null : +r.value / 100}));
+    }), 'box');
+  }
+
+  // copy one block's look onto others, and make it the look new ones of that kind start with
+  sep();
+  const lookOf = b => Object.fromEntries(LOOK_KEYS.map(k => [k, (b.data || {})[k] ?? null]));
+  btn(svgIcon('brush'), 'Copy this look', null, () => { fmtLook = lookOf(styleable[0] || blocks[0] || first);
+    toast('Look copied — pick something else and press paste'); fmtSoon(true); });
+  if (fmtLook) btn(svgIcon('paste'), 'Paste the copied look', null, () => {
+    restyle(blocks, b => { const L = {...fmtLook}; if (b.kind !== 'text') delete L.caps; return L; });
+    toast('Look pasted'); });
+  if (list.length === 1 && blocks.length === 1 && first.kind !== 'image') {
+    const kinds = store.get('olLooks', {}), mine = !!kinds[first.kind];
+    const many_ = n => /(x|s|sh|ch)$/.test(n) ? n + 'es' : n + 's', kn = many_(KIND_NAME[first.kind] || first.kind);
+    btn(svgIcon('star'), mine ? 'New ' + kn + ' start like this one (click to stop)'
+                              : 'Start new ' + kn + ' looking like this one', mine, () => {
+      const all = store.get('olLooks', {});
+      if (mine) delete all[first.kind]; else all[first.kind] = Object.fromEntries(Object.entries(lookOf(first)).filter(([, v]) => v != null));
+      store.set('olLooks', all);
+      toast(mine ? 'New ones go back to the usual look' : 'New ' + kn + ' will look like this');
+      fmtSoon(true); });
+  }
+  btn(svgIcon('reset'), 'Back to how it started', null, () => restyle(blocks, b => ({
+    ...Object.fromEntries(LOOK_KEYS.map(k => [k, null])), ...(b.kind === 'text' ? {size: 40} : {}) })));
+  const lock = locked(first);
+  btn(svgIcon(lock ? 'lock' : 'unlock'), lock ? 'Locked (click to unlock)' : 'Lock in place', lock, () => {
+    const steps = [];
+    list.forEach(b => { const before = snap(b); b.data = {...b.data, lock: !lock}; steps.push({before, after: snap(b)}); put(b); });
+    record(steps); fmtSoon(true); });
+  btn(svgIcon('more', 3.2), 'Everything else', null, b => {
+    const r = b.getBoundingClientRect();
+    ctxBuild(lines.length && !blocks.length ? linkItems(first) : blockItems(blocks[0] || first, [...S.sel]));
+    ctxOpen(r.left, r.bottom + 6, true);
+  });
+}
+
+// Clicks on the bar must not take the typing cursor out of the note being written in.
+fmt.addEventListener('pointerdown', ev => { if (!ev.target.closest('input,select')) ev.preventDefault(); ev.stopPropagation(); });
+fpop.addEventListener('pointerdown', ev => { if (!ev.target.closest('input')) ev.preventDefault(); ev.stopPropagation(); });
+[fmt, fpop].forEach(el => el.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape') { ev.preventDefault(); fpop._k ? fpopClose() : (document.activeElement.blur(), fmtHide()); }
+  if (ev.target.closest('input,select')) ev.stopPropagation();       // Delete in a box must not delete the block
+}));
+document.addEventListener('pointerdown', ev => { if (fpop._k && !ev.target.closest('.ol-fmt,.ol-fmtpop')) fpopClose(); }, true);
+board.addEventListener('pointerup', () => fmtSoon());
+addEventListener('resize', () => fmtSoon());
+
+// Hover a button for a moment and a small label says what it does. The browser's own tooltip is
+// slow and plain, so the title is moved aside while ours shows, and put back after.
+const tip = h('div', 'ol-tip'); R.appendChild(tip);
+let tipT = 0, tipEl = null;
+function tipHide() {
+  clearTimeout(tipT); tip.classList.remove('on');
+  if (tipEl && tipEl.dataset.tip != null) { tipEl.title = tipEl.dataset.tip; delete tipEl.dataset.tip; }
+  tipEl = null;
+}
+R.addEventListener('pointerover', ev => {
+  const el = ev.target.closest('button[title],select[title],input[title],[data-tool][title],.ol-tools button,.ol-zoom button');
+  if (el === tipEl) return;
+  tipHide();
+  if (!el || !R.contains(el) || el.closest('.ol-b') || !(el.title || el.getAttribute('aria-label'))) return;
+  tipEl = el;
+  const text = el.title || el.getAttribute('aria-label');
+  if (el.title) { el.dataset.tip = el.title; el.title = ''; }
+  tipT = setTimeout(() => {
+    if (tipEl !== el || !el.isConnected) return;
+    const m = /^(.*?)\s*\(([^()]{1,24})\)\s*$/.exec(text);       // "Bold (Ctrl B)": the keys go in grey
+    tip.replaceChildren(document.createTextNode(m ? m[1] : text));
+    if (m) tip.appendChild(h('b', '', m[2]));
+    const rr = R.getBoundingClientRect(), f = rr.width / R.offsetWidth || 1, r = el.getBoundingClientRect();
+    tip.classList.add('on');
+    const w = tip.offsetWidth, hh = tip.offsetHeight;
+    const toolbar = el.closest('.ol-tools');
+    let x = toolbar ? (r.right - rr.left) / f + 10 : (r.left + r.width / 2 - rr.left) / f - w / 2;
+    let y = toolbar ? (r.top + r.height / 2 - rr.top) / f - hh / 2 : (r.bottom - rr.top) / f + 8;
+    if (!toolbar && y + hh > R.clientHeight - 6) y = (r.top - rr.top) / f - hh - 8;
+    tip.style.left = clamp(x, 6, R.clientWidth - w - 6) + 'px';
+    tip.style.top = clamp(y, 6, R.clientHeight - hh - 6) + 'px';
+  }, 380);
+});
+R.addEventListener('pointerout', ev => { if (tipEl && !tipEl.contains(ev.relatedTarget)) tipHide(); });
+R.addEventListener('pointerdown', tipHide, true);
+addEventListener('wheel', tipHide, {passive: true});
+
+// How the board itself looks, a choice kept on this computer.
+function boardLook() {
+  R.dataset.grid = store.get('olGrid', 'dots');
+  const p = store.get('olPaper', '');
+  if (p) R.dataset.paper = p; else delete R.dataset.paper;
+}
+boardLook();
+function boardLookMenu(at) {
+  const tick = on => on ? '✓  ' : '    ';
+  const g = store.get('olGrid', 'dots'), p = store.get('olPaper', '');
+  const pick = (k, v) => () => { store.set(k, v); boardLook(); };
+  ctxBuild([
+    {head: 'the board'},
+    ...[['dots', 'Dots'], ['big', 'Big dots'], ['lines', 'Squared paper'], ['none', 'Plain']]
+      .map(([v, n]) => ({label: tick(g === v) + n, go: pick('olGrid', v)})),
+    {rule: 1}, {head: 'paper colour'},
+    ...[['', 'The usual'], ['warm', 'Warm'], ['cool', 'Cool'], ['green', 'Green'], ['dark', 'Darker']]
+      .map(([v, n]) => ({label: tick(p === v) + n, go: pick('olPaper', v)})),
+    {rule: 1},
+    {label: tick(fmtOn()) + 'Style bar over picked things', go: () => { store.set('olFmt', !fmtOn()); fmtSoon(true);
+      toast(fmtOn() ? 'The style bar shows over what you pick' : 'Style bar off — right-click for the look instead'); }},
+  ]);
+  ctxOpen(at ? at.x : innerWidth / 2, at ? at.y : 120, true);
 }
 
 // Lay out whatever is sitting in a box, in rows inside it, in the order it is already in:
@@ -3454,8 +4804,8 @@ const LAYOUTS = {
                       {size: [310, 460], centre: false});
         made.push(f.id);
         if (i === 0) for (let k = 0; k < 2; k++)
-          made.push(add('sticky', sx + 22, y + 40 + k * 120,
-                        {color: STICKY[k % STICKY.length]}, {size: [266, 100], centre: false}).id);
+          made.push(add('note', sx + 22, y + 40 + k * 120,
+                        {html: '', bg: PAPER[k % PAPER.length]}, {size: [266, 100], centre: false}).id);
       });
       return made;
     },
@@ -3472,7 +4822,7 @@ const LAYOUTS = {
         {t: 'Make notes', done: false}]}, {size: [300, 180], centre: false});
       const notes = add('note', x + 352, y + 48, {html: 'What I did not understand'},
                         {size: [320, 180], centre: false});
-      const next = add('sticky', x + 24, y + 254, {text: 'Next: ', color: STICKY[0]},
+      const next = add('note', x + 24, y + 254, {html: 'Next: ', bg: PAPER[0]},
                        {size: [300, 130], centre: false});
       made.push(topics.id, notes.id, next.id);
       add('arrow', 0, 0, {from: topics.id, to: notes.id, form: 'straight', ends: 'to'},
@@ -3500,7 +4850,6 @@ function spaceItems(p) {
   return [
     {head: 'Put here'},
     {label: 'Note', key: 'N', go: put('note')},
-    {label: 'Sticky note', key: 'S', go: put('sticky', {color: STICKY[Math.floor(Math.random() * STICKY.length)]})},
     {label: 'Big text', key: 'T', go: put('text')},
     {label: 'Code', key: 'C', go: put('code', {lang: 'auto', text: ''})},
     {label: 'Code project', key: 'K', go: put('proj', {title: '', files: []})},
@@ -3508,6 +4857,8 @@ function spaceItems(p) {
     {label: 'Terminal output', key: 'R', go: put('term')},
     {label: 'Link', key: 'U', go: put('link', {url: '', title: ''})},
     {label: 'Picture\u2026', key: 'I', go: () => $('.ol-file').click()},
+    {label: 'Code files or a zip from this computer\u2026', go: () => importCode('files', p)},
+    {label: 'A code folder from this computer\u2026', go: () => importCode('folder', p)},
     {rule: 1},
     {label: 'Box to group things\u2026', key: 'O', go: () => {
       setTool('shape', 'box'); toast('Drag out how big it should be'); }},
@@ -3527,6 +4878,7 @@ function spaceItems(p) {
      go: () => { Writing.auto = !Writing.auto;
                  toast(Writing.auto ? 'Typos get fixed as you type' : 'Typing left alone'); }},
     {label: 'Select everything', key: 'Ctrl A', go: () => select([...S.blocks.keys()])},
+    {label: 'How the board looks…', go: () => boardLookMenu(ctxWas)},
     {rule: 1},
     {label: 'Show everything', key: 'F', go: () => fit()},
     {label: 'Back to 100%', key: '0', go: () => zoomAt(1)},
@@ -3577,6 +4929,6 @@ nav && nav.addEventListener('click', () => setTimeout(() => { start(); R.focus({
 if (document.querySelector('#online.on')) start();
 new MutationObserver(() => { if (document.querySelector('#online.on')) start(); }).observe(document.getElementById('online'), {attributes: true, attributeFilter: ['class']});
 window.bbWriting = Writing;
-window.bbOnline = {S, IDE, run, add, fit, start, useLocal, incoming, sniff, guessLang, clean, paint, place, put, drawLinks, startEdit, tidy, dropLayout, Writing, view: v => { S.view = v; applyView(); }};
+window.bbOnline = {S, IDE, run, add, fit, placeCode, codeFiles, select, autoCmd, start, useLocal, incoming, sniff, guessLang, clean, paint, place, put, drawLinks, startEdit, tidy, dropLayout, Writing, view: v => { S.view = v; applyView(); }};
 })();
 """

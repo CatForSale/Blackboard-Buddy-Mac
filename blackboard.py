@@ -1,9 +1,11 @@
 """Reads your Blackboard Learn (Ultra) account through its REST API,
 using a browser session you sign into yourself."""
 
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
 
@@ -33,10 +35,20 @@ class Blackboard:
 
     def __enter__(self):
         self._pw = sync_playwright().start()
-        self.context = self._pw.chromium.launch_persistent_context(
-            str(self.profile_dir), channel="msedge", headless=self.headless,
-            viewport={"width": 1100, "height": 800},
-        )
+        # Edge comes with Windows; a Mac usually has Chrome. Use whichever is there.
+        channels = ("msedge", "chrome") if sys.platform == "win32" else ("chrome", "msedge")
+        for i, channel in enumerate(channels):
+            try:
+                self.context = self._pw.chromium.launch_persistent_context(
+                    str(self.profile_dir), channel=channel, headless=self.headless,
+                    viewport={"width": 1100, "height": 800},
+                )
+                break
+            except Exception:
+                if i == len(channels) - 1:
+                    self._pw.stop()
+                    raise RuntimeError("Blackboard Buddy signs in through Google Chrome or Microsoft Edge, "
+                                       "and neither is installed. Install Chrome from google.com/chrome, then try again.")
         return self
 
     def __exit__(self, *exc):
@@ -91,6 +103,41 @@ class Blackboard:
             pages += 1
         return results
 
+    def get_many(self, paths, at_once=8):
+        """Fetches many API paths at the same time from inside the signed-in page (None for any that fail).
+        If the page can't fetch at all, falls back to one at a time."""
+        if not paths:
+            return []
+        try:
+            page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            out = page.evaluate("""async ([base, paths, n]) => {
+                const res = new Array(paths.length).fill(null); let next = 0;
+                const one = async () => { while (next < paths.length) { const k = next++;
+                  try { const r = await fetch(base + paths[k], {credentials: 'include', headers: {Accept: 'application/json'}});
+                        res[k] = r.ok ? await r.json() : null; } catch (_) {} } };
+                await Promise.all(Array.from({length: n}, one));
+                return res; }""", [self.base, paths, at_once])
+        except Exception:
+            out = [None] * len(paths)
+        if all(o is None for o in out):
+            out = [self.get(p) for p in paths]
+        return out
+
+    def get_all_many(self, paths, max_pages=20):
+        """get_all for many paths at once: each round fetches every list's next page together."""
+        results = [[] for _ in paths]
+        todo, rounds = list(enumerate(paths)), 0
+        while todo and rounds <= max_pages:
+            nxt = []
+            for (i, _), data in zip(todo, self.get_many([p for _, p in todo])):
+                if not data:
+                    continue
+                results[i].extend(data.get("results", []))
+                if (data.get("paging") or {}).get("nextPage"):
+                    nxt.append((i, data["paging"]["nextPage"]))
+            todo, rounds = nxt, rounds + 1
+        return results
+
     def download(self, path):
         resp = self.context.request.get(f"{self.base}{path}", fail_on_status_code=False)
         return resp.body() if resp.ok else None
@@ -107,7 +154,7 @@ class Blackboard:
         out = []
         for m in memberships:
             c = m.get("course") or {}
-            if (m.get("availability") or {}).get("available") == "No":
+            if (m.get("availability") or {}).get("available") in ("No", "Disabled"):   # UWE switched it off for you
                 continue
             if (c.get("availability") or {}).get("available") == "No":
                 continue
@@ -123,8 +170,49 @@ class Blackboard:
             })
         return out
 
+    def read_courses(self, courses, max_depth=4, max_items=400):
+        """Fills in gradebook, announcements and contents for every module, fetching side by side."""
+        uid, n = self.me["id"], len(courses)
+        q = lambda path, **kw: f"{path}?{urlencode(kw)}"
+        lists = self.get_all_many([q(f"{API}/v2/courses/{c['id']}/gradebook/columns", limit=100) for c in courses]
+                                  + [q(f"{API}/v2/courses/{c['id']}/gradebook/users/{uid}", limit=100) for c in courses]
+                                  + [q(f"{API}/v1/courses/{c['id']}/announcements", limit=100) for c in courses])
+        for k, c in enumerate(courses):
+            c["gradebook"] = self._gradebook(lists[k], lists[n + k])
+            c["announcements"] = self._announcements(lists[2 * n + k])
+        # the outlines, a folder level at a time across every module
+        tops = {c["id"]: [] for c in courses}
+        count = {c["id"]: 0 for c in courses}
+        level = [(c["id"], None, [], 0, tops[c["id"]]) for c in courses]
+        while level:
+            found = self.get_all_many([q(f"{API}/v1/courses/{cid}/contents" + (f"/{iid}/children" if iid else ""), limit=200)
+                                       for cid, iid, *_ in level])
+            nxt = []
+            for (cid, parent, titles, depth, sink), items in zip(level, found):
+                for item in items:
+                    if count[cid] >= max_items:
+                        break
+                    count[cid] += 1
+                    node, sub = self._content(item, titles, parent)
+                    kids = []
+                    sink.append((node, kids))
+                    if item.get("hasChildren") and depth + 1 <= max_depth:
+                        nxt.append((cid, item["id"], sub, depth + 1, kids))
+            level = nxt
+
+        def flat(tree, out):   # same order as walking the outline top to bottom
+            for node, kids in tree:
+                out.append(node)
+                flat(kids, out)
+            return out
+        for c in courses:
+            c["contents"] = flat(tops[c["id"]], [])
+        return courses
+
     def announcements(self, course_id):
-        items = self.get_all(f"{API}/v1/courses/{course_id}/announcements", {"limit": 100})
+        return self._announcements(self.get_all(f"{API}/v1/courses/{course_id}/announcements", {"limit": 100}))
+
+    def _announcements(self, items):
         return [{
             "id": a.get("id"),
             "title": a.get("title", ""),
@@ -137,6 +225,9 @@ class Blackboard:
         cols = self.get_all(f"{API}/v2/courses/{course_id}/gradebook/columns", {"limit": 100})
         grades = self.get_all(f"{API}/v2/courses/{course_id}/gradebook/users/{self.me['id']}",
                               {"limit": 100})
+        return self._gradebook(cols, grades)
+
+    def _gradebook(self, cols, grades):
         by_col = {g.get("columnId"): g for g in grades}
         out = []
         for col in cols:
@@ -182,30 +273,35 @@ class Blackboard:
             if depth > max_depth or len(out) >= max_items:
                 return
             for item in self.get_all(path, {"limit": 200}):
-                title = item.get("title", "")
-                if title == "ultraDocumentBody":
-                    title = parent_titles[-1] if parent_titles else "Course page"
-                titles = parent_titles + [title] if title not in parent_titles[-1:] else parent_titles
-                ch = item.get("contentHandler") or {}
-                handler = ch.get("id", "")
-                out.append({
-                    "id": item.get("id"),
-                    "title": title,
-                    "path": " / ".join(titles),
-                    "body": item.get("body", "") or item.get("description", ""),
-                    "handler": handler,
-                    "created": item.get("created"),
-                    "modified": item.get("modified"),
-                    "hasChildren": item.get("hasChildren", False),
-                    "parentId": parent_id,
-                    "url": ch.get("url") or item.get("link") or "",
-                })
+                node, titles = self._content(item, parent_titles, parent_id)
+                out.append(node)
                 if item.get("hasChildren"):
                     walk(f"{API}/v1/courses/{course_id}/contents/{item['id']}/children",
                          titles, item["id"], depth + 1)
 
         walk(f"{API}/v1/courses/{course_id}/contents", [], None, 0)
         return out
+
+    @staticmethod
+    def _content(item, parent_titles, parent_id):
+        """One outline item, and the title path its children sit under."""
+        title = item.get("title", "")
+        if title == "ultraDocumentBody":
+            title = parent_titles[-1] if parent_titles else "Course page"
+        titles = parent_titles + [title] if title not in parent_titles[-1:] else parent_titles
+        ch = item.get("contentHandler") or {}
+        return {
+            "id": item.get("id"),
+            "title": title,
+            "path": " / ".join(titles),
+            "body": item.get("body", "") or item.get("description", ""),
+            "handler": ch.get("id", ""),
+            "created": item.get("created"),
+            "modified": item.get("modified"),
+            "hasChildren": item.get("hasChildren", False),
+            "parentId": parent_id,
+            "url": ch.get("url") or item.get("link") or "",
+        }, titles
 
     def attachments(self, course_id, content_id):
         items = self.get_all(f"{API}/v1/courses/{course_id}/contents/{content_id}/attachments")

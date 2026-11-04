@@ -3,10 +3,12 @@
 import base64
 import io
 import json
+import threading
 
 import anthropic
 
 MODEL = "claude-opus-5-5"
+_TALLY = threading.Lock()
 
 # The models Min can pick in Settings. Prices are US dollars per million tokens:
 # (input, output, cache read). A cheaper model costs less but writes shorter, blunter notes.
@@ -52,9 +54,10 @@ class AI:
         read = usage.cache_read_input_tokens or 0
         written = usage.cache_creation_input_tokens or 0
         fresh = usage.input_tokens + written  # writing to the cache is charged at the input rate
-        self.tokens_in += fresh + read
-        self.tokens_out += usage.output_tokens
-        self.cost += (fresh * price["in"] + read * price["cache"] + usage.output_tokens * price["out"]) / 1_000_000
+        with _TALLY:   # a sync asks several things at once
+            self.tokens_in += fresh + read
+            self.tokens_out += usage.output_tokens
+            self.cost += (fresh * price["in"] + read * price["cache"] + usage.output_tokens * price["out"]) / 1_000_000
 
     def _ask(self, content, max_tokens=16000, messages=None, system=SYSTEM):
         with self.client.beta.messages.stream(

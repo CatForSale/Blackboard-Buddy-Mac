@@ -1,5 +1,10 @@
 """Blackboard Buddy desktop app: a window around the dashboard, with syncing in the background."""
 
+import atexit
+import base64
+import gzip
+import secrets
+import codecs
 import html
 import json
 import os
@@ -14,6 +19,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,18 +30,43 @@ import online
 import vault as notebook
 
 AUTO_SYNC_AFTER = timedelta(hours=6)
-STATE = {"busy": False, "msg": "", "signin": False, "update": None}
+STATE = {"busy": False, "quiet": False, "msg": "", "signin": False, "update": None}  # quiet: the AI is writing after the page already updated
 window = None
 viewer = None      # the window Blackboard links open in (Api.open_inside)
 _maximised = False
 BACKUP_EVERY = 300          # seconds between kept copies of a board
 BACKUPS_KEPT = 20           # how many of those to hold on to, per board
+IS_WIN = sys.platform == "win32"
+NO_WINDOW = 0x08000000 if IS_WIN else 0     # CREATE_NO_WINDOW; anything but 0 is an error on a Mac
+DETACHED = 0x00000008 if IS_WIN else 0      # DETACHED_PROCESS
 
 
 def _file_name(name):
     """A board's name turned into something safe to call a file."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "board")).strip("-").lower()
     return (safe or "board")[:48]
+
+
+# The first offline board keeps the file it always had; any more go in a folder of their own.
+def _board_file(board):
+    board = str(board or "main")
+    if board == "main":
+        return main.DATA_DIR / "online-board.json"
+    if not re.fullmatch(r"[0-9a-f]{6,32}", board):
+        raise ValueError("not a board")
+    return main.DATA_DIR / "offline-boards" / f"{board}.json"
+
+
+def _boards():
+    kept = main.load_json(main.DATA_DIR / "offline-boards.json", [])
+    kept = [b for b in kept if isinstance(b, dict) and b.get("id")] if isinstance(kept, list) else []
+    if not any(b["id"] == "main" for b in kept):
+        kept.insert(0, {"id": "main", "name": "Offline board"})
+    return kept
+
+
+def _boards_save(boards):
+    _write_safely(main.DATA_DIR / "offline-boards.json", boards)
 
 
 def _write_safely(path, data):
@@ -70,21 +101,39 @@ def push(msg, busy=True):
 def on_log(msg):
     if msg.startswith("Please sign in"):
         push("Sign in to Blackboard in the window that opened", True)
+    elif msg.startswith("AI cost this run"):   # the last line of a check: nothing is still going on
+        push(friendly(msg), False)
     elif not msg.startswith(("Signed in as", "Dashboard ready")):
-        push(friendly(msg), True)
+        push(friendly(msg), not STATE["quiet"])
+
+
+def reload(path):
+    """Shows the new page - unless you're working on the Online or Notebook tab, where it waits for a tab switch."""
+    url = json.dumps(path.as_uri() + "#updated")
+    try:
+        window.evaluate_js(f"window.bbReloadTo ? bbReloadTo({url}) : location.replace({url})")
+    except Exception:
+        window.load_url(path.as_uri() + "#updated")
 
 
 def sync_worker(interactive):
+    def ready(path):   # Blackboard's part is on the page already; the AI keeps writing quietly after
+        STATE["quiet"] = True
+        reload(path)
     try:
+        backup_all("before a check")
         push("Checking Blackboard…")
-        path = main.run(sync=True, use_ai=True, interactive=interactive)
+        path = main.run(sync=True, use_ai=True, interactive=interactive, on_ready=ready)
         STATE["signin"] = False
         # Done before the page is reloaded, not after. The fresh page asks what is going on as
         # soon as it loads, and if it is told "still working" it puts up a message that nothing
         # is left to take down again - the old copy that would have said so is gone.
         STATE["busy"] = False
-        if path:
-            window.load_url(path.as_uri() + "#updated")
+        push("Up to date", False)    # take the spinner down even if the page can't be reloaded
+        if path and (not STATE["quiet"] or main.AI_NEW):
+            reload(path)
+        if main.settings().get("share"):          # classmates following you get this sync too
+            threading.Thread(target=share_push, daemon=True).start()
     except main.SignInNeeded:
         # signed out: ask in the app instead of popping a browser window out of nowhere
         STATE["signin"] = True
@@ -97,11 +146,17 @@ def sync_worker(interactive):
         main.log(f"Sync failed: {e!r}")
         push("Couldn't update. Check your internet and try ↻ again.", False)
     finally:
-        STATE["busy"] = False
+        STATE["busy"] = STATE["quiet"] = False
 
 
 def start_sync(interactive=True):
     if STATE["busy"]:
+        return False
+    if main.following():                         # ↻ fetches their latest shared notes instead of Blackboard
+        STATE["busy"] = True
+        threading.Thread(target=follow_worker, daemon=True).start()
+        return True
+    if not main.signed_in():                     # no Claude key: Online and Notebook only, nothing to fetch
         return False
     STATE["busy"] = True
     threading.Thread(target=sync_worker, args=(interactive,), daemon=True).start()
@@ -120,7 +175,8 @@ def check_update():
                                  headers={"User-Agent": "BlackboardBuddy", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=15) as r:
         rel = json.load(r)
-    zips = [a for a in rel.get("assets", []) if a["name"].lower().endswith(".zip")]
+    zips = [a for a in rel.get("assets", []) if a["name"].lower().endswith(".zip")
+            and ("mac" in a["name"].lower()) == (sys.platform == "darwin")]
     if not zips or _version(rel.get("tag_name", "")) <= _version(main.VERSION):
         return None
     notes = (rel.get("body") or "").strip().splitlines()
@@ -281,7 +337,7 @@ class Api:
     def open_materials(self):
         try:
             main.MATERIALS.mkdir(parents=True, exist_ok=True)
-            os.startfile(main.MATERIALS)
+            main.open_path(main.MATERIALS)
             return "ok"
         except OSError as e:
             main.log_quiet(f"open study files folder failed: {e!r}")
@@ -378,10 +434,10 @@ class Api:
         """Opens a downloaded study file in its own app (Word, PowerPoint...)."""
         f = Path(path).resolve()
         if f.is_relative_to(main.MATERIALS.resolve()) and f.exists():
-            os.startfile(f)
+            main.open_path(f)
 
     def open_calendar(self):
-        os.startfile(main.OUT_DIR / "deadlines.ics")
+        main.open_path(main.OUT_DIR / "deadlines.ics")
 
     # ---- Notebook
     def online_config(self, url, key):
@@ -416,41 +472,236 @@ class Api:
     def ol_vscode(self, title, files, how="code"):
         """Saves a board project's files to Documents\\Blackboard Buddy projects\\<name> and opens that folder in VS Code
         (or in File Explorer when VS Code isn't installed, or when how="folder"). The board stays the shared copy."""
-        import ctypes
-        buf = ctypes.create_unicode_buffer(260)
-        ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf)  # the real Documents folder, even when OneDrive moved it
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(title or "Project")).strip(" .")[:60] or "Project"
-        folder = Path(buf.value or Path.home() / "Documents") / "Blackboard Buddy projects" / name
-        folder.mkdir(parents=True, exist_ok=True)
-        for f in list(files or [])[:300]:
-            rel = Path(str(f.get("n", "")).replace("\\", "/"))
-            if not rel.parts or rel.anchor or ".." in rel.parts:  # anchor covers C:/x, /x and C:x
-                continue
-            target = folder / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(str(f.get("t", "")), encoding="utf-8")
+        folder = _proj_folder(title)
+        name = folder.name
+        _write_files(folder, files)
         if how == "folder":
-            os.startfile(folder)
+            main.open_path(folder)
             return f"Saved to Documents\\Blackboard Buddy projects\\{name}"
         exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe"
         code = str(exe) if exe.exists() else shutil.which("code")
+        if not IS_WIN and not code and Path("/Applications/Visual Studio Code.app").exists():
+            subprocess.Popen(["open", "-a", "Visual Studio Code", str(folder)])
+            return "Opened in VS Code"
         if code:
             subprocess.Popen([code, str(folder)], creationflags=0x08000000)
             return "Opened in VS Code"
-        os.startfile(folder)
+        main.open_path(folder)
         return "VS Code isn't installed, so the folder opened instead"
 
-    def ol_local_load(self):
-        return main.load_json(main.DATA_DIR / "online-board.json", [])
+    # ---------- running a project on this computer ----------
+    # The board's copy is the shared one; these write it to the project's folder, run a command there and
+    # stream what it prints back to the page (window.bbTerm), so any language installed here can run.
+    def term_start(self, key, title, files, cmd):
+        key, cmd = str(key or "")[:80], str(cmd or "").strip()
+        if not key or not cmd:
+            return {"error": "There's no command to run"}
+        old = _TERMS.get(key)
+        if old and old.poll() is None:
+            return {"error": "Something is still running here. Stop it first."}
+        cmd, missing = _check_tools(cmd)
+        if missing:
+            return {"error": missing}
+        folder = _proj_folder(title)
+        _write_files(folder, files)
+        started = time.time() * 1000
+        try:
+            p = subprocess.Popen(cmd, shell=True, cwd=folder, env=_child_env(), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
+                                 start_new_session=not IS_WIN)
+        except OSError as e:
+            return {"error": f"Couldn't start it: {e}"}
+        _TERMS[key] = p
+        threading.Thread(target=_term_pump, args=(key, p), daemon=True).start()
+        return {"ok": True, "folder": str(folder), "started": started, "cmd": cmd}
 
-    def ol_local_save(self, rows):
-        if isinstance(rows, list):
-            _write_safely(main.DATA_DIR / "online-board.json", rows)
+    def term_input(self, key, text):
+        p = _TERMS.get(str(key))
+        if not p or p.poll() is not None:
+            return "not running"
+        try:
+            p.stdin.write((str(text) + "\n").encode("utf-8"))
+            p.stdin.flush()
+        except OSError:
+            return "closed"
         return "ok"
 
-    def ol_local_saved_at(self):
+    def term_stop(self, key):
+        p = _TERMS.get(str(key))
+        if p and p.poll() is None:
+            _kill(p)
+        return "ok"
+
+    def proj_pull(self, title, since=0):
+        """Text files in the project's folder changed since `since` (ms): what a program wrote or a command made."""
+        folder = _proj_folder(title, make=False)
+        out = []
+        if not folder.is_dir():
+            return out
+        for root, dirs, names in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS and not d.startswith(".")]
+            for n in names:
+                f = Path(root) / n
+                try:
+                    st = f.stat()
+                    if st.st_size > 400_000 or st.st_mtime * 1000 < float(since or 0):
+                        continue
+                    data = f.read_bytes()
+                    if b"\x00" in data[:8192]:
+                        continue
+                    out.append({"n": f.relative_to(folder).as_posix(), "t": data.decode("utf-8").replace("\r\n", "\n")})
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if len(out) >= 300:
+                    return out
+        return out
+
+    def pc_tools(self):
+        return {n: bool(shutil.which(n)) for n in ("python", "py", "node", "npm", "java", "javac", "gcc", "g++",
+                                                    "dotnet", "go", "cargo", "rustc", "git")}
+
+    # ---------- code in and out of the board ----------
+    _SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", "env", "dist", "build", ".idea",
+                  ".vscode", ".next", "target", "bin", "obj"}
+
+    @staticmethod
+    def _safe_rel(name):
+        rel = Path(str(name or "").replace("\\", "/"))
+        return None if not rel.parts or rel.anchor or ".." in rel.parts else rel
+
+    def ol_export(self, name, files):
+        """Saves code from the board through a Save dialog: one file as itself, several as a .zip."""
+        files = [f for f in list(files or [])[:600] if self._safe_rel(f.get("n"))]
+        if not files:
+            return {"error": "There's no code in there to save."}
+        base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(name or "code")).strip(" .")[:60] or "code"
+        one = len(files) == 1
+        fname = Path(files[0]["n"]).name if one else base + ".zip"
+        kinds = ("All files (*.*)",) if one else ("Zip files (*.zip)",)
+        picked = window.create_file_dialog(webview.SAVE_DIALOG, directory=str(Path.home() / "Documents"),
+                                           save_filename=fname, file_types=kinds)
+        if not picked:
+            return {"cancelled": True}
+        target = Path(picked[0] if isinstance(picked, (list, tuple)) else picked)
+        try:
+            if one:
+                target.write_text(str(files[0].get("t", "")), encoding="utf-8")
+            else:
+                if target.suffix.lower() != ".zip":
+                    target = target.with_suffix(".zip")
+                with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
+                    for f in files:
+                        z.writestr(f"{base}/{self._safe_rel(f['n']).as_posix()}", str(f.get("t", "")))
+        except OSError as e:
+            return {"error": f"Couldn't save it: {e}"}
+        return {"saved": str(target), "msg": f"Saved {target.name}"}
+
+    def ol_import(self, how="files"):
+        """Picks code files, a folder or a .zip from this computer and hands back their text.
+        Pictures, build folders, binaries and anything over 400 KB are left out."""
+        if how == "folder":
+            picked = window.create_file_dialog(webview.FOLDER_DIALOG, directory=str(Path.home() / "Documents"))
+        else:
+            picked = window.create_file_dialog(webview.OPEN_DIALOG, directory=str(Path.home() / "Documents"),
+                                               allow_multiple=True)
+        if not picked:
+            return {"cancelled": True}
+        picked = [Path(p) for p in (picked if isinstance(picked, (list, tuple)) else [picked])]
+        out, skipped, size = [], 0, 0
+
+        def take(rel, data):
+            nonlocal skipped, size
+            rel = self._safe_rel(rel)
+            if (not rel or any(p in self._SKIP_DIRS for p in rel.parts[:-1]) or len(data) > 400_000
+                    or size + len(data) > 3_000_000 or len(out) >= 300 or b"\x00" in data[:4096]):
+                skipped += 1
+                return
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode("latin-1")
+            size += len(data)
+            out.append({"n": rel.as_posix(), "t": text})
+
+        name = picked[0].stem if len(picked) == 1 else "Imported code"
+        for p in picked:
+            if p.is_dir():
+                for f in sorted(p.rglob("*")):
+                    if f.is_file() and not (set(f.relative_to(p).parts[:-1]) & self._SKIP_DIRS):
+                        take(f.relative_to(p).as_posix(), f.read_bytes() if f.stat().st_size <= 400_000 else b"\x00")
+                    if len(out) >= 300:
+                        break
+            elif p.suffix.lower() == ".zip":
+                with zipfile.ZipFile(p) as z:
+                    names = [i for i in z.infolist() if not i.is_dir()]
+                    # a zip that holds one folder: drop that folder from the names
+                    tops = {i.filename.split("/")[0] for i in names}
+                    cut = len(next(iter(tops))) + 1 if len(tops) == 1 and all("/" in i.filename for i in names) else 0
+                    for i in names:
+                        take(i.filename[cut:], z.read(i) if i.file_size <= 400_000 else b"\x00")
+            elif p.is_file():
+                take(p.name, p.read_bytes() if p.stat().st_size <= 400_000 else b"\x00")
+        return {"name": name, "files": out, "skipped": skipped}
+
+    def ol_local_load(self, board="main"):
+        return main.load_json(_board_file(board), [])
+
+    def ol_boards(self):
+        return _boards()
+
+    def ol_board_new(self, name):
+        name = str(name or "").strip()[:60] or "New board"
+        bid = uuid.uuid4().hex[:12]
+        _write_safely(_board_file(bid), [])
+        _boards_save(_boards() + [{"id": bid, "name": name}])
+        return {"id": bid, "name": name}
+
+    def ol_board_rename(self, board, name):
+        name = str(name or "").strip()[:60]
+        if name:
+            _boards_save([{**b, "name": name} if b["id"] == board else b for b in _boards()])
+        return _boards()
+
+    def ol_board_remove(self, board):
+        """Takes a board off the list. Its file goes in with the backups rather than being deleted."""
+        if board == "main":
+            return {"msg": "The first board stays"}
+        f = _board_file(board)
+        if f.exists():
+            folder = main.DATA_DIR / "backups"
+            folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(folder / f"removed-board-{board}-{datetime.now():%Y%m%d-%H%M%S}.json"))
+        _boards_save([b for b in _boards() if b["id"] != board])
+        return {"msg": "Removed. A copy is kept in the backups folder"}
+
+    def ol_local_save(self, rows, board="main"):
+        if isinstance(rows, list):
+            f = _board_file(board)
+            # A board that suddenly loses most of its blocks is far more likely to be a page that
+            # loaded too early than a real clear-out, so keep what was there first.
+            old = main.load_json(f, [])
+            if isinstance(old, list) and len(old) >= 4 and len(rows) < len(old) / 2:
+                folder = main.DATA_DIR / "backups"
+                folder.mkdir(parents=True, exist_ok=True)
+                _write_safely(folder / f"offline-{f.stem}-before-shrink-{datetime.now():%Y%m%d-%H%M%S}.json", old)
+                main.log_quiet(f"board went from {len(old)} blocks to {len(rows)}: kept a copy of the bigger one")
+            _write_safely(f, rows)
+        return "ok"
+
+    def backups_open(self):
+        """Opens the folder with the automatic copies of everything."""
+        backup_all("asked")
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        main.open_path(BACKUPS)
+        return "ok"
+
+    def backup_now(self):
+        made = backup_all("asked", force=True)
+        return {"msg": f"Backed up to {made.name}" if made else "Couldn't make a backup"}
+
+    def ol_local_saved_at(self, board="main"):
         """When the offline board was last written, in milliseconds, or 0 if it never was."""
-        f = main.DATA_DIR / "online-board.json"
+        f = _board_file(board)
         try:
             return int(f.stat().st_mtime * 1000)
         except OSError:
@@ -509,7 +760,7 @@ class Api:
     def board_backup_folder(self):
         folder = main.DATA_DIR / "backups"
         folder.mkdir(parents=True, exist_ok=True)
-        os.startfile(folder)
+        main.open_path(folder)
         return str(folder)
 
     def nb_list(self):
@@ -529,7 +780,7 @@ class Api:
 
     def nb_open_folder(self):
         notebook.init()
-        os.startfile(notebook.ROOT)
+        main.open_path(notebook.ROOT)
 
     def check_update(self):
         if not main.UPDATE_REPO:
@@ -548,6 +799,9 @@ class Api:
             return "Updates only work in the installed app."
         if not info["url"].startswith("https://github.com/"):
             return "That download doesn't come from GitHub."
+        if not IS_WIN:
+            main.open_path(f"https://github.com/{main.UPDATE_REPO}/releases/latest")
+            return "The download page is open in your browser. Unzip it and drag the new app into Applications."
         if STATE["busy"]:
             return "Busy syncing. Try again in a minute."
         work = Path(tempfile.mkdtemp(prefix="bb-update-"))
@@ -574,9 +828,160 @@ tasklist /FI "PID eq {os.getpid()}" | find "{os.getpid()}" >nul && (timeout /t 1
 robocopy "{exe.parent}" "{app_dir}" /E /R:3 /W:1 /NFL /NDL /NJH /NJS >nul
 start "" "{app_dir / 'Blackboard Buddy.exe'}"
 """, encoding="utf-8")
-        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=NO_WINDOW | DETACHED)
         threading.Timer(0.5, window.destroy).start()
         return "ok"
+
+    def study_save(self, state):
+        """Your flashcard progress, focus minutes and daily goal (data/study.json)."""
+        if not isinstance(state, dict) or len(json.dumps(state)) > 3_000_000:
+            return False
+        main.save_json(main.DATA_DIR / "study.json", state)
+        return True
+
+    # ---------- sharing ----------
+    def share_status(self):
+        sh, f = main.settings().get("share"), main.following()
+        return {"share": {k: sh.get(k) for k in ("code", "updated", "size")} if sh else None,
+                "follow": {k: f.get(k) for k in ("code", "name", "updated", "synced")} if f else None,
+                "has_key": main.signed_in(), "has_sync": main.SNAPSHOT.exists()}
+
+    def share_start(self):
+        if main.settings().get("share"):
+            return self.share_status()
+        if not main.SNAPSHOT.exists():
+            return {"error": "Sync with Blackboard once first, so there is something to share."}
+        key = secrets.token_urlsafe(32)
+        try:
+            code = _rpc("share_create", p_secret=key, p_name=os.getenv("USER_NAME") or "A classmate")
+            _set("share", {"code": code, "secret": key})
+            share_push()
+        except ShareError as e:
+            return {"error": str(e)}
+        return self.share_status()
+
+    def share_now(self):
+        try:
+            share_push()
+        except ShareError as e:
+            return {"error": str(e)}
+        return self.share_status()
+
+    def share_stop(self):
+        sh = main.settings().get("share")
+        if sh:
+            try:
+                _rpc("share_stop", p_code=sh["code"], p_secret=sh["secret"])
+            except ShareError as e:
+                return {"error": str(e)}
+        _set("share", None)
+        return self.share_status()
+
+    def follow(self, code):
+        code = re.sub(r"[^A-Za-z0-9]", "", str(code or "")).upper()
+        if len(code) != 8:
+            return {"error": "A share code is 8 letters and numbers, like ABCD-2345."}
+        if (main.settings().get("share") or {}).get("code") == code:
+            return {"error": "That's your own code. Give it to classmates instead."}
+        if STATE["busy"]:
+            return {"error": "Busy. Try again in a minute."}
+        old = main.load_json(main.SETTINGS, {}).get("follow")
+        _set("follow", {"code": code})
+        STATE["busy"] = True
+        try:
+            follow_pull(force=True)
+        except ShareError as e:
+            _set("follow", old)
+            msg = str(e)
+            return {"error": "No one is sharing with that code. Check it, or ask them for it again." if "stopped sharing" in msg else msg}
+        except Exception as e:
+            _set("follow", old)
+            main.log(f"Follow failed: {e!r}")
+            return {"error": "Couldn't get their notes. Try again."}
+        finally:
+            STATE["busy"] = False
+        return {"ok": True, **self.share_status()}
+
+    def unfollow(self):
+        _set("follow", None)
+        try:
+            main.run(sync=False, use_ai=False) if main.signed_in() and main.SNAPSHOT.exists() else main.build_lite()
+        except Exception as e:
+            main.log_quiet(f"rebuild after unfollow failed: {e!r}")
+        return {"ok": True, **self.share_status()}
+
+    def follow_now(self):
+        return start_sync()
+
+    # ---------- uninstall ----------
+    def uninstall_info(self):
+        """What uninstalling could remove, with sizes, and whether this copy can be uninstalled at all."""
+        out = []
+        for key, paths in _uninstall_parts().items():
+            out.append({"key": key, "size": sum(_size(x) for x in paths),
+                        "where": str(paths[0]) if paths else "", "found": any(x.exists() for x in paths)})
+        why = _uninstall_blocked()
+        return {"parts": out, "blocked": why, "custom_materials": main.MATERIALS != main.LOCAL / "materials"}
+
+    def uninstall(self, choices, backup_first=True):
+        """Sends the chosen parts to the Recycle Bin once the app has closed. The app files always go."""
+        why = _uninstall_blocked()
+        if why:
+            return {"error": why}
+        if STATE["busy"]:
+            return {"error": "Busy syncing. Try again in a minute."}
+        parts = _uninstall_parts()
+        keep = set(choices or []) & set(parts)
+        keep.add("app")
+        saved = ""
+        if backup_first:
+            made = backup_all("uninstall", force=True)
+            if not made:
+                return {"error": "Couldn't make the final backup, so nothing was removed."}
+            dest = _desktop() / made.name.replace("Blackboard Buddy ", "Blackboard Buddy final backup ")
+            try:
+                shutil.copy2(made, dest)
+                saved = str(dest)
+            except OSError as e:
+                return {"error": f"Couldn't put the backup on your Desktop ({e.strerror}), so nothing was removed."}
+        paths = [x for k in parts if k in keep for x in parts[k] if x.exists()]
+        for x in paths:     # never a whole user folder, a drive, or the app's own LocalAppData folder
+            x = x.resolve()
+            if x == Path(x.anchor) or x in {main.LOCAL.resolve(), Path.home().resolve(), _desktop().resolve(), _proj_folder('x', make=False).parent.parent.resolve()}:
+                return {"error": f"Refused to remove {x}. Nothing was removed."}
+        app_dir = Path(sys.executable).parent
+        ps1 = Path(tempfile.gettempdir()) / f"bb-uninstall-{os.getpid()}.ps1"
+        q = lambda x: "'" + str(x).replace("'", "''") + "'"
+        ps1.write_text(f"""$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName Microsoft.VisualBasic, System.Windows.Forms
+while (Get-Process -Id {os.getpid()}) {{ Start-Sleep -Milliseconds 500 }}
+Start-Sleep -Seconds 2
+$left = @()
+foreach ($p in @({", ".join(q(x) for x in paths)})) {{
+  for ($i = 0; $i -lt 10 -and (Test-Path -LiteralPath $p); $i++) {{
+    if (Test-Path -LiteralPath $p -PathType Container) {{
+      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    }} else {{
+      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    }}
+    if (Test-Path -LiteralPath $p) {{ Start-Sleep -Seconds 1 }}
+  }}
+  if (Test-Path -LiteralPath $p) {{ $left += $p }}
+}}
+foreach ($d in @({q(app_dir)}, {q(main.LOCAL)})) {{
+  if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force)) {{ Remove-Item -LiteralPath $d }}
+}}
+$msg = "Blackboard Buddy has been uninstalled. What was removed is in the Recycle Bin, in case you need it back."
+if ({q(saved)}) {{ $msg += "`n`nYour final backup is on the Desktop:`n" + {q(saved)} }}
+if ($left) {{ $msg += "`n`nThese couldn't be removed (maybe still open somewhere):`n" + ($left -join "`n") }}
+[System.Windows.Forms.MessageBox]::Show($msg, 'Blackboard Buddy') | Out-Null
+Remove-Item -LiteralPath $PSCommandPath
+""", encoding="utf-8-sig")
+        main.log_quiet(f"uninstall: {sorted(keep)}")
+        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(ps1)],
+                         creationflags=NO_WINDOW | DETACHED)
+        threading.Timer(0.8, window.destroy).start()
+        return {"ok": True, "saved": saved}
 
     def win_minimize(self):
         window.minimize()
@@ -626,7 +1031,13 @@ start "" "{app_dir / 'Blackboard Buddy.exe'}"
                                                      wintypes.WPARAM, wintypes.LPARAM]
             windll.user32.DefWindowProcW.restype = wintypes.LPARAM
             # BeginInvoke, because the move loop does not come back until the drag is over
-            form.BeginInvoke(Action(lambda: windll.user32.DefWindowProcW(hwnd, 0x0112, 0xF012, 0)))
+            # Only if the button is still down when Windows gets to it: a move started after the button
+            # is up never ends, and the window then follows the mouse around until the next click.
+            def go():
+                btn = 0x02 if windll.user32.GetSystemMetrics(23) else 0x01     # left/right swapped?
+                if windll.user32.GetAsyncKeyState(btn) & 0x8000:
+                    windll.user32.DefWindowProcW(hwnd, 0x0112, 0xF012, 0)
+            form.BeginInvoke(Action(go))
             return True
         except Exception as e:
             main.log_quiet(f"Could not start a window drag: {e}")
@@ -740,24 +1151,121 @@ start "" "{app_dir / 'Blackboard Buddy.exe'}"
     def win_state(self):
         return _zoomed()
 
-    def setup(self, key, url, name=""):
-        """First run: save the name, Blackboard address and (optionally) the Claude key, then sync."""
+    def set_name(self, name):
+        name = " ".join((name or "").split())[:30]
+        if not name:
+            return "Enter a name"
+        main.set_env("USER_NAME", name)
+        return "ok"
+
+    def profile_save(self, p):
+        """The profile card from Settings: kept in data/, so the backups carry it too."""
+        p = p if isinstance(p, dict) else {}
+        clip = lambda k, n: " ".join(str(p.get(k) or "").split())[:n]
+        name = clip("name", 30)
+        if not name:
+            return {"msg": "Enter a name"}
+        accent = str(p.get("accent") or "")
+        clean = {"name": name, "tag": clip("tag", 60), "course": clip("course", 60), "avatar": clip("avatar", 4),
+                 "accent": accent if re.fullmatch(r"#[0-9a-fA-F]{6}", accent) else "#d71921",
+                 "banner": clip("banner", 20), "pattern": clip("pattern", 20),
+                 "shape": p.get("shape") if p.get("shape") in ("round", "square", "hex") else "round"}
+        pic = lambda k, n: v if isinstance(v := p.get(k), str) and len(v) <= n and re.fullmatch(
+            r"data:image/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+", v) else ""
+        hexc = lambda k, d: v if re.fullmatch(r"#[0-9a-fA-F]{6}", v := str(p.get(k) or "")) else d
+        badges = p.get("badges") if isinstance(p.get("badges"), list) else []
+        clean.update(avatarImg=pic("avatarImg", 300_000), bannerImg=pic("bannerImg", 700_000),
+                     g1=hexc("g1", "#7f5af0"), g2=hexc("g2", "#2cb67d"),
+                     font=p.get("font") if p.get("font") in ("dot", "sans", "serif", "mono", "round") else "dot",
+                     effect=p.get("effect") if p.get("effect") in ("none", "glow", "shimmer", "ring", "float") else "none",
+                     badges=[" ".join(str(x).split())[:18] for x in badges[:4] if str(x).strip()])
+        main.set_env("USER_NAME", name)
+        main.save_json(main.DATA_DIR / "profile.json", clean)
+        if not STATE["busy"]:       # a sync that's running builds the page with it anyway
+            try:
+                main.run(sync=False, use_ai=False)
+            except Exception as e:
+                main.log_quiet(f"profile_save rebuild failed: {e!r}")
+        return {"ok": True, "profile": clean}
+
+    def backups_list(self):
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        out = []
+        for f in sorted(BACKUPS.glob("Blackboard Buddy *.zip"), reverse=True)[:40]:
+            st = f.stat()
+            out.append({"file": f.name, "when": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="minutes"), "size": st.st_size})
+        return out
+
+    def backup_restore(self, file):
+        """Puts a backup back. What is there now is zipped first, and files the backup doesn't have are left alone."""
+        f = BACKUPS / Path(str(file or "")).name
+        if not f.is_file() or not re.fullmatch(r"Blackboard Buddy [\d -]+\.zip", f.name):
+            return {"msg": "Couldn't find that backup"}
+        if STATE["busy"]:
+            return {"msg": "Busy checking Blackboard. Try again in a minute."}
+        if not backup_all("before loading a backup", force=True):
+            return {"msg": "Couldn't back up what you have now, so nothing was changed"}
+        roots, n = {"data": main.DATA_DIR, "Notebook": notebook.ROOT}, 0
+        try:
+            with zipfile.ZipFile(f) as z:
+                for i in z.infolist():
+                    top, _, rest = i.filename.partition("/")
+                    root = roots.get(top)
+                    if i.is_dir() or not root or not rest:
+                        continue
+                    dest = (root / rest).resolve()
+                    if not dest.is_relative_to(root.resolve()):
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(z.read(i))
+                    n += 1
+        except (OSError, zipfile.BadZipFile) as e:
+            main.log_quiet(f"loading {f.name} failed: {e!r}")
+            return {"msg": "That backup couldn't be read. A copy of what you had was kept"}
+        main.log_quiet(f"loaded backup {f.name}: {n} files")
+        try:
+            main.run(sync=False, use_ai=False) if main.signed_in() else main.build_lite()
+        except Exception as e:
+            main.log_quiet(f"rebuild after loading a backup failed: {e!r}")
+        return {"ok": True, "msg": f"Loaded {n} files", "count": n}
+
+    def unlock(self, key, url):
+        """From the locked app: check and save the Claude key and the Blackboard address, then the first check."""
+        u = urlparse((url or "").strip())
+        if u.scheme != "https" or not u.netloc:
+            return "Enter the full Blackboard address, starting with https://"
+        r = self.account_add("My Claude account", key)
+        if not r.get("ok"):
+            return r.get("error") or "That key didn't work"
+        main.BB_URL = f"https://{u.netloc}"
+        main.set_env("BB_URL", main.BB_URL)
+        start_sync()
+        return "ok"
+
+    def setup(self, key, url, name="", lite=False):
+        """First run: save the name, Blackboard address and the Claude key, then sync. Without a key
+        (lite) it opens straight onto Online and Notebook, and the rest unlocks once a key is added."""
         name = " ".join((name or "").split())[:30]
         if not os.getenv("USER_NAME"):
             if not name:
                 return "Enter your name"
             main.set_env("USER_NAME", name)
+        if lite:
+            path = main.build_lite()
+            threading.Thread(target=lambda: (time.sleep(.3), window.load_url(path.as_uri())), daemon=True).start()
+            return "lite"
+        if not main.signed_in() and not (key or "").strip():
+            return "Enter your Claude API key, or go back and pick No"
         if url is not None and not os.getenv("BB_URL"):
             u = urlparse((url or "").strip())
             if u.scheme != "https" or not u.netloc:
                 return "Enter the full address, starting with https://"
             main.BB_URL = f"https://{u.netloc}"
             main.set_env("BB_URL", main.BB_URL)
-        key = (key or "").strip()
-        if key:
-            if not key.startswith("sk-ant-"):
-                return "That doesn't look like a Claude API key. It starts with sk-ant-"
-            main.set_env("ANTHROPIC_API_KEY", key)
+        if (key or "").strip():
+            r = self.account_add("My Claude account", key)
+            if not r.get("ok"):
+                return r.get("error") or "That key didn't work"
         start_sync()
         return "ok"
 
@@ -790,40 +1298,395 @@ small{{display:block;color:var(--muted);margin-top:6px;font-size:12.5px}}
 .btn{{margin-top:22px;width:100%;padding:12px;border:0;border-radius:999px;background:var(--text);color:var(--bg);
  font:12px "Space Mono",Consolas,monospace;letter-spacing:.1em;text-transform:uppercase;cursor:pointer}}
 .err{{color:#d71921;font-size:13px;min-height:1em;margin:10px 0 0}}
+.two{{display:flex;gap:10px}} .two .btn{{flex:1}} .btn.alt{{background:transparent;color:var(--text);border:1px solid var(--line)}}
 .dots{{display:flex;gap:8px;justify-content:center;margin:6px 0 18px}} .dots i{{width:9px;height:9px;border-radius:50%;background:var(--text);animation:blink 1.2s infinite}}
 .dots i:nth-child(2){{animation-delay:.2s}} .dots i:nth-child(3){{animation-delay:.4s}} @keyframes blink{{0%,80%,100%{{opacity:.2}}40%{{opacity:1}}}}
 #load{{display:{'none' if form else 'block'};text-align:center}}
 </style></head><body><div class="card">
-<div id="form" style="display:{'block' if form else 'none'}"><h1>Blackboard Buddy</h1>
+<div id="ask" style="display:{'block' if need_key else 'none'}"><h1>Blackboard Buddy</h1>
+ <p class="sub">Your week, deadlines, files and notes from Blackboard, in one app.</p>
+ <div style="display:{'block' if need_name else 'none'}"><label for="n0">Your name</label>
+ <input id="n0" autocomplete="off" spellcheck="false" maxlength="30" placeholder="What should the app call you?"></div>
+ <label>Do you have a Claude API key?</label>
+ <small>The week, deadlines, notes and Ask Claude use one. Without it you still get Online (group boards and code) and the Notebook, and you can add a key later to unlock the rest.</small>
+ <div class="two"><button class="btn alt" onclick="noKey()">No, not yet</button><button class="btn" onclick="hasKey()">Yes</button></div>
+ <p id="err0" class="err"></p></div>
+<div id="form" style="display:{'block' if form and not need_key else 'none'}"><h1>Blackboard Buddy</h1>
  <p class="sub">Your week, deadlines, files and notes from Blackboard, in one app.</p>
  <div style="display:{'block' if need_name else 'none'}"><label for="n">Your name</label>
  <input id="n" autocomplete="off" spellcheck="false" maxlength="30" placeholder="What should the app call you?"></div>
  <div style="display:{'block' if need_url else 'none'}"><label for="u">Your Blackboard address</label>
  <input id="u" value="{url}" autocomplete="off" spellcheck="false">
  <small>The address you use to open Blackboard, e.g. https://blackboard.uwe.ac.uk</small></div>
- <div style="display:{'block' if need_key else 'none'}"><label for="k">Claude API key (optional)</label>
+ <div style="display:{'block' if need_key else 'none'}"><label for="k">Claude API key</label>
  <input id="k" type="password" placeholder="sk-ant-…" autocomplete="off">
- <small>Needed for the briefing, notes, plans and Ask Claude. Get one at platform.claude.com → API keys. You can add it later in Settings.</small></div>
+ <small>Get one at platform.claude.com → API keys.</small></div>
  <p id="err" class="err"></p><button class="btn" onclick="save()">Continue</button></div>
 <div id="load"><div class="dots"><i></i><i></i><i></i></div><h1 style="font-size:24px">Getting your week ready</h1>
  <p class="sub" id="msg">A Blackboard window will open. Sign in there.</p></div>
 </div><script>
 function loading(){{document.getElementById('form').style.display='none';document.getElementById('load').style.display='block'}}
+const $id=i=>document.getElementById(i);
+function hasKey(){{$id('n').value=$id('n0').value;$id('ask').style.display='none';$id('form').style.display='block';
+ ($id('n').offsetParent?$id('n'):$id('k')).focus()}}
+async function noKey(){{const r=await pywebview.api.setup('',null,$id('n0').value,true);
+ if(r!=='lite')$id('err0').textContent=r;else{{$id('ask').innerHTML='<h1 style="font-size:24px">Opening…</h1>'}}}}
 async function save(){{const r=await pywebview.api.setup(document.getElementById('k').value,document.getElementById('u').value,document.getElementById('n').value);
  if(r==='ok')loading();else document.getElementById('err').textContent=r}}
-document.addEventListener('keydown',e=>{{if(e.key==='Enter')save()}});
+document.addEventListener('keydown',e=>{{if(e.key==='Enter'&&$id('form').style.display!=='none')save()}});
 window.bbStatus=(m)=>{{document.getElementById('msg').textContent=m}};
 </script></body></html>"""
 
 
+# ---------- sharing your notes with a code ----------
+class ShareError(Exception):
+    pass
+
+
+def _rpc(name, **args):
+    """Calls one of the share functions on the group server. No sign-in needed: the code (and, to
+    change a share, its key) is the permission."""
+    cfg = online.config(main.settings())
+    if not cfg:
+        raise ShareError("No group server is set up.")
+    req = urllib.request.Request(f"{cfg['url']}/rest/v1/rpc/{name}", data=json.dumps(args).encode(), method="POST",
+                                 headers={"apikey": cfg["key"], "Authorization": f"Bearer {cfg['key']}",
+                                          "Content-Type": "application/json", "User-Agent": "BlackboardBuddy"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            return json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        main.log_quiet(f"share {name} failed: {e.code} {body[:300]}")
+        if "PGRST202" in body or "Could not find the function" in body:
+            raise ShareError('Sharing needs a one-off update to the group server: open "Online setup.sql" from the app folder, '
+                             "paste all of it into Supabase > SQL Editor and press Run.")
+        if "not yours" in body:
+            raise ShareError("This share code isn't yours any more. Stop sharing and start again for a new code.")
+        if "too big" in body:
+            raise ShareError("Your notes are too big to share in one go.")
+        raise ShareError("The group server said no. Try again in a minute.")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise ShareError("Couldn't reach the group server. Are you online?")
+
+
+def _set(key, value):
+    cur = main.load_json(main.SETTINGS, {})
+    if value is None:
+        cur.pop(key, None)
+    else:
+        cur[key] = value
+    main.save_json(main.SETTINGS, cur)
+
+
+def share_push():
+    """Sends your latest sync to everyone following your code."""
+    sh = main.settings().get("share")
+    if not sh:
+        return None
+    payload = main.share_payload()
+    if not payload:
+        raise ShareError("Sync with Blackboard once first, so there is something to share.")
+    blob = base64.b64encode(gzip.compress(json.dumps(payload, default=str).encode("utf-8"))).decode()
+    when = _rpc("share_put", p_code=sh["code"], p_secret=sh["secret"], p_name=payload["from"] or "A classmate", p_data=blob)
+    _set("share", {**sh, "updated": when, "size": len(blob)})
+    main.log_quiet(f"shared notes sent: {len(blob) // 1024} KB")
+    return when
+
+
+def follow_pull(force=False):
+    """Fetches the notes of whoever you follow if they've changed, and remakes the page. Returns the new
+    page's path, or None when nothing changed."""
+    f = main.following()
+    if not f:
+        return None
+    when = _rpc("share_when", p_code=f["code"])
+    if not when:
+        raise ShareError(f"{f.get('name') or 'They'} stopped sharing. Stop following in Settings › Share to use your own sync.")
+    if when == f.get("updated") and not force and (main.SHARED / "snapshot.json").exists():
+        return None
+    rows = _rpc("share_get", p_code=f["code"]) or []
+    if not rows or not rows[0].get("data"):
+        raise ShareError("Nothing has been shared on that code yet. Ask them to sync once.")
+    row = rows[0]
+    try:
+        data = json.loads(gzip.decompress(base64.b64decode(row["data"])).decode("utf-8"))
+        assert data.get("v") == 1 and isinstance(data["snapshot"]["courses"], list) and isinstance(data["ai"], dict)
+    except Exception:
+        raise ShareError("The shared notes couldn't be read. Ask them to sync again.")
+    data = main.defang_share(data)
+    main.SHARED.mkdir(parents=True, exist_ok=True)
+    main.save_json(main.SHARED / "snapshot.json", data["snapshot"])
+    main.save_json(main.SHARED / "ai-latest.json", data["ai"])
+    _set("follow", {"code": f["code"], "name": (row.get("name") or "A classmate")[:40], "updated": row["updated_at"],
+                    "synced": data.get("synced")})
+    return main.run(sync=False, use_ai=False)
+
+
+def follow_worker():
+    f = main.following() or {}
+    try:
+        push(f"Getting {f.get('name') or 'their'}'s latest notes…")
+        path = follow_pull()
+        STATE["busy"] = False
+        push("Up to date", False)
+        if path:
+            reload(path)
+    except ShareError as e:
+        push(str(e), False)
+    except Exception as e:
+        main.log(f"Follow update failed: {e!r}")
+        push("Couldn't get their latest notes. Try ↻ again.", False)
+    finally:
+        STATE["busy"] = False
+
+
+def follow_loop():
+    """Keeps a follower's app in step with the person they follow: shortly after start, then every 15 minutes."""
+    time.sleep(25)
+    while True:
+        if main.following() and not STATE["busy"]:
+            start_sync(interactive=False)
+        time.sleep(15 * 60)
+
+
+# ---------- uninstall ----------
+def _uninstall_blocked():
+    """Why this copy can't be uninstalled from inside the app, or '' when it can."""
+    if not getattr(sys, "frozen", False):
+        return "Uninstall only works in the installed app."
+    if not IS_WIN:
+        return ("On a Mac, quit the app and drag Blackboard Buddy from Applications to the Bin. "
+                f"Your data stays in {main.LOCAL} until you remove that folder too.")
+    app_dir = Path(sys.executable).parent
+    if (app_dir / ".git").exists() or any(app_dir.glob("*.py")):
+        return "This is the developer copy (it sits next to the source code), so uninstall is switched off here."
+    return ""
+
+
+def _uninstall_parts():
+    """Each choice in the uninstall window, and the files and folders it stands for."""
+    app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else main.HERE
+    mine = {main.ENV, main.DATA_DIR, notebook.ROOT}
+    app = [x for x in app_dir.iterdir() if x not in mine] if app_dir.is_dir() else []
+    if main.OUT_DIR not in app:
+        app.append(main.OUT_DIR)
+    app += [main.LOCAL / "run.log"]
+    return {
+        "app": app,
+        "settings": [main.ENV, main.SETTINGS, main.ACCOUNTS],
+        "data": [main.DATA_DIR],
+        "notebook": [notebook.ROOT],
+        "materials": [main.MATERIALS],
+        "backups": [BACKUPS],
+        "browser": [main.LOCAL / "webview", main.PROFILE_DIR],
+        "projects": [_proj_folder("x", make=False).parent],
+    }
+
+
+def _size(path):
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
+def _desktop():
+    if not IS_WIN:
+        return Path.home() / "Desktop"
+    import ctypes
+    buf = ctypes.create_unicode_buffer(260)
+    ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buf)  # the real Desktop, even when OneDrive moved it
+    return Path(buf.value or Path.home() / "Desktop")
+
+
+# ---------- projects on this computer ----------
+_TERMS = {}     # block id -> the process running in its folder
+
+
+def _proj_folder(title, make=True):
+    if IS_WIN:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf)  # the real Documents folder, even when OneDrive moved it
+        docs = Path(buf.value or Path.home() / "Documents")
+    else:
+        docs = Path.home() / "Documents"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(title or "Project")).strip(" .")[:60] or "Project"
+    folder = docs / "Blackboard Buddy projects" / name
+    if make:
+        folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _write_files(folder, files):
+    for f in list(files or [])[:300]:
+        rel = Path(str(f.get("n", "")).replace("\\", "/"))
+        if not rel.parts or rel.anchor or ".." in rel.parts:  # anchor covers C:/x, /x and C:x
+            continue
+        target = folder / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(f.get("t", "")), encoding="utf-8")
+
+
+def _child_env():
+    """What a project's program sees: the usual environment, minus anything of the app's own (keys above all)."""
+    env = {k: v for k, v in os.environ.items()
+           if not re.search(r"KEY|TOKEN|SECRET|PASSWORD|ANTHROPIC|SUPABASE|^BB_|^_MEI|^_PYI", k, re.I)}
+    for k in ("PYTHONHOME", "PYTHONPATH"):
+        env.pop(k, None)
+    env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    return env
+
+
+_TOOL_HELP = {"python3": ("Python", "python.org/downloads"), "python": ("Python", "python.org/downloads"), "py": ("Python", "python.org/downloads"),
+              "node": ("Node.js", "nodejs.org"), "npm": ("Node.js", "nodejs.org"), "npx": ("Node.js", "nodejs.org"),
+              "java": ("Java", "adoptium.net"), "javac": ("Java (the JDK)", "adoptium.net"),
+              "gcc": ("a C compiler", "winlibs.com"), "g++": ("a C++ compiler", "winlibs.com"),
+              "dotnet": (".NET", "dot.net"), "go": ("Go", "go.dev/dl"), "cargo": ("Rust", "rustup.rs"),
+              "rustc": ("Rust", "rustup.rs"), "git": ("Git", "git-scm.com"), "ruby": ("Ruby", "rubyinstaller.org"),
+              "php": ("PHP", "php.net")}
+
+
+def _check_tools(cmd):
+    """Says which tool isn't installed, before cmd.exe gives its own puzzling message. Prefers the py launcher,
+    which is there with every python.org install, over a bare `python` that may only be the Store's stand-in."""
+    if re.match(r"\s*python(\.exe)?\s", cmd + " ", re.I) and shutil.which("py"):
+        cmd = re.sub(r"^\s*python(\.exe)?", "py", cmd, count=1, flags=re.I)
+    elif not IS_WIN and re.match(r"\s*python\s", cmd + " ") and not shutil.which("python") and shutil.which("python3"):
+        cmd = re.sub(r"^\s*python", "python3", cmd, count=1)      # a Mac has python3 but no python
+    for part in re.split(r"&&|\|\||[|&]", cmd):
+        word = part.strip().strip('"').split(" ")[0].lower().removesuffix(".exe")
+        if word in _TOOL_HELP and not shutil.which(word):
+            what, where = _TOOL_HELP[word]
+            return cmd, f"{what} isn't on this computer yet. Install it from {where}, then try again."
+    return cmd, None
+
+
+def _kill(p):
+    if not IS_WIN:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)     # the shell and whatever it started
+        except OSError:
+            p.kill()
+        return
+    subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True,
+                   creationflags=NO_WINDOW)
+
+
+def _term_pump(key, p):
+    def send(text=None, code=None):
+        try:
+            window.evaluate_js(f"window.bbTerm && bbTerm({json.dumps(key)}, {json.dumps(text)}, {json.dumps(code)})")
+        except Exception:
+            pass
+    dec, shown = codecs.getincrementaldecoder("utf-8")("replace"), 0
+    while True:
+        chunk = p.stdout.read1(65536)
+        if not chunk:
+            break
+        shown += len(chunk)
+        if shown <= 2_000_000:
+            send(dec.decode(chunk))
+        elif shown - len(chunk) <= 2_000_000:
+            send("\n[That's a lot of output: the rest isn't shown]\n")
+    rest = dec.decode(b"", final=True)
+    if rest:
+        send(rest)
+    send(None, p.wait())
+
+
+atexit.register(lambda: [_kill(p) for p in _TERMS.values() if p.poll() is None])
+
+
+# ---------- copies of everything you make ----------
+# Your notebook, the offline board, the copies of group boards, settings and the AI's notes, zipped
+# every so often into a folder outside the app's own. Updating or rebuilding the app never touches it.
+BACKUPS = main.LOCAL / "Backups"
+KEEP_BACKUPS = 60
+_backup_lock = threading.Lock()
+
+
+def _backup_sources():
+    skip = {"run.log", "snapshot.json"}          # the log, and what the next sync fetches again anyway
+    for root, label in ((main.DATA_DIR, "data"), (notebook.ROOT, "Notebook")):
+        if root.exists():
+            for f in root.rglob("*"):
+                if f.is_file() and f.name not in skip and f.stat().st_size < 50_000_000:
+                    yield f, f"{label}/{f.relative_to(root).as_posix()}"
+
+
+def backup_all(reason="timer", force=False):
+    """Zips everything worth keeping, unless nothing has changed since the last copy. Returns the zip."""
+    with _backup_lock:
+        try:
+            files = list(_backup_sources())
+            mark = f"{len(files)}:{sum(f.stat().st_size for f, _ in files)}:{max((f.stat().st_mtime for f, _ in files), default=0):.0f}"
+            BACKUPS.mkdir(parents=True, exist_ok=True)
+            stamp = BACKUPS / ".last"
+            if not force and stamp.exists() and stamp.read_text() == mark:
+                return None
+            target = BACKUPS / f"Blackboard Buddy {datetime.now():%Y-%m-%d %H%M%S}.zip"
+            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
+                for f, name in files:
+                    try:
+                        z.write(f, name)
+                    except OSError:
+                        pass
+            stamp.write_text(mark)
+            old = sorted(BACKUPS.glob("Blackboard Buddy *.zip"))
+            for f in old[:-KEEP_BACKUPS]:
+                f.unlink(missing_ok=True)
+            main.log_quiet(f"backup ({reason}): {target.name}, {len(files)} files")
+            return target
+        except Exception as e:
+            main.log_quiet(f"backup failed: {e!r}")
+            return None
+
+
+def backup_loop():
+    backup_all("start")
+    while True:
+        time.sleep(15 * 60)
+        backup_all()
+
+
+# The group board lives on Supabase, not on anyone's computer, so a group carries on whoever has the app open.
+# A free Supabase project goes to sleep after about a week with no visits, though, and then nobody can get in
+# until it is woken by hand. Every copy of the app looks in once at start and once a day, which keeps it awake
+# for as long as anyone in any group uses the app. It reads nothing: without a sign-in the answer is empty.
+def online_keepalive():
+    while True:
+        try:
+            cfg = online.config(main.settings())
+            if cfg:
+                req = urllib.request.Request(cfg["url"] + "/rest/v1/groups?select=id&limit=1",
+                                             headers={"apikey": cfg["key"], "Authorization": "Bearer " + cfg["key"]})
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        r.read(200)
+                except urllib.error.HTTPError:
+                    pass      # "permission denied" comes from the database itself, which is the visit that counts
+        except Exception as e:
+            main.log_quiet(f"group server check-in failed: {e!r}")
+        time.sleep(24 * 3600)
+
+
 def on_start():
     _restore_resizing()
+    threading.Thread(target=backup_loop, daemon=True).start()
+    threading.Thread(target=online_keepalive, daemon=True).start()
     main.adopt_env_key()
     has_dashboard = (main.OUT_DIR / "dashboard.html").exists()
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=update_loop, daemon=True).start()
+    threading.Thread(target=follow_loop, daemon=True).start()
     if not has_dashboard and (not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("BB_URL") or not os.getenv("USER_NAME")):
         return  # the welcome page asks for the Blackboard address and key, then starts the sync
+    if not main.signed_in():
+        return  # no Claude key: Online and Notebook only until one is added
     synced = last_synced()
     if not has_dashboard or not synced or datetime.now() - synced > AUTO_SYNC_AFTER:
         start_sync(interactive=not has_dashboard)
@@ -956,6 +1819,8 @@ def _find_window(pid=None):
 
 
 def _restore_resizing():
+    if not IS_WIN:
+        return
     from ctypes import windll
     # WS_SYSMENU matters as much as the rest: without the system menu Windows ignores SC_MOVE
     # and SC_SIZE, so handing it a drag does nothing and none of its snapping can happen.
@@ -986,7 +1851,7 @@ def wait_for_profile(seconds=6.0):
     closed, and then the window opens empty with nothing to show for it. Wait for the lock."""
     from ctypes import windll
     lock = main.LOCAL / "webview" / "EBWebView" / "lockfile"
-    if not lock.exists():
+    if not IS_WIN or not lock.exists():
         return True
     GENERIC_READ, OPEN_EXISTING, INVALID = 0x80000000, 3, -1
     waited = 0.0
@@ -1034,7 +1899,7 @@ def save_on_close():
         got = json.loads(raw)
         rows = got.get("rows") or []
         if got.get("mode") == "local":
-            _write_safely(main.DATA_DIR / "online-board.json", rows)
+            _write_safely(_board_file(got.get("board") or "main"), rows)
         if rows:
             folder = main.DATA_DIR / "backups"
             folder.mkdir(parents=True, exist_ok=True)
@@ -1054,6 +1919,8 @@ def start_colour():
 def only_one_copy():
     """True if this is the only copy running. A second one would fight the first for the
     browser's data folder and open as an empty window, so it bows out and raises the first."""
+    if not IS_WIN:
+        return True        # macOS itself only ever opens one copy of an app
     from ctypes import windll
     handle = windll.kernel32.CreateMutexW(None, True, "BlackboardBuddy.OneCopy")
     if windll.kernel32.GetLastError() == 183:          # ERROR_ALREADY_EXISTS
@@ -1090,16 +1957,23 @@ def run():
         flags = (flags + " --enable-features=msWebView2EnableDraggableRegions").strip()
         STATE["drag_regions"] = True
     os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = flags
-    main.LISTENERS.append(on_log)
     dashboard = main.OUT_DIR / "dashboard.html"
+    card = main.DATA_DIR / "profile.json"
+    if dashboard.exists() and card.exists() and card.stat().st_mtime > dashboard.stat().st_mtime:
+        try:
+            main.run(sync=False, use_ai=False)
+            main.log_quiet("launch: remade the page for a newer profile card")
+        except Exception as e:
+            main.log_quiet(f"launch: couldn't remake the page for the profile card: {e!r}")
+    main.LISTENERS.append(on_log)
     if dashboard.exists():
         window = webview.create_window("Blackboard Buddy", url=dashboard.as_uri(), js_api=Api(),
                                        width=1180, height=860, min_size=(420, 560), background_color=start_colour(),
-                                       frameless=True, easy_drag=False)
+                                       frameless=IS_WIN, easy_drag=False)
     else:
         window = webview.create_window("Blackboard Buddy", html=welcome_page(not os.getenv("ANTHROPIC_API_KEY"), not os.getenv("BB_URL"), not os.getenv("USER_NAME")),
                                        js_api=Api(), width=1180, height=860, min_size=(420, 560),
-                                       background_color=start_colour(), frameless=True, easy_drag=False)
+                                       background_color=start_colour(), frameless=IS_WIN, easy_drag=False)
     # closing the app closes the Blackboard window too, so nothing is left running in the background
     window.events.closed += lambda: viewer in webview.windows and viewer.destroy()
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True

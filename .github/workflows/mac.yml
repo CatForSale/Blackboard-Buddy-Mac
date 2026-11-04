@@ -1,0 +1,22 @@
+# Builds the Mac app on GitHub's Macs, for both kinds of chip. Start it from the Actions tab
+# ("Mac app" > Run workflow); the two zips appear under the run's Artifacts when it finishes.
+name: Mac app
+on: workflow_dispatch
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-15, macos-15-intel]      # Apple silicon, Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python build_mac.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.os }}
+          path: dist/Blackboard Buddy - mac*.zip

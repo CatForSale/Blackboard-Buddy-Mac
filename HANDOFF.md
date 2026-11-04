@@ -1129,3 +1129,369 @@ corner search (including checklists), and boxes sizing themselves both ways. All
   (`sync_hours` 12/24/48/72/168; `background_loop` already handles any number).
 - Testing note: a running app rewrites `output/dashboard.html` from its own (older) code after a sync, so browser tests
   should use a copy of the freshly built page.
+
+### Round 20 (3 Nov, ~01:00): faster checks, style bar, backups, no-key mode, code in/out
+- **Faster Blackboard check.** `blackboard.read_courses` fetches gradebook, marks, announcements and every outline level for
+  all modules side by side from inside the signed-in page (`get_many` = a pool of 8 `fetch`es, falls back to one at a time).
+  `main.run` shows the Blackboard part as soon as it's read (`on_ready`), then `run_ai` writes plans/notes/briefing four at
+  a time (`ThreadPoolExecutor(4)`, `ai._TALLY` lock on the cost tally). Not yet timed against a real sync.
+- **Busy pointer / pill.** The spinning arc shows for 5 s per job only. The "AI cost" line is the end of a check, pushed as
+  not-busy, and `sync_worker` always pushes "Up to date" before reloading. The pill's watchdog gives up on a state check that
+  doesn't answer in 6 s.
+- **Lost board/notebook after an update - cause and fix.** After a check the page reloads; on the Online tab the board
+  loaded before `pywebview.api` existed, read the stale browser copy, and saved that over `data/online-board.json` (the
+  backups show 3.4 KB at 00:02 -> 244 B at 00:14). Now: `window.bbApiReady` (main.py) is awaited by `Local.load` and the
+  notebook's `load`; `bbReloadTo`/tab-switch reloads run `bbLeave()` first (each tab pushes a flush into `bbBeforeLeave`);
+  `Api.ol_local_save` keeps `backups/offline-before-shrink-*.json` when a save would drop more than half the blocks.
+- **Backups of everything.** `app.backup_all` zips `data/` (minus run.log/snapshot) and `Notebook/` into
+  `%LOCALAPPDATA%\BlackboardBuddy\Backups` at start, every 15 min if anything changed, and before every check; keeps 60.
+  `.env` is never included. Settings has Open backups / Back up now.
+- **No Claude key = Online + Notebook only.** Welcome asks "Do you have a Claude API key?"; No -> `main.build_lite()` and
+  the window opens on Online. `<html class="locked">` (from `not signed_in()`) hides the other tabs and the refresh button;
+  "Unlock everything" asks for the key (checked via `account_add`) and the Blackboard address, then syncs. `start_sync`
+  refuses without a key. Settings has "Your name" (`Api.set_name`, also sets the board name `olName`).
+- **Online board.** Floating **style bar** fixed at the top of the board while something is picked: lettering, size, B/I/U/S,
+  alignment, writing colour (palette, any colour, recent), spacing, fill, box shape/edge/inside, line heads/shape/dash/
+  thickness/colour/label, ink colour/width, corners/edge/shadow/glow/see-through, copy+paste look, "new ones start like
+  this", reset, lock, more. New block fields: `ul strike op rad bd bw shadow glow lh ls dots`, `fill:'solid'`. One click =
+  one undo. Board look (grid, paper colour, bar on/off) under right-click > How the board looks. Hover pop-outs (`.ol-tip`)
+  on buttons. Find bar: centred SVG buttons. Hand tool icon: straight lines.
+- **Lines.** Arrowheads were never drawn: `drawLinks` removed every `path` in the svg, including the marker's triangle. New
+  lines default to right angle, no arrow, dashed, plain colour; any change to a line becomes the look for the next one.
+- **Sticky notes removed** (tool, S key, menu; layouts use tinted notes). Old ones still show, square-cornered.
+- **Pen:** a click or a few-pixel wobble no longer leaves a coloured dot.
+- **Code in/out.** Board menu, right-click on empty space and on code/project blocks: bring in files, a folder or a .zip
+  (`Api.ol_import`: skips build folders, binaries, >400 KB) - one file = code block, several = project; save a block as a
+  file, a project or several blocks as a .zip (`Api.ol_export`, Windows Save dialog).
+- Tests: scratchpad `fmt_test.py` 55/55 (spinner, pill, find bar, style bar, lines, pen, hover, code in/out, locked mode).
+  Repo suites all pass: vault 51, ctx 34 (now uses a note; old stickies still checked), lines 51 (looks at the
+  line itself, `.ol-links > path`, now the arrowhead survives; dashed checked both ways), board2 21, write 40, group 16,
+  save 18, far 24. Scratchpad online/coding/features tests pass. The rebuilt exe is in place; sources re-hidden.
+
+## Round 21 (3 Nov 2026)
+- **Group name / join code boxes ate every key.** Their Enter shortcut was `onkeydown = ev => ev.key === 'Enter' && ...`,
+  which returns `false` for other keys, and a `false` from an `on...` handler cancels the key. Now a plain `if`. The
+  Create button was also class `mk`, which the Notes tab's global click handler grabbed ("Make notes"); now `mkgroup`,
+  and main.py's handler only takes `.mk[data-item]`.
+- **Several offline boards.** The first stays `data/online-board.json` (id `main`); more live in
+  `data/offline-boards/<id>.json`, names in `data/offline-boards.json` (`app._board_file/_boards`). `ol_local_load/save/
+  saved_at` take a board id; `ol_boards`, `ol_board_new/rename/remove` (remove moves the file into `data/backups/`,
+  never deletes). The page remembers the open one in `localStorage.olLocalBoard`; mirror keys are per board; closing
+  (`bbRows().board`) writes the right file. Switcher: each board, New, Rename, Remove.
+- **Profile card** (Settings > General, replaces the name row): live preview with banner (7 gradients), pattern, accent
+  colour, avatar (letter/emoji) and shape (round/square/hex), name, status, course. `Api.profile_save` ->
+  `data/profile.json` (also sets USER_NAME); `BB.profile` in the boot data; the corner avatar and the group board's
+  name/colour follow it.
+- **Load a backup** (Settings, next to Back up now): pick a zip, read the warning, Yes unlocks after a 5 s count.
+  `Api.backup_restore` backs up what is there first (refuses if that fails), writes the zip's `data/` and `Notebook/`
+  files back (files not in the backup are kept), rebuilds the page. The page sets `window.bbFrozen` so the offline
+  board's mirror/save can't write over what came back, and clears the board mirrors before reloading.
+- **Resize grips on all four corners**, 24 px, with their own cursors; the drawn pointer turns into a resize bar
+  (45 / -45 deg) over a grip and while dragging (`board.dataset.rz`). Pulling a top/left corner keeps the opposite one put;
+  boxes still won't shrink past what they hold from any corner.
+- **Project blocks' text size** can change (style bar size, Ctrl +/-): code preview, file list and output follow `--fs2`.
+- Could not reproduce the dark blobs on a box's corners from Min's screenshot (no tiny blocks or stray lines in the
+  data, and a box with the same look renders clean). Ask for another screenshot if they come back.
+- Tests (scratchpad): `boards_test.py` 16/16 (also typing in the group boxes and Create), `round21_test.py` 26/27 (the
+  one is the stub's `nbNotes.filter`, not the page).
+- **Zooming out changes nothing.** `applyView` no longer adds `.ol.far` (the swap of each block for its name), and the
+  board's dots no longer follow the view: fixed 22 px, fixed position. far_test's zoom part now checks exactly that (17/17).
+
+## Round 22 (3 Nov 2026): full projects - running on this computer
+- **Where Run runs** (select next to Run in the editor): "In the app" (Pyodide / JS worker / web preview, as before) or
+  "On this PC". Default: in the app when it can run there (py/js/html), otherwise on the PC. Kept on the block as
+  `data.where`; `data.cmd` overrides the worked-out command (`autoCmd`: python, node, npx tsx, java / javac -d out +
+  java -cp out, gcc/g++ -> app.exe, dotnet run, go run ., cargo run / rustc, ruby, php, start "" for html).
+- **Terminal tab**: a real command line in the project's folder (`Documents\Blackboard Buddy projects\<title>`, same
+  folder as Open in VS Code). Enter runs a command (or, while a program runs, sends the line to its input); Up/Down
+  history; Ctrl+C or Stop kills the process tree; `cls` clears; a bare `cd` explains itself. Shows which tools are
+  installed (`Api.pc_tools`). Folder button opens the folder.
+- **App side** (app.py): `term_start(key, title, files, cmd)` writes the files, runs `cmd` with `shell=True` in that
+  folder, and `_term_pump` streams output to `window.bbTerm(key, text, code)`; `term_input`, `term_stop` (taskkill /T),
+  `proj_pull(title, since)` = text files changed after the start (<=400 KB, not binary, skips build/venv/.dirs, CRLF ->
+  LF). After a run the page brings new files in, and changed ones when the board copy wasn't edited meanwhile.
+  `_child_env` strips the app's own variables (anything KEY/TOKEN/SECRET/PASSWORD/ANTHROPIC/SUPABASE/BB_) so a program
+  never sees the Claude key. `_check_tools` names the missing tool and where to get it; `python` -> `py` when the
+  launcher exists. Running processes are killed when the app exits.
+- **Safety on group boards**: the first time a block runs a given command it asks (confirm with the exact command);
+  remembered in `localStorage.bbPcOk`. Offline boards don't ask (it's your own code).
+- **Templates**: Java now two classes; new C (main.c + maths.h/.c) and C++.
+- On Min's PC right now: python, py, git, dotnet. Not: node, java, gcc/g++, go, rust.
+- Tests (scratchpad): `pc_test.py` 11/11 (real processes: input, exit codes, key not leaked, files back, missing tool,
+  one-at-a-time, stop), `pcui_test.py` 28/28 (page with a pretend app).
+
+## Round 23 (3 Nov 2026)
+- **Window moved/resized on its own when the mouse passed over it.** Two causes: (1) `win_drag` hands Windows a
+  move via BeginInvoke; if the button was already up when it ran, Windows' move loop followed the mouse until the next
+  click. Now it only starts if the button is still down (GetAsyncKeyState, honouring swapped buttons). (2) The edge
+  resize awaited `win_bounds()` before listening, so a quick click could miss the button coming up and leave the edge
+  resizing on every move. Listeners are set straight away; any move with no button down, lost capture or window blur
+  stops it. The title bar drag also stops on a move with no button.
+- **White/black colours follow the theme** (`themed()` in online.py): box outlines, lines, pen ink, writing colour and
+  edge colour picked near white or near black draw in `var(--text)`, so they show in light and dark mode.
+- **Profile card, more:** upload a picture for the avatar (cut to 256x256) or the banner (840x240), both as webp data
+  URLs in `data/profile.json`; your own two banner colours; any accent colour; name font (Dot, Clean, Serif, Code,
+  Round); effects (Glow, Shimmer, Spinning ring, Float - still under reduced motion); up to 4 badges. Save closes the
+  editor. `Api.profile_save` checks pictures are png/jpeg/webp data and caps their size.
+- **Group boards don't need anyone hosting.** They already live on Supabase (the address and the public anon key are
+  built in), so anyone with the invite code joins and edits with Min's app closed. The real risk was the free project
+  going to sleep after a week of no visits: `online_keepalive` in app.py looks in at start and daily from every copy
+  of the app (the "permission denied" answer comes from Postgres itself, so it counts as a visit).
+- Tests (scratchpad): `r23_test.py` 20/20.
+
+## Round 24 (3 Nov 2026)
+- **Rename, leave and delete group boards** (••• menu, and the board list when you're on a group):
+  - Rename: anyone in the group (`rename_group` RPC). The new name is broadcast, so people on the board see it at once.
+  - Leave: deletes your own member row (the existing "leave group" policy). The board stays for everyone else.
+  - Delete for everyone: only whoever made the group (`delete_group` RPC checks `created_by = auth.uid()`). Its blocks
+    and members go with it (cascade). You have to type the group's name. A copy of the board is saved first as an
+    offline board "<name> (copy)"; if the server refuses, that copy is removed again. People on the board get moved
+    to their offline board with a message.
+- **The two RPCs are new SQL**, added to SETUP_SQL and `Online setup.sql`. **Min must run `Online setup.sql` once in
+  Supabase > SQL Editor** (safe to re-run). Until then rename/delete shows an alert saying exactly that (PGRST202).
+- Offline boards: Rename / Remove are now in the ••• menu too (already in the board list). The first board can't be removed.
+- Tests (scratchpad): `manage_test.py` 17/17 (two people through `fake_supabase.js`, which now has
+  rename_group/delete_group and `__fake.old` to act like an old server).
+
+## Round 25 (3 Nov 2026)
+- **Display toggle in the project/code editor** (top bar "Display", also in Ctrl+Shift+P). A panel beside the code shows
+  what you're making; the width drags (`P.lw` in `localStorage.bbIde`), and on/off is kept in `localStorage.bbDisplay`.
+  - Web (main file is .html, or the project has an index.html): the page redraws 300 ms after you type, with its
+    CSS/JS files inlined by `webPage()`.
+  - Python/JavaScript run "In the app": runs again 900 ms after you stop typing and shows the output, charts and
+    errors (red). One run at a time; a real Run waits for a display run to finish, since they share the Python worker.
+  - "On this PC" projects (apps, games, other languages): their window opens on the PC, so the display says so and
+    has a "Run on this PC" button.
+  - Chromium gotcha: a sandboxed srcdoc iframe must get its `srcdoc` **before** it is put in the page; setting it
+    after `replaceWith` leaves the frame white.
+- **Notes can be resized while you're typing in them**: the "click inside the block being typed in is just typing"
+  rule now lets the corner grips through, and typing carries on after.
+- Line-ending gotcha: Git Bash `sed -i` rewrites CRLF files as LF. Edit sources with Python scripts only.
+- Tests (scratchpad): `display_test.py` 17/17, `rsedit_test.py` 7/7.
+- **Offline and group boards are fully separate now.** They were leaking into each other:
+  - `saveEverything` (window blur, every 2 min, close) wrote `Local.mirror()` whatever was on screen, so a group's
+    blocks went into the offline safety copy; the next offline load saw it as newer than the file and loaded it.
+  - The offline save waits 250 ms; a switch inside that window saved the new board's blocks under the old one.
+  - Group saves used `groupId` at send time, so a pending save could land in the next group.
+  - An open editor or a drag carried on into the next board.
+  Fixes: `Local.here()` (offline on screen and not mid-switch) gates mirror/now/write; the offline timer checks the
+  same board and `S.gen`; `Local.flush()`; group saves remember their group (`pending` holds `{b, g}`); `leaveBoard()`
+  finishes typing, closes the editor, drops a drag and flushes before every switch, then `S.swapping` blocks saves
+  until the new board is in; a load that finishes after you've moved on is dropped. An old mixed-up safety copy
+  (rows with `group_id`) is ignored.
+- **Chat on group boards** (button "N Chat" in the top bar, also ••• > Messages): the number is how many are on the
+  board now (presence). Messages go to everyone or privately to one member; click a message to answer privately.
+  Unread badge and a toast when the box is shut. Stored in a new `messages` table: RLS only returns a private
+  message to its sender and recipient, and senders must be members and themselves. Its own realtime channel, so a
+  server without the table doesn't break the board; the box then says to run the setup SQL. Enter sends; the
+  board's key handler leaves `.ol-chat` alone.
+- **Min must run `Online setup.sql` once more** (it now also makes `messages`, plus rename/delete from Round 24).
+- Tests (scratchpad): `separate_test.py` 12/12, `chat_test.py` 17/17 (three people).
+- **Profile name/card didn't stick after a restart.** The app opens the ready-made output/dashboard.html, which carries
+  the name and card inside it, and saving the card didn't remake it (only a sync did). `profile_save` now remakes the
+  page from the last sync (no Blackboard, no AI), and on launch a profile.json newer than the page remakes it first.
+- The code editor's close button (top-right X) is red like Ask AI, filled red on hover.
+
+## Round 26: smoother online, chat v2, uninstall, note map, sharing by code, update publishing
+
+- **Online sync is lighter**: live moves and cursors go out together as one `tick` broadcast at most every 80 ms
+  (`Sync.live`/`Sync.cursor` queue, `Sync.tick` sends). Each block carries a `_rev`; `stale(id, r)` drops older
+  echoes, so a slow packet can't pull a block back. Others' moves glide; links and cursors redraw once per frame.
+  The old `live`/`cur` events are still understood, for older copies.
+- **Chat v2**: chips for who's here, day dividers, a "New" line, grouped messages, "@name" mentions (yellow badge),
+  links, "is typing…", retry for a failed send, hover actions (reply privately, copy, put on board as a sticky).
+- Person colours come from `PEOPLE` (first 20 of the palette); `personColor` swaps near-white/near-black for grey.
+  The format toolbar steps around the chat box; the chat box sits above the board menus.
+- Tests (scratchpad): `five_test.py` 28/28 (five people on the fake server), `chat_test.py` 17/17.
+- Real 3-person run on Min's Supabase worked for create/join/presence/live typing/checklists/reload. It left a few
+  empty groups named "BB test group…" behind (anonymous members gone, nobody can see them). To remove them:
+  Supabase > SQL Editor > `delete from groups where name like 'BB test group%';`
+- **Uninstall** (Settings > General, bottom): three steps. 1) tick what goes with the app (settings and Claude
+  keys, boards/profile, Notebook, downloaded files, backups, sign-ins; code projects only if the folder exists), with
+  sizes; 2) optional final backup zip to the Desktop; 3) type "uninstall" plus a 5 s countdown. `Api.uninstall` writes
+  a PowerShell script to %TEMP% that waits for the app to exit, sends the chosen paths to the **Recycle Bin**
+  (never a hard delete), removes empty folders, and shows a message. It refuses the dev copy (not frozen, or the
+  app folder holds `.git`/`*.py`) and never touches a drive root, the home folder, Desktop, Documents or
+  %LOCALAPPDATA%\BlackboardBuddy itself. Tests: `uninstall_test.py` 23/23; the script was run for real on a dummy
+  install folder (it left a few tiny dummy files in the Recycle Bin).
+- **Note map** is bigger (64vh, full-screen button, Esc leaves). "Colour by" Age (old = cool blue, new = lime),
+  Week, Module or None, remembered. Ring = changed in the last 7 days. A strip of teaching weeks underneath (bar =
+  notes that week); click one to show just that week. Hover card: topic, file, module, folder, week, date, links.
+  Week 1 = the Monday on/after 18 Sep of the year in the module codes ("26sep"); a title saying "Week 5" wins.
+  Weeks are counted in calendar days, so the clocks changing doesn't shift them. Test: `notemap_test.py` 17/17.
+- **Sharing by code** (Settings > Share). Min makes a code (ABCD-2345); after every sync the app sends a cleaned
+  copy of the sync and Claude's notes/plans/briefing to the server (`share_push`, gzip+base64). Left out: marks,
+  feedback, submission status, Blackboard ID, file paths. Followers enter the code; their app shows those
+  notes instead of its own sync (`data/shared/`), with a "Shared by …" line on This week and no Grades tab. ↻ and a
+  check every 15 min fetch newer ones (`share_when` first, so it's cheap). No Claude key needed to follow.
+  Notebook, boards and keys stay their own. Stop following goes back to their own sync (or the lite app).
+  - Server: `shares` table (no direct access) and `share_create/put/stop/get/when` functions, callable with the
+    anon key. The code is the read permission; changing or stopping needs the key kept in Min's settings.json
+    (stored there as a hash on the server).
+  - Safety: someone else's notes are shown inside the app, so `defang_share` cuts page HTML down to plain tags,
+    keeps only https addresses and stops other text opening tags, and `md()` cleans its output while following.
+  - **Needs `Online setup.sql` run again.** Until then sharing says so.
+  - Tests: `share_flow_test.py` 18/18 (owner -> follower -> update -> stop), `share_ui_test.py` 11/11.
+- **Updates**: `publish_update.py 1.2.0 "what's new"` bumps VERSION, builds, zips like the share zip (and checks
+  it's clean), and makes a GitHub release with the zip. Needs, once: a public releases-only repo, its name in
+  `UPDATE_REPO` (main.py), and a fine-grained GITHUB_TOKEN set in the window (never saved). Copies built while
+  `UPDATE_REPO` was empty (every copy shared so far) never check, so they need one manual reinstall.
+- Full regressions passed (repo tests and scratchpad online tests). Built, six sources re-hidden, share zip remade
+  (74.7 MB, clean).
+
+## Round 27: setup run, releases repo, version 1.2.0, map connections
+
+- **Online setup.sql was run** on Min's Supabase (3 Nov). Checked from Python with the anon key: `share_when`/`share_get`
+  answer, writing to someone else's code is refused, and the `shares` table can't be read directly (401).
+- **Releases repo**: https://github.com/CatForSale/blackboard-buddy-releases (public, README only). `UPDATE_REPO` points
+  at it and `VERSION` is 1.2.0. Min attaches `Blackboard Buddy - share.zip` to the v1.2.0 release by hand and presses
+  Publish (the browser tools can't attach files). Copies from before 1.2.0 never check for updates; 1.2.0 onwards do.
+  Later versions: `publish_update.py`, or a new release with the share zip attached. The updater takes any .zip asset.
+- **Map legend** draws the real shapes (dot, diamond, module ring, "new" ring, line kinds) instead of text symbols.
+- **Map connections**: each line keeps why it exists. Module lines are thin and grey. Notebook [[links]] are solid and
+  bright. Similar-topic lines are dashed, and thicker and brighter the closer the match (TF-IDF cosine). Hovering a
+  line shows "Similar topic · N% match", both notes, the shared key words and a strength bar. A note's hover card
+  lists up to 6 connections with their reasons. `notemap_test.py` 18/18.
+- Gotcha again: Git Bash `sed -i` turned main.py to LF; fixed by rewriting it with Python. Use Python edits only.
+- Still to do: the Mac version. About 130 Windows-only spots (mostly app.py: ctypes/windll window handling, WebView2
+  flags, update.bat/robocopy, PowerShell uninstall, os.startfile, %LOCALAPPDATA%). It has to be built on macOS
+  (GitHub Actions in a private source repo). Unsigned, so Mac users right-click > Open the first time.
+
+## Round 28: Study tab, mouse back/forward, legend lines
+
+- **Study tab** (after Notes). Flashcards are made from the notes without Claude, so they're free. `make_cards` in
+  main.py builds four kinds:
+  - "### idea" headings become Explain cards.
+  - "A **term** is ..." sentences become Define cards.
+  - Two-column tables become one card per row.
+  - Sentences with one bold term become Fill-the-gap cards.
+
+  Admin headings and file-talk answers (URLs, "check with", placeholders) are skipped (`_SKIP_HEAD`, `_SKIP_ANS`,
+  `_SKIP_TABLE`), and only real modules make cards. That gives 611 cards today.
+- Study features:
+  - spaced repetition (Again/Hard/Good/Easy, with the next gap shown);
+  - modes: Review due, Learn new, Quiz me, Practise weak ones, All cards (searchable);
+  - module filter;
+  - daily goal ring, streak, 14-day chart;
+  - 25/5 and 50/10 focus timer.
+- How the quiz picks wrong options: same kind and module first, and definition options leave out their own term, so
+  they don't give the answer away. Progress is saved to `data/study.json` (`Api.study_save`).
+- Study keys: Space turns or moves on, 1-4 grade or pick. They run in the capture phase, and the tab shortcut skips
+  `defaultPrevented` keys, so 1-4 on a card no longer switch tabs.
+- **Mouse side buttons**: back first closes whatever is on top (viewer, sheet, full-screen map, dialog) by sending
+  Escape. After that, back and forward step through the tabs visited (`TH` in the tab script). WebView's own history
+  navigation on those buttons is blocked.
+- **Map legend**: line keys are drawn as two dots joined the map's way (thin grey, bright thick, dashed). "Thicker
+  line = closer match" is now its own small hint, so the keys no longer look like underlined text.
+- Tests (scratchpad): `study_test.py`, `mouse_test.py` (new), `notemap_test.py` and `share_ui_test.py` all pass. Built,
+  six sources re-hidden, share zip remade and clean.
+- Gotcha: the Bash tool turns `\\` into `\` inside heredocs. Write edit scripts with the Write tool when they hold
+  backslashes.
+- Release: the zip on the Desktop now has all of this. If v1.2.0 isn't published yet, attach this zip. If it is,
+  ship this as 1.3.0.
+
+## Round 29: Study made fun, every module, notes that follow their files
+
+- **Study animations**:
+  - The card turns in 3D in place; it is no longer redrawn, so the turn actually plays. It lifts a little as it turns,
+    and a soft shine crosses the answer.
+  - Cards sit on a stack that thins out as you go. A graded card flies off: left for Again, right for Good, up-right
+    for Easy, tinted by grade. The next card rises from the stack.
+  - Smaller details: grade buttons and quiz options pop in one after another; the progress bar slides; numbers count
+    up and bump; "+XP" floats up from what you pressed; right answers pulse; wrong ones shake.
+  - Confetti and a toast mark the daily goal, a level up, a quiz or Blurt of 80% or more, and a new best Match time.
+  - Everything respects reduced motion (the OS setting and the app's own `no-anim`).
+- **New ways to practise** (Study row: Due/New/Weak · Quiz/Match/Type it/Blurt · All):
+  - **Match**: six term-meaning pairs against the clock. The best time is kept per module and week (`ST.best`).
+    Pairs whose questions only make sense next to their note ("what does *it* do") are left out.
+  - **Type it**: shows the meaning, or a sentence with a gap, and you type the term. Matching is forgiving:
+    Levenshtein closeness ≥ .75, ignoring case and brackets; "A / B" and "(B)" are each accepted. It feeds spaced
+    repetition (Good, or Hard after a hint, or Again). Only names and terms are asked, never whole questions.
+  - **Blurt**: pick a note, write everything you remember, and compare. A key point counts as got when 60% of its
+    words (5-letter stems) are in what you wrote. You see a ring, the got/missed list and your last score
+    (`ST.blurts`), and "Review the N I missed" runs those as cards.
+- **Weeks**: every card has a teaching week (`note_week`). It comes from "Week 5"-style names in the title or folder,
+  otherwise from when the file changed, counted from that module's own term start. A Week row shows each week's
+  "% done", the current week is outlined, and a ★ means 80% learnt. "All" groups cards under week headings, and the
+  home screen has a "This week's cards" button.
+- **Fun bits**: XP and levels (Starter … Legend; 100 XP, then 1.35x per level), streaks with bonus XP in Quiz and
+  Type it, a gold star medal, a hot streak dot, a random study tip on the home screen, and green bars on days the
+  goal was hit.
+- **Focus timer**: says what 25 / 5 means ("Focus for 25 min, then take a 5 min break"). It shows dots for the
+  focus rounds done today and gives 15 XP per round. It breathes while running and turns amber on a break.
+- **Tidier filters**: Module, Week and Study are one labelled line each, scrolling sideways (with a fade) instead of
+  wrapping.
+- **Every module**: a sync now reads all open Blackboard modules, not only this year's. Earlier-year ones go into
+  Modules, Notes and Study (sorted after this year's, with an "Earlier year" tag). The header says "· N from earlier
+  years". The note map, deadlines and timetable still use this year's. The first sync after this downloads those
+  modules' files too, so it will take longer once.
+- **Notes follow their files** (`run_ai`): on a sync, notes are written for anything changed in the last
+  NOTES_DAYS (as before). They are also written for anything that had notes and whose file has changed since, in
+  any module and however old: up to 20 per sync, on their own allowance. A file newly added to a module seen before
+  also gets notes. A module seen for the first time doesn't count as all new, so adding earlier years doesn't write
+  notes for their whole backlog; use "Make notes" in the Notes tab for those. Until fresh notes are written, the last
+  ones stay. Study cards, the map and the share all rebuild from the notes.
+- Tests (scratchpad), all passing: `study_more_test.py` (28 checks: home, weeks, flip in place, fling, XP, Match,
+  Type it, Blurt, by-week list, phone width), `notes_sync_test.py` (which items get notes, using a fake Blackboard and
+  a fake Claude), `past_mod_test.py` (an earlier-year module in the page), and the existing study, mouse, note map and
+  share UI tests.
+- Built, sources re-hidden, share zip remade and clean.
+
+- Fix: the stack's under-cards (`.st-deck::before/::after`) now sit fully below the card. Overlapping it, they showed through its see-through face as a box inside the bottom edge.
+
+## Round 30: Study drop-down, rewards, tidy rows
+
+- **Drop-down panel:** the start screen (picks Quiz me / Match / Type it / Blurt) now stays put. A pick opens its game
+  in a panel that slides open below it (`.st-drop`, titled, with a ✕). The open pick is lit and its arrow turns
+  down. Pressing the open pick again, the ✕, or Esc closes the panel. The filter rows (Due/New/Weak, the modes) open
+  the same panel. Esc won't close it while the note viewer is open or a Blurt box has text in it.
+- **Rewards** (a panel above the filters):
+  - Three daily challenges. One is always "Review N cards"; the other two change each day, picked by the date.
+    They give +25 XP each and +50 for all three.
+  - 12 badges, unlocked with a toast and confetti. Badges already earned when the page opens are added quietly.
+  - Card styles unlock with level: Plain, Ocean (Lv 3), Sunset (Lv 5), Aurora (Lv 8). The level-up toast says what
+    unlocked.
+  - All saved in the study state (`badges`, `flags`, `style`).
+- **Filter rows:** each row scrolls on its own, with edge fades only where there is more, `‹ ›` arrows, and wheel
+  scrolling, so no chip is ever cut off or faded.
+- Fixes:
+  - Hovering a Notebook note (no path) on the note map threw "reading 'slice'".
+  - The snap menu's "top half" icon used class `st`, the Study root's class. It's now `stop`.
+  - The card-style colour dots used `.sw` (the Settings switches' class) and drew a stray knob. They're now `csw`.
+- Tests: `drop_rewards_test.py` (open/swap/close/Esc, challenges, badges, styles, saving, phone width). `study_test`
+  and that test now read the daily goal from the page instead of assuming 20. All tests pass.
+- Built, sources re-hidden, share zip remade and clean.
+
+## Round 31: Mac version, disabled modules
+
+- **The same code runs on macOS.** Windows behaviour is unchanged.
+  - `main.IS_MAC`, `app.IS_WIN`.
+  - Data lives in `~/Library/Application Support/BlackboardBuddy`. A built Mac app always keeps it there, never
+    inside the .app.
+  - `main.open_path()` replaces `os.startfile` (it uses `open` on a Mac).
+  - `NO_WINDOW`/`DETACHED` are 0 off Windows (a non-zero creationflags is an error there). Project commands run in
+    their own process group, so Stop kills the whole tree.
+  - The Mac window is a normal one with traffic lights: `frameless=IS_WIN`, and `html.mac` hides the drawn title
+    bar, window buttons, resize edges and snap menu.
+  - The border fix, centring, profile-lock wait and one-copy mutex are skipped on a Mac.
+  - Desktop and Documents are under the home folder.
+  - Uninstall says to drag the app to the Bin.
+  - Updates: each platform takes only its own release zip ("mac" in the name or not). A Mac opens the release page
+    instead of swapping files.
+  - Blackboard sign-in tries Chrome then Edge on a Mac (Edge then Chrome on Windows), with a clear "install Chrome"
+    message if neither is there.
+  - Online projects on a Mac: `python3`, `./app` instead of `app.exe`, and `open` for HTML.
+- **Building it:** `build_mac.py` must run on a Mac. It makes `dist/Blackboard Buddy.app` plus
+  `Blackboard Buddy - mac (Apple silicon|Intel).zip`, including `READ ME FIRST (Mac).txt`.
+  `.github/workflows/mac.yml` runs it on GitHub's Macs for both chips (Actions > "Mac app" > Run workflow).
+  It needs this source in a (private) GitHub repo. `icon.icns` is made from icon.png.
+- **Release order matters:** the 1.2.0 Windows app takes the *first* zip on a release. Upload the Windows share zip
+  before any Mac zip.
+- Unsigned: a Mac asks once, and you allow it in System Settings > Privacy & Security > Open Anyway. A paid Apple
+  Developer ID would remove that step.
+- **Fix:** modules whose membership Blackboard marks "Disabled" (e.g. Scct-cct1-jul25) are skipped. Checked
+  against Blackboard: all five first-year modules (FDS, ES, HS, FFS, FGS) come back from `courses()`. They appear
+  after the next sync.
+- Tests: `mac_sim_test.py` (scratchpad) runs the Mac branches on Windows with `sys.platform` faked. All Windows
+  tests still pass.
+- Built, sources re-hidden, share zip remade and clean.

@@ -133,7 +133,7 @@ with sync_playwright() as pw:
     # plain line
     pickmenu("Plain line, no arrow")
     check("no arrow head when plain", pg.evaluate("""() => {
-        const p = document.querySelector('.ol-links path:not(.hit)');
+        const p = document.querySelector('.ol-links > path:not(.hit)');
         return !p.getAttribute('marker-end') && !p.getAttribute('marker-start'); }"""))
 
     def line_menu(text):
@@ -144,23 +144,25 @@ with sync_playwright() as pw:
 
     line_menu("Arrows both ways")
     check("arrow heads on both ends", pg.evaluate("""() => {
-        const p = document.querySelector('.ol-links path:not(.hit)');
+        const p = document.querySelector('.ol-links > path:not(.hit)');
         return !!p.getAttribute('marker-end') && !!p.getAttribute('marker-start'); }"""))
 
     line_menu("Straight")
-    d = pg.evaluate("document.querySelector('.ol-links path:not(.hit)').getAttribute('d')")
+    d = pg.evaluate("document.querySelector('.ol-links > path:not(.hit)').getAttribute('d')")
     check("straight is one segment", d.count("L") == 1 and "Q" not in d, d)
 
     line_menu("Right angle")
-    d = pg.evaluate("document.querySelector('.ol-links path:not(.hit)').getAttribute('d')")
+    d = pg.evaluate("document.querySelector('.ol-links > path:not(.hit)').getAttribute('d')")
     check("right angle turns three times", d.count("L") == 3, d)
 
+    was = pg.evaluate("""() => !!document.querySelector('.ol-links > path:not(.hit)').getAttribute('stroke-dasharray')""")
     line_menu("Dashed")
-    check("dashed", pg.evaluate("""() => !!document.querySelector('.ol-links path:not(.hit)')
-        .getAttribute('stroke-dasharray')"""))
+    check("Dashed switches the dashes", pg.evaluate("""() => !!document.querySelector('.ol-links > path:not(.hit)').getAttribute('stroke-dasharray')""") != was, was)
+    line_menu("Dashed")
+    check("and back again", pg.evaluate("""() => !!document.querySelector('.ol-links > path:not(.hit)').getAttribute('stroke-dasharray')""") == was)
 
     line_menu("Thicker")
-    check("thicker", pg.evaluate("""() => document.querySelector('.ol-links path:not(.hit)')
+    check("thicker", pg.evaluate("""() => document.querySelector('.ol-links > path:not(.hit)')
         .style.strokeWidth === '3.6'"""))
 
     pg.evaluate(f"bbOnline.S.blocks.get('{line_id}').data.label = 'leads to'")

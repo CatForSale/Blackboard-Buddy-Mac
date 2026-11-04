@@ -64,7 +64,7 @@ with sync_playwright() as p:
     rclick(700, 450)
     check("right-click on empty space opens a menu", menu.is_visible())
     L = labels()
-    for want in ("Note", "Sticky note", "Big text", "Code", "Checklist",
+    for want in ("Note", "Big text", "Code", "Checklist",
                  "Paste here", "Select everything", "Show everything", "Back to 100%"):
         check(f"offers {want!r}", any(t.startswith(want) for t in L), ", ".join(L)[:90])
     # it opens at the pointer, except where it would hang off an edge: then it slides back in
@@ -77,18 +77,20 @@ with sync_playwright() as p:
         [bx["x"] + 700, bx["y"] + 450]))
 
     n = nblocks()
-    pg.locator(".ol-ctx button", has_text="Sticky note").first.click()
+    check("no sticky notes on offer any more", not any(t.startswith("Sticky") for t in L))
+    pg.locator(".ol-ctx button", has_text="Note").first.click()
     pg.wait_for_timeout(500)
     check("the menu closes after choosing", not menu.is_visible())
-    check("a sticky note is added", nblocks() == n + 1, nblocks())
+    check("a note is added", nblocks() == n + 1, nblocks())
     check("it lands where the click was", pg.evaluate("""() => {
         const b = [...bbOnline.S.blocks.values()].pop();
-        return b.kind === 'sticky'; }"""))
+        return b.kind === 'note'; }"""))
     pg.keyboard.press("Escape")
     pg.wait_for_timeout(250)
 
-    # ---------------------------------------------------------------- on a block
-    bid = pg.evaluate("[...bbOnline.S.blocks.keys()].pop()")
+    # ---------------------------------------------------------------- on a block (an old sticky note still works)
+    bid = pg.evaluate("bbOnline.add('sticky', 300, 300, {text: 'old one', color: '#fff4b8'}).id")
+    pg.wait_for_timeout(200)
     r = pg.evaluate(f"""(() => {{ const r = document.querySelector('.ol-b[data-id=\"{bid}\"]')
         .getBoundingClientRect(); return [r.x + 20, r.y + 14]; }})()""")
     pg.mouse.click(r[0], r[1], button="right")

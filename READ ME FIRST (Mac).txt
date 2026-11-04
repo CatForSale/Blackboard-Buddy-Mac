@@ -1,0 +1,22 @@
+Blackboard Buddy for Mac
+========================
+
+1. Unzip, then drag "Blackboard Buddy" into your Applications folder.
+
+2. The first time, macOS says it can't check the app, because it isn't from the App Store.
+   Open it once anyway:
+   - Double-click it and close the message.
+   - Open System Settings > Privacy & Security, scroll down, and click "Open Anyway" next to Blackboard Buddy.
+   After that it opens normally.
+
+3. Signing in to Blackboard uses Google Chrome (or Microsoft Edge). If neither is on your Mac,
+   install Chrome from google.com/chrome first.
+
+Your settings, notes and study files are kept in:
+   ~/Library/Application Support/BlackboardBuddy
+
+New version? The app tells you and opens the download page. Unzip it and drag the new app into
+Applications, replacing the old one. Your notes and settings stay.
+
+To remove it: quit the app, drag it from Applications to the Bin, and delete the folder above if you
+don't want your data either.
