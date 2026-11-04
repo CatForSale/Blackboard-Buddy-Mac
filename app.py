@@ -1881,14 +1881,23 @@ def wait_for_profile(seconds=6.0):
 
 
 def watch_first_paint():
-    """If the page never reports in, the window is sitting there empty. Load it again."""
+    """If the page never reports in, the window is sitting there empty. Load it again.
+
+    Only ever a page that is actually there. On a brand new copy nothing has been built yet and
+    the window is showing the welcome screen, which never reports in because it is not the
+    dashboard - so this used to throw that screen away twenty seconds in and leave the person
+    looking at "File not found", halfway through typing their name."""
+    page = main.OUT_DIR / "dashboard.html"
     for attempt in (1, 2):
         time.sleep(20)
         if STATE.get("page_ok") or not window:
             return
+        if not page.exists():
+            main.log_quiet("launch: nothing built yet, so the welcome screen stays where it is")
+            return
         main.log_quiet(f"launch: nothing from the page after 20s, reloading (try {attempt})")
         try:
-            window.load_url((main.OUT_DIR / "dashboard.html").as_uri())
+            window.load_url(page.as_uri())
         except Exception as e:
             main.log_quiet(f"launch: could not reload: {e}")
     if not STATE.get("page_ok"):
