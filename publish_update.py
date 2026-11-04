@@ -81,15 +81,19 @@ def make_zip(version):
             if f.is_file():
                 z.write(f, "Blackboard Buddy/" + f.relative_to(DIST).as_posix())
         z.write(APP / "READ ME FIRST.txt", "Blackboard Buddy/READ ME FIRST.txt")
+        # without this beside the exe, a downloaded copy will not start at all: see the file itself
+        z.write(APP / "Blackboard Buddy.exe.config", "Blackboard Buddy/Blackboard Buddy.exe.config")
     # nothing personal may go out: no keys, data, notes or your name
     bad = re.compile(r"(^|/)(\.env|data|output|Notebook|materials|browser-profile|webview)(/|$)|\.(py|md|json|log)$", re.I)
     with zipfile.ZipFile(out) as z:
         names = z.namelist()
         flagged = [n for n in names if bad.search(n) and not n.startswith("Blackboard Buddy/_internal/")]
         leaks = [n for n in names if any(s in z.read(n) for s in (b"sk-ant-", b"ANTHROPIC_API_KEY=sk"))]
-    if "Blackboard Buddy/Blackboard Buddy.exe" not in names or flagged or leaks:
+    missing = [n for n in ("Blackboard Buddy/Blackboard Buddy.exe",
+                           "Blackboard Buddy/Blackboard Buddy.exe.config") if n not in names]
+    if missing or flagged or leaks:
         out.unlink()
-        sys.exit(f"Zip refused. Missing exe, or personal files: {flagged + leaks}")
+        sys.exit(f"Zip refused. Missing {missing}, or personal files: {flagged + leaks}")
     return out
 
 
