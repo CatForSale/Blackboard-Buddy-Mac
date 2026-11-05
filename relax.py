@@ -422,6 +422,47 @@ RX_HTML = {
   <span class="rx-dur">0:00</span></div>
 </div>
 
+<h3 class="label">Spotify</h3>
+<div class="rx-sp glass">
+ <div class="rx-sp-setup" hidden>
+  <p class="note">Spotify lets another program play whole tracks only if it knows that program,
+  so this needs doing once: make an app on Spotify's developer dashboard, put the address below
+  in its Redirect URIs, and paste its Client ID here.</p>
+  <div class="rx-sp-redirect"><code class="rx-sp-uri"></code>
+   <button class="ghost rx-sp-copy">Copy</button></div>
+  <div class="rx-link-row">
+   <input class="rx-link rx-sp-cid" aria-label="Spotify client ID"
+    placeholder="Client ID - 32 letters and numbers">
+   <button class="btn rx-sp-save">Save</button></div>
+  <button class="ghost rx-sp-dash">Open Spotify's dashboard</button>
+ </div>
+
+ <div class="rx-sp-out" hidden>
+  <p class="note">Connect, and Spotify plays in here with the controls above - whole tracks,
+  not thirty seconds. Spotify asks for Premium before it will play in another app.</p>
+  <div class="rx-sp-acts">
+   <button class="btn rx-sp-login">Connect Spotify</button>
+   <button class="ghost rx-sp-forget">Use a different app ID</button></div>
+ </div>
+
+ <div class="rx-sp-in" hidden>
+  <div class="rx-sp-who"><b class="rx-sp-name"></b><span class="rx-sp-plan sub"></span>
+   <button class="ghost rx-sp-signout">Sign out</button></div>
+  <div class="rx-link-row">
+   <input class="rx-link rx-sp-q" aria-label="Search Spotify"
+    placeholder="Search Spotify for a track, an album or a playlist">
+   <button class="btn rx-sp-go">Search</button></div>
+  <div class="rx-sp-kinds">
+   <button class="rx-serv on" data-kind="track">Tracks</button>
+   <button class="rx-serv" data-kind="album">Albums</button>
+   <button class="rx-serv" data-kind="playlist">Playlists</button></div>
+  <div class="rx-sp-res"></div>
+ </div>
+
+ <p class="note rx-sp-note" hidden></p>
+ <iframe class="rx-sp-frame" title="Spotify player" allow="autoplay; encrypted-media"></iframe>
+</div>
+
 <h3 class="label">Online</h3>
 <div class="rx-online glass">
  <div class="rx-servs rx-msrv">
@@ -668,6 +709,45 @@ input[type=range].rx-seek-in::-webkit-slider-thumb,input[type=range].rx-vol::-we
 
 /* the online player, sitting in the tab rather than in a window of its own */
 .rx-online{border-radius:28px;padding:20px 24px;margin:10px 0 4px;display:flex;flex-direction:column;gap:12px}
+/* Spotify. The frame is the player itself: it draws nothing, so it is kept at a pixel rather
+   than display:none, which browsers are entitled to treat as "not running". */
+.rx-sp{border-radius:28px;padding:20px 24px;margin:10px 0 4px;display:flex;
+ flex-direction:column;gap:14px}
+.rx-sp-frame{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;border:0;pointer-events:none}
+.rx-sp-setup,.rx-sp-out,.rx-sp-in{display:flex;flex-direction:column;gap:12px;align-items:stretch}
+.rx-sp-acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.rx-sp-setup > .ghost,.rx-sp-acts > .btn,.rx-sp-acts > .ghost{align-self:flex-start;flex:0 0 auto}
+.rx-sp .rx-link-row{align-items:center}
+.rx-sp .rx-link{flex:1 1 260px}
+.rx-sp .note{margin:0}
+.rx-sp-redirect{display:flex;gap:8px;align-items:center;flex-wrap:wrap;align-self:stretch}
+.rx-sp-uri{flex:1 1 260px;min-width:0;overflow-x:auto;white-space:nowrap;border:1px dashed var(--line);
+ background:var(--inset);border-radius:12px;padding:9px 14px;font:11.5px var(--mono);color:var(--text)}
+.rx-sp-who{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.rx-sp-who b{font:800 20px/1 var(--dotf);text-transform:uppercase;letter-spacing:.01em}
+.rx-sp-plan{font:10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase}
+.rx-sp-who .ghost{margin-left:auto}
+.rx-sp-kinds{display:flex;gap:6px;flex-wrap:wrap}
+.rx-sp-kinds .rx-serv{padding:6px 14px;font-size:11px}
+.rx-sp-kinds .rx-serv.on{border-color:var(--red);color:var(--red)}
+.rx-sp-res{display:flex;flex-direction:column;max-height:360px;overflow-y:auto}
+.rx-sp-res:empty{display:none}
+.rx-sp-row{display:grid;grid-template-columns:38px 1fr auto;gap:12px;align-items:center;border:0;
+ background:transparent;color:inherit;text-align:left;cursor:pointer;padding:8px 10px;
+ border-radius:14px;border-bottom:1px solid var(--line)}
+.rx-sp-row:last-child{border-bottom:0}
+.rx-sp-row:hover{background:var(--inset)}
+.rx-sp-row:active{transform:scale(.995)}
+.rx-sp-row img,.rx-sp-row .rx-sp-noart{width:38px;height:38px;border-radius:9px;object-fit:cover;
+ background:var(--inset);display:block}
+.rx-sp-meta{min-width:0}
+.rx-sp-row b{display:block;font-weight:500;font-size:14px;overflow:hidden;text-overflow:ellipsis;
+ white-space:nowrap}
+.rx-sp-row .rx-sp-sub{display:block;font:10.5px var(--mono);letter-spacing:.08em;
+ text-transform:uppercase;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rx-sp-row .rx-sp-len{font:10.5px var(--mono);font-style:normal;color:var(--muted)}
+.rx-sp-row.on b{color:var(--red)}
+.rx-sp-note{margin:0;color:var(--muted)}
 .rx-link-row{display:flex;gap:8px;flex-wrap:wrap}
 .rx-link,.rx-wlink{flex:1 1 320px;min-width:0;border:1px solid var(--line);background:var(--inset);
  color:var(--text);border-radius:999px;padding:12px 18px;font:12.5px var(--mono)}
@@ -1115,7 +1195,7 @@ async function kindForm(kind) {
 
 // ---------------------------------------------------------------- Music
 
-const M = { rows: [], at: -1, shuffle: false, audio: null };
+const M = { rows: [], at: -1, shuffle: false, audio: null, src: '' };
 
 function musicInit() {
   M.audio = new Audio();
@@ -1127,15 +1207,26 @@ function musicInit() {
     $('.rx-at').textContent = mmss(M.audio.currentTime);
     $('.rx-dur').textContent = mmss(M.audio.duration);
   };
-  $('.rx-play').onclick = () => M.audio.paused ? (M.at < 0 ? playTrack(0) : M.audio.play()) : M.audio.pause();
+  $('.rx-play').onclick = () => {
+    if (M.src === 'spotify') return spSay({ do: 'toggle' });
+    M.audio.paused ? (M.at < 0 ? playTrack(0) : M.audio.play()) : M.audio.pause();
+  };
   M.audio.onplay = M.audio.onpause = () => {
     const on = !M.audio.paused;
     $('.i-play').hidden = on; $('.i-pause').hidden = !on;
   };
-  $('.rx-prev').onclick = () => step(-1);
-  $('.rx-next').onclick = () => step(1);
-  $('.rx-shuffle').onclick = ev => { M.shuffle = !M.shuffle; ev.currentTarget.classList.toggle('on', M.shuffle); };
-  $('.rx-seek-in').oninput = ev => { if (M.audio.duration) M.audio.currentTime = ev.target.value / 1000 * M.audio.duration; };
+  $('.rx-prev').onclick = () => M.src === 'spotify' ? spSay({ do: 'prev' }) : step(-1);
+  $('.rx-next').onclick = () => M.src === 'spotify' ? spSay({ do: 'next' }) : step(1);
+  $('.rx-shuffle').onclick = ev => {
+    M.shuffle = !M.shuffle;
+    ev.currentTarget.classList.toggle('on', M.shuffle);
+    if (M.src === 'spotify') api().sp_shuffle(M.shuffle, S.device);
+  };
+  $('.rx-seek-in').oninput = ev => {
+    if (M.src === 'spotify')
+      return spSay({ do: 'seek', ms: ev.target.value / 1000 * (S.duration || 0) });
+    if (M.audio.duration) M.audio.currentTime = ev.target.value / 1000 * M.audio.duration;
+  };
   const link = $('.rx-link');
   $('.rx-link-go').onclick = () => playEmbed(link.value);
   link.onkeydown = ev => { if (ev.key === 'Enter') playEmbed(link.value); };
@@ -1162,6 +1253,7 @@ function musicInit() {
   const last = read('rxEmbed');
   if (last) { link.value = last; playEmbed(last); }
   loadMusic();
+  spInit();
 }
 
 async function loadMusic() {
@@ -1231,6 +1323,8 @@ function playEmbed(link) {
 
 function playTrack(i) {
   if (!M.rows[i]) return;
+  if (M.src === 'spotify') spSay({ do: 'pause' });
+  M.src = 'file';
   M.at = i;
   if (!$('.rx-membed-wrap').hidden) $('.rx-membed-close').click();
   M.audio.src = M.rows[i].url;
@@ -1246,6 +1340,213 @@ function step(d) {
   const next = M.shuffle ? Math.floor(Math.random() * M.rows.length)
                          : (M.at + d + M.rows.length) % M.rows.length;
   playTrack(next);
+}
+
+// ---------------------------------------------------------------- Spotify, in this tab
+
+// The player is a page of its own on 127.0.0.1, in a frame a pixel wide. It has to be: Spotify's
+// SDK wants a real web address, and this dashboard is a file on disk. So the frame holds the
+// player and this holds the buttons, and the two talk.
+const S = { device: '', kind: 'track', duration: 0, origin: '', rows: [], poll: 0 };
+
+function spSay(msg) {
+  const f = $('.rx-sp-frame');
+  if (!f || !f.contentWindow) return;
+  try { f.contentWindow.postMessage(Object.assign({ to: 'bb-spotify' }, msg), '*'); } catch (_) {}
+}
+
+function spNote(text) {
+  const n = $('.rx-sp-note');
+  n.textContent = text || '';
+  n.hidden = !text;
+}
+
+function spInit() {
+  $('.rx-sp-save').onclick = async () => {
+    const res = await api().sp_client_id($('.rx-sp-cid').value);
+    if (res && res.error) return spNote(res.error);
+    spNote('');
+    spDraw();
+  };
+  $('.rx-sp-dash').onclick = () => api().sp_dashboard();
+  $('.rx-sp-copy').onclick = async ev => {
+    try {
+      await navigator.clipboard.writeText($('.rx-sp-uri').textContent);
+      ev.currentTarget.textContent = 'Copied';
+      setTimeout(() => { ev.currentTarget.textContent = 'Copy'; }, 1400);
+    } catch (_) {}
+  };
+  $('.rx-sp-forget').onclick = async () => { await api().sp_client_id(''); spDraw(); };
+
+  $('.rx-sp-login').onclick = async () => {
+    const res = await api().sp_login();
+    if (res && res.error) return res.setup ? spDraw() : spNote(res.error);
+    spNote('Spotify has opened in your browser. Say yes there, then come back - this notices on ' +
+           'its own, there is nothing to press.');
+    spWait();
+  };
+  $('.rx-sp-signout').onclick = async () => {
+    spSay({ do: 'pause' });
+    const res = await api().sp_logout();
+    S.device = '';
+    if (M.src === 'spotify') { M.src = ''; $('.rx-now').hidden = true; }
+    await spDraw();
+    if (res && res.note) spNote(res.note);
+  };
+
+  const q = $('.rx-sp-q');
+  const go = async () => {
+    const text = q.value.trim();
+    if (!text) return;
+    $('.rx-sp-res').innerHTML = '<p class="note">Looking...</p>';
+    const res = await api().sp_search(text, S.kind);
+    if (!res || res.error) {
+      $('.rx-sp-res').innerHTML = '';
+      return spNote((res && res.error) || 'That search didn\'t get through.');
+    }
+    spNote('');
+    spRows(res.rows || []);
+  };
+  $('.rx-sp-go').onclick = go;
+  q.onkeydown = ev => { if (ev.key === 'Enter') go(); };
+  $$('.rx-sp-kinds .rx-serv').forEach(b => {
+    b.onclick = () => {
+      S.kind = b.dataset.kind;
+      $$('.rx-sp-kinds .rx-serv').forEach(o => o.classList.toggle('on', o === b));
+      if (q.value.trim()) go();
+    };
+  });
+
+  window.addEventListener('message', spHeard);
+  spDraw();
+}
+
+// Other frames on this page are other people's pages - YouTube's player, Spotify's own embed -
+// and any of them may post a message here. Only the one on the loopback address is listened to.
+function spHeard(ev) {
+  if (!S.origin || ev.origin !== S.origin) return;
+  const m = ev.data;
+  if (!m || m.from !== 'bb-spotify') return;
+  if (m.kind === 'ready') { S.device = m.device_id; spNote(''); return; }
+  if (m.kind === 'not-ready') { S.device = ''; return; }
+  if (m.kind === 'signed-out') { S.device = ''; spDraw(); return; }
+  if (m.kind === 'error') return spTrouble(m);
+  if (m.kind === 'state') return spState(m);
+}
+
+// Each way this can go wrong means something different to whoever is sitting here, so each gets
+// its own sentence rather than one shrug.
+function spTrouble(m) {
+  const why = m.why || '';
+  const say = {
+    premium: 'Spotify only lets another program play whole tracks on a Premium account. ' +
+             'Searching still works, and the player further down still gives you thirty seconds.',
+    auth: 'Spotify stopped trusting that sign-in. Connect again.',
+    sdk: why,
+    start: 'Spotify\'s player would not start here: ' + (why || 'no reason given') + '.',
+    connect: 'Spotify would not take the player.',
+    playback: 'Spotify would not play that: ' + (why || 'no reason given') + '.',
+  }[m.what] || ('The Spotify player had trouble: ' + (why || m.what) + '.');
+  spNote(say);
+  if (m.what === 'auth') { S.device = ''; spDraw(); }
+}
+
+function spState(m) {
+  if (m.empty) return;
+  M.src = 'spotify';
+  S.duration = m.duration || 0;
+  $('.rx-now').hidden = false;
+  $('.rx-now-title').textContent = m.title || 'Spotify';
+  $('.rx-now-artist').textContent = m.artist || '';
+  $('.i-play').hidden = !m.paused;
+  $('.i-pause').hidden = !!m.paused;
+  $('.rx-at').textContent = mmss((m.position || 0) / 1000);
+  $('.rx-dur').textContent = mmss(S.duration / 1000);
+  if (S.duration) $('.rx-seek-in').value = String((m.position || 0) / S.duration * 1000);
+  $$('.rx-sp-row').forEach(r => r.classList.toggle('on', r.dataset.uri === m.uri));
+}
+
+async function spDraw() {
+  const st = (api() && await api().sp_status()) || {};
+  const setup = !st.client_id, inside = !!st.signed_in;
+  $('.rx-sp-setup').hidden = !setup;
+  $('.rx-sp-out').hidden = setup || inside;
+  $('.rx-sp-in').hidden = setup || !inside;
+  $('.rx-sp-uri').textContent = st.redirect || 'no address - see below';
+  if (!st.redirect && !st.error) {
+    spNote('The app could not get hold of any of the three ports the sign-in comes back on. ' +
+           'Something else on this computer has them. Close it, or restart the app, and this ' +
+           'will fill itself in.');
+  }
+  if (st.error) spNote(st.error);
+  if (!inside) {
+    S.device = '';
+    const f = $('.rx-sp-frame');
+    if (f.src && f.src !== 'about:blank') f.src = 'about:blank';
+    return st;
+  }
+  $('.rx-sp-name').textContent = st.who || 'your account';
+  $('.rx-sp-plan').textContent = st.product === 'premium' ? 'Premium'
+    : st.product ? st.product + ' account' : '';
+  if (st.product && st.product !== 'premium') {
+    // No point starting a player Spotify is going to refuse: say so once, here.
+    spNote('This account is not Premium, and Premium is what Spotify asks for before it will ' +
+           'play in another program. Searching works; the player further down still gives you ' +
+           'thirty seconds of a track.');
+  } else if (st.player) {
+    try { S.origin = new URL(st.player).origin; } catch (_) { S.origin = ''; }
+    const f = $('.rx-sp-frame');
+    if (f.src !== st.player) f.src = st.player;
+  }
+  return st;
+}
+
+// After the browser opens there is nothing for anyone to press here, so this watches for the
+// sign-in landing and draws itself again when it does.
+function spWait() {
+  clearInterval(S.poll);
+  let left = 45;
+  S.poll = setInterval(async () => {
+    const st = await api().sp_status();
+    if (st && st.signed_in) { clearInterval(S.poll); spNote(''); spDraw(); }
+    else if (--left <= 0) { clearInterval(S.poll); }
+  }, 2000);
+}
+
+function spRows(rows) {
+  S.rows = rows;
+  const box = $('.rx-sp-res');
+  box.innerHTML = '';
+  if (!rows.length) { box.innerHTML = '<p class="note">Nothing came back for that.</p>'; return; }
+  rows.forEach(r => {
+    const b = document.createElement('button');
+    b.className = 'rx-sp-row';
+    b.dataset.uri = r.uri;
+    b.innerHTML =
+      (r.art ? `<img src="${esc(r.art)}" alt="" loading="lazy">` : '<span class="rx-sp-noart"></span>') +
+      `<span class="rx-sp-meta"><b>${esc(r.title)}</b>` +
+      `<span class="rx-sp-sub">${esc(r.artist || r.album || '')}</span></span>` +
+      `<span class="rx-sp-len">${r.ms ? mmss(r.ms / 1000) : ''}</span>`;
+    b.onclick = () => spPlay(r, b);
+    box.appendChild(b);
+  });
+}
+
+async function spPlay(row, el) {
+  if (!S.device) {
+    return spNote('The player hasn\'t finished starting. Give it a moment and press it again.');
+  }
+  if (M.audio && !M.audio.paused) M.audio.pause();      // one thing at a time
+  if (!$('.rx-membed-wrap').hidden) $('.rx-membed-close').click();
+  spNote('');
+  const res = await api().sp_play(S.device, row.uri, 0);
+  if (res && res.error) return spNote(res.error);
+  M.src = 'spotify';
+  $$('.rx-track').forEach(t => t.classList.remove('on'));
+  $$('.rx-sp-row').forEach(r => r.classList.toggle('on', r === el));
+  $('.rx-now').hidden = false;
+  $('.rx-now-title').textContent = row.title;
+  $('.rx-now-artist').textContent = row.artist || '';
 }
 
 // ---------------------------------------------------------------- Chill
@@ -1459,11 +1760,17 @@ function pushUndo(c) {
   if (G.undo.length > 20) G.undo.shift();
 }
 
+// Giving a canvas a width empties it, so this does as little of that as it can get away with:
+// nothing at all if the size is the same, and nothing if the measurement comes back as nothing,
+// which is what a pane that has not finished appearing measures as.
 function sizeCanvas() {
   const c = $('.rx-canvas'); if (!c) return;
-  const keep = c.width && c.height ? c.getContext('2d').getImageData(0, 0, c.width, c.height) : null;
   const r = c.getBoundingClientRect();
-  c.width = Math.round(r.width); c.height = Math.round(r.height);
+  const w = Math.round(r.width), h = Math.round(r.height);
+  if (!w || !h) return;
+  if (c.width === w && c.height === h) return;
+  const keep = c.width && c.height ? c.getContext('2d').getImageData(0, 0, c.width, c.height) : null;
+  c.width = w; c.height = h;
   if (keep) c.getContext('2d').putImageData(keep, 0, 0);
 }
 
@@ -1522,6 +1829,8 @@ async function pickFolderFor(kind) {
   if (kind === 'audio') loadMusic(); else if (kind === 'image') loadPhotos();
 }
 
-window.bbRelax = { setMode: m => setMode(m, $('.rx-toggle')), mode: () => mode, embedFor, playEmbed, watchEmbedFor, watchHere };
+window.bbRelax = { setMode: m => setMode(m, $('.rx-toggle')), mode: () => mode, embedFor,
+  playEmbed, watchEmbedFor, watchHere,
+  spotify: { state: S, music: M, draw: spDraw, say: spSay, rows: spRows, heard: spHeard, play: spPlay } };
 })();
 """

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import webbrowser
 import zipfile
 import signal
 from datetime import datetime, timedelta
@@ -63,6 +64,7 @@ import webview  # noqa: E402
 import main
 import online
 import relax
+import spotify
 import vault as notebook
 
 AUTO_SYNC_AFTER = timedelta(hours=6)
@@ -985,6 +987,78 @@ class Api:
         except Exception as e:
             main.log_quiet(f"relax: saving a drawing failed: {e!r}")
             return {"error": "Couldn't save that where the pictures live."}
+
+    # ------------------------------------------------ Spotify, playing in the app itself
+
+    def sp_status(self):
+        """Whether an app ID is set, whether anyone is signed in, and what Spotify says the
+        account is allowed to do. The Music tab draws itself out of this one answer."""
+        try:
+            return spotify.status()
+        except Exception as e:
+            main.log_quiet(f"spotify: status failed: {e!r}")
+            return {"client_id": False, "signed_in": False,
+                    "error": "Couldn't work out where Spotify stands."}
+
+    def sp_client_id(self, value):
+        """The app ID from Spotify's dashboard. Public by design in this kind of sign-in, so it
+        sits in data/ in plain sight rather than pretending to be a secret."""
+        try:
+            return spotify.set_client_id(value)
+        except Exception as e:
+            main.log_quiet(f"spotify: saving the client id failed: {e!r}")
+            return {"error": "Couldn't save that."}
+
+    def sp_login(self):
+        """Opens Spotify's own permission page in your browser, where you are probably signed in
+        already and where your password is nobody else's business. The answer comes back to the
+        small server inside the app."""
+        try:
+            got = spotify.login_url()
+            if got.get("error"):
+                return got
+            webbrowser.open(got["url"])
+            return {"ok": True, "redirect": got.get("redirect", "")}
+        except Exception as e:
+            main.log_quiet(f"spotify: starting the sign-in failed: {e!r}")
+            return {"error": "Couldn't open Spotify's sign-in page."}
+
+    def sp_logout(self):
+        try:
+            return spotify.logout()
+        except Exception as e:
+            main.log_quiet(f"spotify: signing out failed: {e!r}")
+            return {"error": "Couldn't sign out cleanly."}
+
+    def sp_search(self, q, kind="track"):
+        try:
+            return spotify.search(q, kind)
+        except Exception as e:
+            main.log_quiet(f"spotify: search failed: {e!r}")
+            return {"error": "That search didn't get through."}
+
+    def sp_play(self, device_id, uri, position_ms=0):
+        try:
+            return spotify.play(device_id, uri, position_ms)
+        except Exception as e:
+            main.log_quiet(f"spotify: play failed: {e!r}")
+            return {"error": "Couldn't start that."}
+
+    def sp_shuffle(self, on, device_id=""):
+        try:
+            return spotify.shuffle(bool(on), device_id)
+        except Exception as e:
+            main.log_quiet(f"spotify: shuffle failed: {e!r}")
+            return {"error": "Couldn't change shuffle."}
+
+    def sp_dashboard(self):
+        """Where the one-off setup happens. Theirs, not ours, so it opens in a real browser."""
+        try:
+            webbrowser.open("https://developer.spotify.com/dashboard")
+            return {"ok": True}
+        except Exception as e:
+            main.log_quiet(f"spotify: opening the dashboard failed: {e!r}")
+            return {"error": "Couldn't open that page."}
 
     def nb_formats(self):
         """What Export and Import can offer, and what each format cannot carry across."""
