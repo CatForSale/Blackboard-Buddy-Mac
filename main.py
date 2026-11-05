@@ -25,6 +25,7 @@ import markdown
 from dotenv import load_dotenv
 
 import online
+import relax
 import vault as notebook
 
 IS_MAC = sys.platform == "darwin"
@@ -4714,7 +4715,7 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
          (f'<div class="panel glass">{md(ai_results["feedback"])}</div>' if ai_results.get("feedback") else "")
          + f"<div class=\"table-wrap glass\"><table><tr><th>Module</th><th>Assessment</th><th>Mark</th><th>Feedback</th></tr>{gr_rows}</table></div>"),
         ("courses", "Modules", courses),
-    ]
+    ] + relax.RX_TABS
     spend = load_json(SPEND, {})
     notebook.init()
     programme = next((short(c["name"]) for c in snapshot["courses"] if c["name"].startswith("-")), "")
@@ -4726,7 +4727,8 @@ def build_dashboard(snapshot, deadlines, announcements, grades, ai_results):
         "locked": not signed_in(), "bburl": BB_URL, "profile": load_json(DATA_DIR / "profile.json", None),
         "programme": programme.strip("- ").title(), "synced": f"{parse_date(snapshot['synced']).astimezone():%a %d %b, %H:%M}",
     }).replace("</", "<\\/")
-    nav = "".join(f'<button data-tab="{k}">{e(t)}{"<i class=near></i>" if k == "deadlines" and first else ""}</button>'
+    nav = "".join(f'<button data-tab="{k}" data-mode="{"relax" if k in relax.RX_KEYS else "study"}">{e(t)}'
+                  f'{"<i class=near></i>" if k == "deadlines" and first else ""}</button>'
                   for k, t, _ in tabs)
     panes = "".join(f'<section id="{k}">{body}</section>' for k, _, body in tabs)
     synced = parse_date(snapshot["synced"]).astimezone()
@@ -4874,7 +4876,7 @@ nav button .near{{position:absolute;top:7px;right:7px;width:5px;height:5px;margi
 .panel h1,.panel h2{{letter-spacing:-.01em}} .panel h1:first-child,.panel h2:first-child{{margin-top:0}}
 code{{background:rgba(127,127,127,.15);padding:1px 6px;border-radius:6px}}
 @media (max-width:600px){{header h1{{font-size:42px}} .panel{{padding:18px}} th,td{{padding:10px 12px}}}}
-{EXTRA_CSS}{notebook.NB_CSS}{online.ON_CSS}</style>
+{EXTRA_CSS}{notebook.NB_CSS}{online.ON_CSS}{relax.RX_CSS}</style>
 <script>/* the look is read straight from storage so the page never flashes the standard one first */
 (function(){{try{{const L=JSON.parse(localStorage.look||'{{}}'),r=document.documentElement;
  if(L.accent)r.style.setProperty('--red',L.accent);
@@ -4919,6 +4921,9 @@ code{{background:rgba(127,127,127,.15);padding:1px 6px;border-radius:6px}}
 </div>
 <button class="theme glass" title="Light / dark / automatic" aria-label="Change appearance">
 <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/></svg></button>
+<button class="theme rx-toggle glass" title="Study or relax (Alt+R)" aria-label="Switch between study and relax">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M3 12a9 9 0 0 1 9-9v18a9 9 0 0 1-9-9z"/><circle cx="12" cy="12" r="9"/></svg></button>
 <button class="theme refresh glass" title="Check Blackboard for updates" aria-label="Refresh">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg></button>
 <div class="status glass" role="status"><i class="spin"></i><span></span></div>
@@ -5127,7 +5132,7 @@ if(document.documentElement.classList.contains('locked')){{
 let t='week';try{{t=localStorage.tab||t}}catch(_){{}};
 if(document.documentElement.classList.contains('locked')&&t!=='online'&&t!=='notebook')t='online';
 show(document.getElementById(t)?t:'week',true);
-</script>{CORNER_HTML}<script>window.BB={boot}</script><script>{EXTRA_JS}</script><script>{STUDY_JS}</script><script>{notebook.NB_JS}</script><script>{online.ON_JS}</script></body></html>"""
+</script>{CORNER_HTML}<script>window.BB={boot}</script><script>{EXTRA_JS}</script><script>{STUDY_JS}</script><script>{notebook.NB_JS}</script><script>{online.ON_JS}</script><script>{relax.RX_JS}</script></body></html>"""
     path = OUT_DIR / "dashboard.html"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(page, encoding="utf-8")

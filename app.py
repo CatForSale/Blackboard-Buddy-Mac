@@ -62,6 +62,7 @@ import webview  # noqa: E402
 
 import main
 import online
+import relax
 import vault as notebook
 
 AUTO_SYNC_AFTER = timedelta(hours=6)
@@ -840,6 +841,150 @@ class Api:
 
     def nb_backup_read(self, file):
         return notebook.backup_read(file)
+
+    # ---------------------------------------------------------------- relax mode
+
+    def _rx(self):
+        return main.load_json(main.DATA_DIR / "relax.json",
+                              {"sources": [], "progress": {}, "folders": {}})
+
+    def _rx_save(self, data):
+        main.save_json(main.DATA_DIR / "relax.json", data)
+        return data
+
+    def rx_state(self):
+        """Everything relax mode needs to draw itself: sources, where you got to, chosen folders."""
+        d = self._rx()
+        return {"sources": d.get("sources", []), "progress": d.get("progress", {}),
+                "folders": d.get("folders", {})}
+
+    def rx_kinds(self):
+        return relax.SOURCE_KINDS
+
+    def rx_pick_folder(self):
+        picked = window.create_file_dialog(webview.FOLDER_DIALOG, directory=str(Path.home()))
+        if not picked:
+            return {"path": ""}
+        return {"path": str(picked[0] if isinstance(picked, (list, tuple)) else picked)}
+
+    def rx_source_add(self, kind, values):
+        cfg = relax.new_source(kind, values or {})
+        if cfg.get("error"):
+            return cfg
+        d = self._rx()
+        d.setdefault("sources", []).append(cfg)
+        self._rx_save(d)
+        return cfg
+
+    def rx_source_remove(self, source_id):
+        d = self._rx()
+        d["sources"] = [s for s in d.get("sources", []) if s.get("id") != source_id]
+        self._rx_save(d)
+        return {"ok": True}
+
+    def _rx_source(self, source_id):
+        return next((s for s in self._rx().get("sources", []) if s.get("id") == source_id), None)
+
+    def rx_catalogue(self, source_id, query=""):
+        """What one source has. A server that is off, or no internet, says so instead of hanging."""
+        cfg = self._rx_source(source_id)
+        if not cfg:
+            return {"error": "That source is gone."}
+        try:
+            return relax.catalogue(cfg, str(query or ""))
+        except Exception as e:
+            main.log_quiet(f"relax: catalogue {cfg.get('kind')} failed: {e!r}")
+            kind = cfg.get("kind")
+            if kind == "jellyfin":
+                return {"error": "Couldn't reach that server. Check it is on and the address is right."}
+            if kind == "archive":
+                return {"error": "Couldn't reach the Internet Archive. Check your connection."}
+            return {"error": f"Couldn't read that source: {e}"}
+
+    def rx_episodes(self, source_id, series_id):
+        cfg = self._rx_source(source_id)
+        if not cfg or cfg.get("kind") != "jellyfin":
+            return []
+        try:
+            return relax.jellyfin_episodes(cfg, series_id)
+        except Exception as e:
+            main.log_quiet(f"relax: episodes failed: {e!r}")
+            return []
+
+    def rx_resolve(self, source_id, ref):
+        """Turns a catalogue row into something the player can actually open."""
+        cfg = self._rx_source(source_id)
+        if not cfg:
+            return {"error": "That source is gone."}
+        try:
+            if cfg.get("kind") == "archive":
+                return relax.archive_stream(str(ref))
+            return {"error": "Nothing to resolve for that source."}
+        except Exception as e:
+            main.log_quiet(f"relax: resolve failed: {e!r}")
+            return {"error": "Couldn't get that one to play."}
+
+    def rx_subtitles(self, path):
+        """Subtitles sitting beside a video, handed over as a track the page can read."""
+        try:
+            side = relax.subtitle_for(Path(str(path)))
+            return {"url": relax.subtitle_url(side)} if side else {}
+        except Exception as e:
+            main.log_quiet(f"relax: subtitles failed: {e!r}")
+            return {}
+
+    def rx_progress(self, key, at, duration, title="", poster=""):
+        """Where you stopped, so Carry on watching can offer it back."""
+        d = self._rx()
+        prog = d.setdefault("progress", {})
+        prog[str(key)] = {"t": float(at or 0), "d": float(duration or 0), "title": str(title)[:160],
+                          "poster": str(poster)[:500], "at": int(time.time() * 1000)}
+        if len(prog) > 300:
+            for old in sorted(prog, key=lambda k: prog[k].get("at", 0))[:len(prog) - 300]:
+                prog.pop(old, None)
+        self._rx_save(d)
+        return {"ok": True}
+
+    def rx_set_folder(self, kind):
+        """Picks the folder music or pictures come from."""
+        kind = str(kind)
+        if kind not in ("audio", "image", "video"):
+            return {"error": "Unknown kind."}
+        picked = window.create_file_dialog(webview.FOLDER_DIALOG, directory=str(Path.home()))
+        if not picked:
+            return {"path": ""}
+        folder = str(picked[0] if isinstance(picked, (list, tuple)) else picked)
+        d = self._rx()
+        d.setdefault("folders", {})[kind] = folder
+        self._rx_save(d)
+        return {"path": folder}
+
+    def rx_library(self, kind):
+        """The music or pictures in the chosen folder."""
+        folder = self._rx().get("folders", {}).get(str(kind), "")
+        if not folder:
+            return {"folder": "", "rows": []}
+        try:
+            rows = relax.audio_library(folder) if kind == "audio" else relax.image_library(folder)
+            return {"folder": folder, "rows": rows}
+        except Exception as e:
+            main.log_quiet(f"relax: library {kind} failed: {e!r}")
+            return {"folder": folder, "rows": [], "error": "Couldn't read that folder."}
+
+    def rx_save_drawing(self, data_url):
+        """Keeps a drawing with the pictures, so it shows up in the gallery next time."""
+        try:
+            head, _, b64 = str(data_url).partition(",")
+            if "image/png" not in head or not b64:
+                return {"error": "That isn't a picture."}
+            folder = Path(self._rx().get("folders", {}).get("image", "") or (main.LOCAL / "Drawings"))
+            folder.mkdir(parents=True, exist_ok=True)
+            out = folder / f"Drawing {time.strftime('%Y-%m-%d %H%M%S')}.png"
+            out.write_bytes(base64.b64decode(b64))
+            return {"path": str(out)}
+        except Exception as e:
+            main.log_quiet(f"relax: saving a drawing failed: {e!r}")
+            return {"error": "Couldn't save that where the pictures live."}
 
     def nb_formats(self):
         """What Export and Import can offer, and what each format cannot carry across."""
