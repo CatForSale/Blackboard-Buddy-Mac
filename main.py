@@ -60,7 +60,7 @@ ENV = BASE / ".env"
 load_dotenv(ENV)
 
 BB_URL = os.getenv("BB_URL", "https://blackboard.uwe.ac.uk")
-VERSION = "1.3.1"  # bump this for every release you upload
+VERSION = "1.3.2"  # bump this for every release you upload
 UPDATE_REPO = "CatForSale/blackboard-buddy-releases"  # GitHub "owner/repo" whose Releases hold new versions; empty = no update checks
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "45"))
 NOTES_DAYS = int(os.getenv("NOTES_DAYS", "14"))
