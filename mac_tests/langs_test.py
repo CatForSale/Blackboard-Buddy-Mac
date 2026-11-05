@@ -27,9 +27,9 @@ with sync_playwright() as p:
         f.write_text(html.replace(f">{h1}</h1>", f">{name}</h1>", 1), encoding="utf-8")
         for w in (1180, 400):
             pg = b.new_page(viewport={"width": w, "height": 820}, color_scheme="dark")
-            pg.on("pageerror", lambda e: errs.append(str(e)))
+            pg.on("pageerror", lambda e: errs.append(str(e) + " @ " + (getattr(e, "stack", "") or "")[:400]))
             pg.add_init_script(STUB)
-            pg.goto(f.as_uri()); pg.wait_for_timeout(2600)
+            pg.goto((os.environ.get("BB_PAGE_URL", "") + f.name) if os.environ.get("BB_PAGE_URL") else f.as_uri()); pg.wait_for_timeout(2600)
             if w == 1180:
                 lit = pg.evaluate("""(() => { const c = document.querySelector('.intro canvas'); if (!c) return 0;
                   const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0;

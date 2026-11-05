@@ -22,7 +22,7 @@ def check(name, ok, extra=""):
 
 with sync_playwright() as p:
     b = (p.webkit.launch() if os.environ.get("BB_ENGINE", "webkit") == "webkit" else p.chromium.launch(channel="msedge")); pg = b.new_page(viewport={"width": 1400, "height": 900})
-    errs = []; pg.on("pageerror", lambda e: errs.append(str(e)))
+    errs = []; pg.on("pageerror", lambda e: errs.append(str(e) + " @ " + (getattr(e, "stack", "") or "")[:400]))
     pg.add_init_script(STUB)
     pg.goto(f"http://127.0.0.1:{srv.server_port}/_mtest.html"); pg.wait_for_timeout(800)
     pg.click('nav button[data-tab="online"]'); pg.wait_for_timeout(1200)

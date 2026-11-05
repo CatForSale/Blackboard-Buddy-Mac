@@ -20,7 +20,7 @@ def check(name, ok):
 with sync_playwright() as p:
     b = (p.webkit.launch() if os.environ.get("BB_ENGINE", "webkit") == "webkit" else p.chromium.launch(channel="msedge"))
     pg = b.new_page(viewport={"width": 1280, "height": 900})
-    pg.on("pageerror", lambda e: errs.append(str(e)))
+    pg.on("pageerror", lambda e: errs.append(str(e) + " @ " + (getattr(e, "stack", "") or "")[:400]))
     pg.add_init_script(STUB)
     pg.goto(dash); pg.wait_for_timeout(1500)
     pg.evaluate("bbUpdate({version: '9.9.9', notes: 'Test'})"); pg.wait_for_timeout(300)

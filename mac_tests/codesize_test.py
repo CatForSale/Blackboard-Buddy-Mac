@@ -17,7 +17,7 @@ with sync_playwright() as p:
     b = (p.webkit.launch() if os.environ.get("BB_ENGINE", "webkit") == "webkit" else p.chromium.launch(channel="msedge"))
     pg = b.new_page(viewport={"width": 1280, "height": 900})
     errs = []
-    pg.on("pageerror", lambda e: errs.append(str(e)))
+    pg.on("pageerror", lambda e: errs.append(str(e) + " @ " + (getattr(e, "stack", "") or "")[:400]))
     pg.add_init_script(STUB)
     pg.goto(Path(sys.argv[1]).resolve().as_uri()); pg.wait_for_timeout(1500)
     fs = lambda: pg.evaluate("getComputedStyle(document.querySelector('.ol-ide')).getPropertyValue('--ide-fs').trim()")

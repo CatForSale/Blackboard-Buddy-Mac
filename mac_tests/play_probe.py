@@ -33,7 +33,7 @@ def check(name, ok, extra=""):
 
 with sync_playwright() as p:
     b = (p.webkit.launch() if os.environ.get("BB_ENGINE", "webkit") == "webkit" else p.chromium.launch(channel="msedge")); ctx = b.new_context(viewport={"width": 1400, "height": 900}); pg = ctx.new_page()
-    errs = []; pg.on("pageerror", lambda e: errs.append(str(e)))
+    errs = []; pg.on("pageerror", lambda e: errs.append(str(e) + " @ " + (getattr(e, "stack", "") or "")[:400]))
     pops = []; ctx.on("page", lambda q: pops.append(q))
     pg.add_init_script(STUB)
     pg.goto(f"http://127.0.0.1:{srv.server_port}/_ptest.html"); pg.wait_for_timeout(800)

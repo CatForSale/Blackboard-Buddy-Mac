@@ -29,9 +29,9 @@ with sync_playwright() as p:
     b = (p.webkit.launch() if os.environ.get("BB_ENGINE", "webkit") == "webkit" else p.chromium.launch(channel="msedge"))
     for tag, f in pages.items():
         pg = b.new_page(viewport={"width": 1180, "height": 820}, color_scheme="dark")
-        pg.on("pageerror", lambda e: errs.append(str(e)))
+        pg.on("pageerror", lambda e: errs.append(str(e) + " @ " + (getattr(e, "stack", "") or "")[:400]))
         pg.add_init_script(STUB)
-        pg.goto(f.as_uri()); pg.wait_for_timeout(3200)
+        pg.goto((os.environ.get("BB_PAGE_URL", "") + f.name) if os.environ.get("BB_PAGE_URL") else f.as_uri()); pg.wait_for_timeout(3200)
         size = pg.evaluate("(() => { const c = document.querySelector('.intro canvas'); return c ? [c.clientWidth, c.clientHeight] : null })()")
         lit = pg.evaluate("""(() => { const c = document.querySelector('.intro canvas'); if (!c) return 0;
           const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0;

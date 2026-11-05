@@ -25,7 +25,10 @@ jobs:
         env:
           BB_ENGINE: webkit
           PYTHONIOENCODING: utf-8
+          BB_PAGE_URL: http://127.0.0.1:8765/
         run: |
+          (cd output && python -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 2
           fails=0
           for t in mac_tests/*_test.py mac_tests/play_probe.py; do
             echo "::group::$(basename $t)"
@@ -52,18 +55,30 @@ jobs:
         run: |
           sed -i '' 's/^VERSION = "[^"]*"/VERSION = "1.2.0"/' main.py
           python build_mac.py
-      - name: Start it and take pictures
+      - name: Start the built app and take pictures
         run: |
-          open "dist/Blackboard Buddy.app"
-          for s in 15 45 75; do
+          "dist/Blackboard Buddy.app/Contents/MacOS/Blackboard Buddy" > app-out.txt 2>&1 &
+          for s in 15 45; do
             sleep 30
             screencapture -x "shot-${s}s.png" || true
-            pgrep -fl "Blackboard Buddy.app" || echo "NOT RUNNING at ${s}s"
+            pgrep -fl "Blackboard Buddy" || echo "NOT RUNNING at ${s}s"
           done
-          pgrep -f "Blackboard Buddy.app" >/dev/null
+          echo "---- what the app printed:"; cat app-out.txt
+          pgrep -f "Contents/MacOS/Blackboard Buddy" >/dev/null
+      - if: always()
+        name: Start it from the source code instead
+        run: |
+          pkill -f "Contents/MacOS/Blackboard Buddy" || true
+          python app.py > src-out.txt 2>&1 &
+          sleep 40
+          screencapture -x shot-source.png || true
+          echo "---- what it printed:"; cat src-out.txt
+          pgrep -f "app.py" >/dev/null
       - if: always()
         name: Collect the app's log
-        run: cp ~/Library/"Application Support"/BlackboardBuddy/run.log . 2>/dev/null || echo "no run.log"
+        run: |
+          cp ~/Library/"Application Support"/BlackboardBuddy/run.log . 2>/dev/null || echo "no run.log"
+          cp ~/Library/Logs/DiagnosticReports/*Blackboard* . 2>/dev/null || echo "no crash report"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -71,3 +86,5 @@ jobs:
           path: |
             shot-*.png
             run.log
+            *-out.txt
+            *.ips
