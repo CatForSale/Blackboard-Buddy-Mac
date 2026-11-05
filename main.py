@@ -39,6 +39,8 @@ if IS_MAC:
         ssl.create_default_context(cafile=_ca)            # fails here, not later, if the file is missing
         os.environ.setdefault("SSL_CERT_FILE", _ca)
         ssl._create_default_https_context = lambda *a, **k: ssl.create_default_context(cafile=_ca)
+        import urllib.request
+        urllib.request.install_opener(None)   # urllib keeps the settings from its first request; start afresh
         TLS_NOTE = "certificates from " + _ca
     except Exception as e:
         TLS_NOTE = f"no certificate list: {e!r}"
