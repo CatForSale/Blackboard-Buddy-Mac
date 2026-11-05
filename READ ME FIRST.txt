@@ -1,8 +1,10 @@
 ﻿BLACKBOARD BUDDY
 ================
 
-1. Right-click this zip > Extract All. Don't run the app from inside the zip.
-2. Open the extracted folder and double-click "Blackboard Buddy.exe".
+1. Easiest: download Blackboard-Buddy-Setup.exe and run it. It installs the app and
+   adds it to the Start menu and Desktop. (With the zip instead: right-click > Extract All,
+   then double-click "Blackboard Buddy.exe" in the extracted folder.)
+2. Setup opens the app for you when it's done.
    If Windows shows "Windows protected your PC", click More info > Run anyway.
    (This happens because the app isn't signed by a big company. It's safe.)
 3. On first start, enter:
@@ -36,9 +38,8 @@ are clickable. Console keeps your variables after a run. Ctrl+P finds a file,
 Ctrl+Shift+F searches every file, Ctrl+Shift+P lists every command, and Ask AI
 (Ctrl+I) explains errors or code using your Claude account from Settings.
 
-Updates: when there's a new version, the person who sent you this will send a
-new zip. Close the app, extract the new zip over this folder, and your
-settings and notes stay.
+Updates: the app tells you when there's a new version and installs it itself
+(Update now). Your settings and notes stay.
 
 Needs Windows 10 or 11 with Microsoft Edge (already on every Windows PC).
 Your key, data and notes are saved next to the app in this folder. Don't share

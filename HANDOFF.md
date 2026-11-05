@@ -2018,3 +2018,293 @@ The full app was not clicked through again after the fix; only the harness and t
 - Asset `Blackboard-Buddy-1.3.1.zip`, 74,824,031 bytes.
 - `gh release create` hit a GitHub 502 after the upload and left a draft. Published it with `gh release edit v1.3.1 --draft=false --latest`.
 - The first real check of the fixed button will be updating a 1.3.1 copy to the next release.
+
+## Round 40: one Setup .exe to download
+
+`installer.py` is a new, visible file. publish_update.py builds it with `make_setup(version, zip)` into `Desktop\Blackboard Buddy Setup <ver>.exe`:
+- PyInstaller `--onefile --windowed`, with the release zip inside as `app.zip`, plus icon.ico. PIL is excluded. About 87 MB.
+- A release now uploads both files. The zip is still what the in-app updater downloads. The other file is `Blackboard-Buddy-Setup.exe`, always with that name, so `.../releases/latest/download/Blackboard-Buddy-Setup.exe` always works as a link.
+
+What Setup does:
+- Unzips into `%LOCALAPPDATA%\Programs\Blackboard Buddy`. It's per user, so no admin is needed.
+- Adds shortcuts in the Start menu (`%APPDATA%\...\Start Menu\Programs`) and on the real Desktop (found via SHGetFolderPath).
+- Opens the app when it's done.
+- Data next to the exe stays, because it's not in the zip.
+- If the app is running, it says so, and Try again retries.
+
+The window:
+- Nothing x Apple style: borderless and black, with a dot grid, a dot-matrix BLACKBOARD BUDDY title, and a red pulse dot.
+- A progress row of dots with a red head, and a white pill button.
+- Rounded corners and a taskbar button through DWM/exstyle, and it's DPI aware.
+- Drag it anywhere. Enter installs, Esc closes.
+
+Test switches:
+- `BB_SETUP_TEST=<dir>` installs into that folder, shortcuts included.
+- `--quiet` installs with no window and doesn't open the app.
+- `BB_SETUP_SHOT=<dir>` saves a PNG of each step, from source only (needs PIL).
+
+Tested:
+- The quiet install copies all 256 files, and both shortcuts point at the exe.
+- The installed app starts.
+- Setup refuses while the app is open (exit 1).
+- The window was checked in every state at 150% scaling.
+
+Other changes:
+- app.py uninstall also removes those two shortcuts when they point at this copy.
+- READ ME FIRST.txt now mentions Setup, and that updates install themselves.
+- Neither ships until the next version.
+
+---
+
+# Round 38 — the release path, and four bugs in it
+
+Written mid-round, with the usage limit close. Two fixes are finished and verified, two are
+half-done and sitting uncommitted. Read "Where this stops" before touching anything.
+
+## What went out
+
+**v1.2.2 is published and works.** <https://github.com/CatForSale/blackboard-buddy-releases/releases/tag/v1.2.2>
+Verified the whole way round, not just by the publish script: downloaded the zip back off GitHub,
+extracted it, marked all 296 files as internet-sourced the way Explorer does, ran it — window up,
+alive a full minute. Source is pushed; `mac/mac-version` is at `2313967`.
+
+Four commits went up: `cd27e62` the exe.config, `177c983` the welcome screen, `cd5f58e` rounds
+36-37, `2313967` the version bump.
+
+### Two release-blocking bugs, both found by running the app rather than the suites
+
+**A downloaded copy would not start at all** (`cd27e62`). Windows marks every file out of a
+downloaded zip as internet-sourced; .NET then refuses to load `Python.Runtime.dll`, which is what
+the window is built on, so the app died on launch with `Failed to resolve
+Python.Runtime.Loader.Initialize`. Nothing wrong with the code — purely packaging. Fixed with
+`Blackboard Buddy.exe.config` carrying `loadFromRemoteSources`, now written into every zip by
+`publish_update.py`, which also refuses to build a zip without it.
+
+**A new copy had twenty seconds to finish setting up** (`177c983`). `watch_first_paint` in
+`app.py` reloads a window that never reports in, but did not check the page existed. On a new
+copy there is no `output/dashboard.html`, so the app correctly shows the welcome screen — which
+never reports in, because reporting in is something the dashboard does. Twenty seconds later the
+watchdog threw the welcome screen away and navigated to a file that was not there. Anyone still
+typing their name watched the form turn into "File not found". Then again at forty seconds.
+
+Both suites passed throughout. Neither bug was findable from them, because both live in the
+packaged-app, first-run path that nothing drives.
+
+## Rounds 36-37, checked rather than taken on trust
+
+All 12 suites pass, 496 checks — run here, matching what the two sessions reported.
+
+Then the real app, attached to its own browser engine over `--remote-debugging-port` (set
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`; `app.py` appends to it rather than replacing it, so this
+works). This is the shipped binary with real Python behind it:
+
+- **Board, 11/11.** A line from code to an output block joins them; running puts the result in
+  the output box and *not* in the code block; cutting the line gives the code block its result
+  back; works join-then-run and run-then-join; a traceback arrives marked as an error; the format
+  bar sits clear of the selected block (measured: bar 408-454, block 198-398).
+- **Notebook.** Typing with no Save pressed reaches `Notebook/Start here.md` plus a timestamped
+  backup, and survives a **full app restart**, not just a tab switch.
+- **Exports.** All four formats through `vault.to_file`, which is what `nb_export` actually calls:
+  the `.docx` is a real Word package that reads back with its code block intact, the PDF's words
+  extract, markdown keeps its marks, plain text strips them.
+
+Driving notes for whoever picks this up:
+
+- The notebook and board tab buttons match more than one element; click the one with `offsetParent`.
+- `python -I` implies `-E`, so `PYTHONIOENCODING` is ignored — use `python -X utf8`.
+- A second copy shares the WebView2 profile under `LOCALAPPDATA`, so a test copy quietly exits
+  while the real app is open. Give it its own `LOCALAPPDATA`; `main.LOCAL` is derived from it, so
+  the test copy gets its own data and cannot touch real notes.
+- **Never write a driver or patch script through a bash heredoc.** It eats backslashes. It broke a
+  script again this round, and then broke the first attempt at writing this very file. Use Write.
+
+## Where this stops — four more bugs, two fixed, two not
+
+All four live in the uncommitted `app.py` and `main.py`. **Nothing is committed, built or pushed.**
+
+### 1. "Later" meant never — FIXED, but only read, not run
+
+`main.py`: the Settings "Check for updates" button called `bbUpdate(u)`, and `bbUpdate` returns
+early when `sessionStorage.updLater` matches the version. So after pressing Later once, asking for
+the update on purpose cleared its own message, closed the sheet and showed nothing at all.
+`bbUpdate` now takes an `asked` flag that skips that check, and the manual button clears
+`updLater` before calling it. **Not yet exercised in a running app.**
+
+### 2. Download marks healed at startup — FIXED and verified
+
+`_unblock_our_own_files()` at the top of `app.py`, before `import webview`, strips
+`:Zone.Identifier` from our own `.dll/.exe/.pyd` and writes `_internal/.unblocked` so it only runs
+once. Belt as well as the braces of the exe.config.
+
+Verified properly: a build with **no exe.config at all** and 294 of 295 files marked as downloaded
+started and put its window up. That exact setup produced the crash dialog before.
+
+### 3. The app can outlive its window — FIX WRITTEN, CAUSE NOT FOUND
+
+Evidence it is real: the user's `run.log` shows eight launches between 06:44 and 06:51, every one
+`the last copy is still shutting down, waiting for it` then `never finished shutting down` then
+`another copy is already running, raising it instead`, with nothing appearing on screen. A process
+from 02:42 was found with **no window at all**, 20 WebView2 children and 28 minutes of CPU.
+Closing the window had not ended it, and `only_one_copy()` then refused to start a new copy *and*
+could not raise the old one — so the app simply stopped opening.
+
+**I could not reproduce the hang.** A clean close ends in 4-6s with `launch: closed`. Closing
+while a long program runs on the board also ends cleanly. The trigger is still unknown — likely
+something in a long heavy session (the viewer window, a file dialog, a board terminal). So the fix
+is containment, not a cure:
+
+- `leave_for_good()` and `_leave_if_stuck()` in `app.py`: when the window closes, an 8-second
+  daemon timer forces `os._exit(0)` if the process is still there; `run()` ends the same way.
+- `only_one_copy()`: when the mutex wait times out **and** there is no window to raise, the old
+  copy is wedged, so `_end_stuck_copies()` ends it and this copy takes over instead of bowing out
+  for ever.
+
+Clean close still works after this (4s, `launch: closed`, exit 0). The forced path and the
+takeover path are **not verified** — they need the hang, which will not come on demand.
+
+### 4. Updating does not update — REPRODUCED, NOT FIXED. Start here.
+
+This is the important one. Reported: the version stays the same, the new features are not there,
+and the app does not come back afterwards.
+
+**Reproduced exactly.** Built a copy that thinks it is 1.2.1 (`build_old.py` does this and puts
+`main.py` back in a `finally`), launched it, and called `check_update()` then `install_update()`
+through the real API:
+
+    what the update check found : {'version': '1.2.2', 'url': '...v1.2.2/Blackboard-Buddy-1.2.2.zip'}
+    asking it to install, the way the button does
+      t+  3s the old copy has gone
+    the files were replaced : False
+    the app came back       : False
+
+`install_update()` writes a batch file to a temp folder that waits for the app's PID to disappear,
+robocopies the new files over the app folder, and starts it again. **Run by hand, that batch works
+perfectly** — files copied, log written, app relaunched. Started from the app it never runs at
+all: no `update.log`, nothing copied.
+
+Ruled out already, so do not spend time here again:
+
+- Not the batch's contents. It works standalone.
+- Not the wait loop. The old copy was gone in 3 seconds.
+- Not the creation flags. `NO_WINDOW | DETACHED` looked wrong, since those are documented as
+  incompatible console flags, but a direct test showed all four combinations survive the parent
+  exiting. **That theory was wrong.**
+- Not this round's `os._exit(0)`. The bug was reported against the old code, which exits normally.
+
+Still to check, in order of promise:
+
+1. Does `cmd.exe` appear at all after `install_update()`? Watch the process list at the moment it
+   is called. That splits "never started" from "started and died".
+2. Is `install_update()` reaching the `Popen` line? It must be, because the window closes and that
+   happens afterwards — but confirm by logging either side of it. There is no `try` around the
+   `Popen`, so an exception there would surface oddly.
+3. `timeout /t 1` needs a console and the child has none under `DETACHED_PROCESS`, so it fails
+   instantly and the wait becomes a busy spin rather than a wait. Harmless here, but replace it
+   with `ping -n 2 127.0.0.1 >nul`, which needs no console.
+4. Best structural fix: stop depending on a detached child at all. Write the staged folder and the
+   old PID to a file, start the **new** exe straight from the staged folder, and let it wait, copy
+   over the old folder and relaunch itself from there. Then nothing has to outlive the dying app.
+
+The batch was improved this round anyway — bounded 20-second wait, then `taskkill /T /F`, and it
+writes `update.log` beside `run.log` so the next person has evidence. That change is sound, but it
+does not fix this, because the batch is not running in the first place.
+
+**And the part that cannot be fixed from here:** the updater that runs during an update is the one
+inside the copy *being updated*. Everyone on 1.2.0 or 1.2.2 has the old one. Whatever lands next,
+those copies may still need a manual download — say so in the release notes.
+
+## Also still open
+
+- **No Mac build of 1.2.2.** Checked rather than assumed: `check_update` filters assets by
+  platform, so a Mac finds no mac zip and reports no update. It will *not* hand a Mac user the
+  Windows zip. But Mac is stranded on 1.2.0, which still has both launch bugs. Needs a build on a
+  Mac.
+- `robocopy` has no `/PURGE`, so files dropped from a release are never removed on update.
+- "Later" is kept in `sessionStorage`; with WebView2 session restore that may outlive a restart.
+
+## State of the tree
+
+`main.py` and `app.py` are modified and **re-hidden** (`0x02`); unhide with `0x80` before any
+Python write. Both parse. `VERSION` is back to `1.2.2` — check that first, since `build_old.py`
+sets it to 1.2.1 and restores it in a `finally`.
+
+Scratch work worth keeping is in the session scratchpad: `build_old.py` (version-shifted build),
+`doupdate.py` (the end-to-end update test), `selfheal.ps1`, `closetest.ps1`, `live_final.py` (the
+11-check board journey) and `exports.py`.
+
+## Round 41: Setup brings your info from an older copy
+
+**Why Min's info vanished:** Setup installed a fresh copy into `AppData\Local\Programs\Blackboard Buddy`. Each copy keeps its .env, data and Notebook next to its exe. So the new copy started empty, while the real info was still in `OneDrive\Desktop\Blackboard Buddy`, and the Desktop shortcut now points at the new copy. The Blackboard sign-in (`LOCAL\browser-profile`) is shared, so it wasn't affected.
+
+Fix in installer.py: after installing, `find_old_copy()` looks for other copies.
+- A copy counts if its folder has `Blackboard Buddy.exe` plus a .env, `data/settings.json`, or a non-empty Notebook.
+- Places it searches, 3 levels deep:
+  - the real Desktop and `~/Desktop`
+  - Downloads and Documents
+  - OneDrive Desktop and Documents
+  - `LOCALAPPDATA\Programs`
+  - `LOCALAPPDATA\BlackboardBuddy` itself
+- It skips `_internal`, `.git`, `venv` and similar folders, and skips the target folder.
+- If several copies are found, it picks the most recently used one.
+
+If it finds one, a "FOUND YOUR INFO" screen appears with two buttons:
+- **Bring it over:** `bring_over()` first moves the new copy's own .env, data and Notebook into `LOCAL\Backups\Before bringing info over <time>\`. It moves them, never deletes them. Then it copies the old copy's files in. The old folder isn't changed.
+- **Start fresh:** keeps the new copy as it is.
+
+Either answer writes `TARGET\.brought-over`, so Setup only asks once per install.
+- The marker is needed because a new copy creates its own .env the first time it opens. So "the new copy already has a key" can't be used to tell whether it's been set up.
+- Output isn't copied; the app rebuilds it.
+
+Tests:
+- `BB_SETUP_SEARCH=<dir>;<dir>` limits the search; a test install (`BB_SETUP_TEST`) searches nothing else.
+- `scratchpad\import_test.py`: 8/8 pass. It checks that it finds the right copy and skips an empty decoy, copies the key, settings, accounts and notes, keeps the new copy's info in Backups, leaves the old folder unchanged, and offers nothing when no copy has info.
+- A read-only search of Min's real folders found `OneDrive\Desktop\Blackboard Buddy`, last used 4 Nov, in 0.1 s.
+- The screens were checked in pictures. The rebuilt Setup quiet install copies all 256 files.
+- The real click-through of Bring it over has not been done yet.
+
+## Round 42: Mac builds for 1.3.1
+
+Mac copies were stuck on 1.2.0. There was no Mac build after that, and `check_update` only looks at the latest release for a zip with "mac" in its name, so a Mac said it was up to date.
+
+- Ran the "Mac app" workflow on `mac-version` (a360503, VERSION 1.3.1): https://github.com/CatForSale/Blackboard-Buddy-Mac/actions/runs/41951516083. Both macos-15 and macos-15-intel succeeded.
+- Uploaded to v1.3.1 as `Blackboard-Buddy-1.3.1-mac-apple-silicon.zip` (74,446,518 bytes) and `Blackboard-Buddy-1.3.1-mac-intel.zip` (77,499,950 bytes). Each has 472 files: the .app and the Mac readme, nothing personal.
+- Rewrote the release notes. The app shows their first line in the update prompt on both platforms, so that line is now neutral; the Windows and Mac steps come after it.
+- Checked the live release with check_update's own filter: darwin picks the mac-apple-silicon zip, win32 picks `Blackboard-Buddy-1.3.1.zip`.
+- On a Mac, Update now only opens the release page, and the user drags the app into Applications. The first match is the apple-silicon zip, but the page lists both.
+- **Not tested on a real Mac.** The new web features (pop-ups, live ink) run in WKWebView there, not WebView2.
+- From now on, release the Mac build alongside each Windows release: run the workflow, then upload the two zips with "mac" in their names.
+
+## Round 43: the Mac app crashed on start, and Mac tests
+
+**The crash.** Every Mac build crashed at launch: `wait_for_profile()` did `from ctypes import windll` before its `if not IS_WIN` check.
+- Fixed by moving the import below that check.
+- Also fixed "Open in VS Code": it passed `creationflags=0x08000000` on every system, and any flag is an error on a Mac. It now uses `NO_WINDOW`, which is 0 on a Mac.
+- I checked every other windll/creationflags use: each is behind IS_WIN, wrapped in try/except, or only called from Windows code.
+- Rebuilt via the "Mac app" workflow on branch `mac-tests` (79e9234, run 41955489386), and replaced both Mac zips on v1.3.1 (apple-silicon 74,446,993 bytes, intel 77,499,709 bytes).
+- **These fixes are not on mac-version yet.** They're in the working tree here, and on `mac-tests` in the Mac repo.
+
+**Mac tests.** Branch `mac-tests` of CatForSale/Blackboard-Buddy-Mac, workflow `.github/workflows/mac-tests.yml`. It runs on every push to that branch, or from the Actions tab.
+- `mac_tests/update_check.py` checks the update feature against the real latest release. An old copy finds 1.3.1 and picks the mac zip. Update now opens `releases/latest` and mentions Applications. An up-to-date copy sees nothing. GitHub rate-limits its shared test machines, so a 403 counts as SKIPPED. On Windows the script doesn't press Update now: it once really ran the swap from the venv, which only produced a "cannot find Blackboard Buddy.exe" box and copied nothing.
+- `mac_tests/make_page.py` builds a test page for a made-up student "Sam Tester" with no data, and removes the `locked` class. Never upload Min's real `output/dashboard.html`, since it holds their data.
+- The ported page tests (multiout, apart, langs, twoppl, play_probe, intro, later, codesize) run in Playwright WebKit. `BB_ENGINE=msedge` runs them on Windows instead, and `BB_PAGE_URL` serves the pages over http.
+- Job "real-app" builds the .app as VERSION 1.2.0, runs it, and takes screenshots; it starts it from source too. After the fix the welcome screen shows, and the app stays running.
+
+WebKit results:
+- Everything passes on functionality: groups pushing apart, lines, several code blocks per output, games and pop-ups, two people per block, live ink, the update prompt.
+- The "no page errors" checks fail on two messages that come from the test setup, not the app:
+  - "The operation is insecure.", raised at `web-inspector://bootstrap.js`, which is the injected STUB script.
+  - "null is not an object (evaluating 'notes.filter')", from the stub API returning null. Edge's wording of this one is already filtered.
+- Open, cosmetic: in WebKit `dotHeading` gives the non-English big heading 0 px width, and intro_test's header screenshot times out. The intro dots work.
+
+**Also found on Windows.** After Unlock, when Blackboard is already signed in, no sign-in window opens and the page isn't reloaded, so the locked screen stays until the app is reopened. The dashboard is built fine (log: "Dashboard ready"). Not fixed yet.
+
+Min's Windows copy (`LOCALAPPDATA\Programs`) got the old copy's info through installer.bring_over: .env 666 bytes, 47 data files, 5 Notebook files. What the new copy had before is in `Backups\Before bringing info over 2026-11-05 021556`.
+
+## Round 44: a finished update never showed the new page
+
+`bbReloadTo` did `location.replace(dashboard.html#updated)`, and so did the "switch tab to see it" path in `show()`. The new page is the same file, and a change that only touches the part after # is a fragment navigation, which never reloads. So after Unlock, and after any background check, the window kept the old page until the app was reopened. Min hit this after Unlock, where they were already signed in, so the sync ran quietly.
+
+Fix:
+- New `window.bbGoTo(url)` in main.py. When the file is the same, it sets the hash and calls `location.reload()`; otherwise it calls `location.replace`. Both paths use it.
+- Test: `scratchpad\reload_test.py`, 4/4. The page reloads from a URL with and without the hash, it waits on Online, and switching tab then reloads.
+- later_test, multiout_test and codesize_test still pass.

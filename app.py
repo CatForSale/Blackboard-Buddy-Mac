@@ -527,7 +527,7 @@ class Api:
             subprocess.Popen(["open", "-a", "Visual Studio Code", str(folder)])
             return "Opened in VS Code"
         if code:
-            subprocess.Popen([code, str(folder)], creationflags=0x08000000)
+            subprocess.Popen([code, str(folder)], creationflags=NO_WINDOW)   # 0 on a Mac, where any flag is an error
             return "Opened in VS Code"
         main.open_path(folder)
         return "VS Code isn't installed, so the folder opened instead"
@@ -1601,6 +1601,11 @@ def _uninstall_parts():
     if main.OUT_DIR not in app:
         app.append(main.OUT_DIR)
     app += [main.LOCAL / "run.log"]
+    if IS_WIN:  # the shortcuts Setup made, when they point at this copy
+        for lnk in (Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Blackboard Buddy.lnk",
+                    _desktop() / "Blackboard Buddy.lnk"):
+            if lnk.is_file() and str(app_dir / "Blackboard Buddy.exe").lower().encode("utf-16-le") in lnk.read_bytes().lower():
+                app.append(lnk)
     return {
         "app": app,
         "settings": [main.ENV, main.SETTINGS, main.ACCOUNTS],
@@ -1978,10 +1983,10 @@ def _restore_resizing():
 def wait_for_profile(seconds=6.0):
     """Reopening quickly can find the browser's profile still locked by the copy that just
     closed, and then the window opens empty with nothing to show for it. Wait for the lock."""
-    from ctypes import windll
     lock = main.LOCAL / "webview" / "EBWebView" / "lockfile"
     if not IS_WIN or not lock.exists():
         return True
+    from ctypes import windll  # Windows only: on a Mac this import alone stopped the app starting
     GENERIC_READ, OPEN_EXISTING, INVALID = 0x80000000, 3, -1
     waited = 0.0
     while waited < seconds:
