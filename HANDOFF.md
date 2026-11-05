@@ -2326,3 +2326,8 @@ Assets:
 Checked: check_update's filter picks the mac zip on darwin and the Windows zip on win32. The update message's first line is neutral, and the permanent Setup link returns 200.
 
 **First real test of the fixed Update button:** a 1.3.1 Windows copy (Min's) updating to 1.3.2 through Update now. It hasn't been watched yet.
+
+## Round 45: Update now when the app's own check is stale (not released yet)
+- 1.3.3: Mac https fixed by packing certifi (build_mac.py --collect-data certifi), pointing ssl's default context at it, and resetting urllib's opener (install_opener(None)) because urllib keeps the SSL settings from its first request.
+- Found on the user's 1.3.1: pressing Update now did nothing. The app checks 20 s after start and then every 12 h; it started before 1.3.3 was out, so STATE['update'] was empty and install_update quietly returned 'No update found.' (nothing logged).
+- Fix (app.py Api.install_update): when nothing is saved it asks GitHub there and then, says 'You have the latest version.' if there's nothing newer, and logs each outcome to run.log. Tested from source as 1.3.1: it finds 1.3.3. Copies older than this still need Settings > Check for updates first.

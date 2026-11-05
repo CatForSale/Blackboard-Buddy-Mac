@@ -901,8 +901,16 @@ class Api:
     def install_update(self):
         """Downloads the new version, swaps it in after the app closes, and starts it again."""
         info = STATE["update"]
+        if not info:   # the app only checks at start and twice a day, so ask GitHub now
+            try:
+                info = check_update()
+            except Exception as e:
+                main.log_quiet(f"Update now: couldn't check: {e!r}")
+                return "Couldn't reach GitHub. Are you online?"
         if not info:
-            return "No update found."
+            main.log_quiet("Update now: no newer version on GitHub")
+            return "You have the latest version."
+        main.log_quiet(f"Update now: getting {info['version']}")
         if not getattr(sys, "frozen", False):
             return "Updates only work in the installed app."
         if not info["url"].startswith("https://github.com/"):
