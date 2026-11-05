@@ -32,7 +32,8 @@ from pathlib import Path
 APP = Path(__file__).parent
 BUILD = Path(os.environ["LOCALAPPDATA"]) / "bb9"
 DIST = BUILD / "dist" / "Blackboard Buddy"
-SOURCES = ("main.py", "app.py", "ai.py", "blackboard.py", "vault.py", "online.py", "icon.ico", "icon.png")
+SOURCES = ("main.py", "app.py", "ai.py", "blackboard.py", "vault.py", "online.py",
+           "relax.py", "spotify.py", "icon.ico", "icon.png")
 
 
 def ver(t):
