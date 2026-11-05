@@ -1495,7 +1495,8 @@ def _rpc(name, **args):
         if "too big" in body:
             raise ShareError("Your notes are too big to share in one go.")
         raise ShareError("The group server said no. Try again in a minute.")
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        main.log_quiet(f"share {name}: couldn't reach the server: {e!r}")
         raise ShareError("Couldn't reach the group server. Are you online?")
 
 

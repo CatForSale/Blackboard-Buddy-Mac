@@ -28,6 +28,15 @@ import online
 import vault as notebook
 
 IS_MAC = sys.platform == "darwin"
+if IS_MAC:
+    # The Python inside the Mac app has no list of trusted certificates, so every https request made
+    # with urllib (Follow, sharing, update checks) failed as "are you online?". Use certifi's list.
+    try:
+        import ssl
+        import certifi
+        ssl._create_default_https_context = lambda *a, **k: ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 LOCAL = (Path.home() / "Library" / "Application Support" if IS_MAC else Path(os.getenv("LOCALAPPDATA", HERE))) / "BlackboardBuddy"
 
@@ -60,7 +69,7 @@ ENV = BASE / ".env"
 load_dotenv(ENV)
 
 BB_URL = os.getenv("BB_URL", "https://blackboard.uwe.ac.uk")
-VERSION = "1.3.2"  # bump this for every release you upload
+VERSION = "1.3.3"  # bump this for every release you upload
 UPDATE_REPO = "CatForSale/blackboard-buddy-releases"  # GitHub "owner/repo" whose Releases hold new versions; empty = no update checks
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "45"))
 NOTES_DAYS = int(os.getenv("NOTES_DAYS", "14"))
