@@ -6,7 +6,8 @@ from pathlib import Path
 
 src = Path(r"C:\Users\minnk\OneDrive\Desktop\Blackboard Buddy")
 dst = Path(r"C:\Users\minnk\AppData\Local\bb9")
-for n in ("main.py", "app.py", "ai.py", "blackboard.py", "vault.py", "online.py", "icon.ico", "icon.png"):
+for n in ("main.py", "app.py", "ai.py", "blackboard.py", "vault.py", "online.py",
+          "relax.py", "spotify.py", "icon.ico", "icon.png"):
     (dst / n).unlink(missing_ok=True)  # a hidden file can't be opened for writing, but it can be deleted
     shutil.copyfile(src / n, dst / n)
 r = subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--log-level", "ERROR", "Blackboard Buddy.spec"],
@@ -27,10 +28,14 @@ for f in built.rglob("*"):
         n += 1
 print("copied", n, "files; app exe now", (src / "Blackboard Buddy.exe").stat().st_mtime)
 
-# and the source goes up to GitHub, if a repository has been linked
-try:
-    import upload
-    upload.main()
-except Exception as e:
-    print("upload skipped:", e)
+# and the source goes up to GitHub, but only when asked for: the upload commits everything in
+# the folder, and a build is no moment to publish whatever else happens to be lying there.
+if "--upload" in sys.argv:
+    try:
+        import upload
+        upload.main()
+    except Exception as e:
+        print("upload skipped:", e)
+else:
+    print("not uploaded (pass --upload to send the source to GitHub)")
 
