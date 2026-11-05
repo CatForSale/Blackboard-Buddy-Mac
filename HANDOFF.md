@@ -2331,3 +2331,8 @@ Checked: check_update's filter picks the mac zip on darwin and the Windows zip o
 - 1.3.3: Mac https fixed by packing certifi (build_mac.py --collect-data certifi), pointing ssl's default context at it, and resetting urllib's opener (install_opener(None)) because urllib keeps the SSL settings from its first request.
 - Found on the user's 1.3.1: pressing Update now did nothing. The app checks 20 s after start and then every 12 h; it started before 1.3.3 was out, so STATE['update'] was empty and install_update quietly returned 'No update found.' (nothing logged).
 - Fix (app.py Api.install_update): when nothing is saved it asks GitHub there and then, says 'You have the latest version.' if there's nothing newer, and logs each outcome to run.log. Tested from source as 1.3.1: it finds 1.3.3. Copies older than this still need Settings > Check for updates first.
+
+## Round 46: the page still said the old version after an update (not released yet)
+- The user's real Windows update 1.3.1 -> 1.3.3 worked (exe matches the 1.3.3 zip, restarted 04:27:44), but Settings still said 1.3.1: dashboard.html is made by the version that last synced and holds its VERSION in BB.
+- Fix (app.py, start-up): besides a newer profile card, the page is also remade offline (main.run(sync=False, use_ai=False)) when it doesn't contain '"version": "<VERSION>"'. Tested: stale True before, False after.
+- Oddity: update.log under %LOCALAPPDATA%\BlackboardBuddy didn't show the new run's lines from Claude's tools, though the copy clearly ran. Probably the tools' view of that folder, not the app.

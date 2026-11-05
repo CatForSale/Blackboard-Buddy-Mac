@@ -2158,12 +2158,23 @@ def run():
     os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = flags
     dashboard = main.OUT_DIR / "dashboard.html"
     card = main.DATA_DIR / "profile.json"
+    why = ""
     if dashboard.exists() and card.exists() and card.stat().st_mtime > dashboard.stat().st_mtime:
+        why = "a newer profile card"
+    elif dashboard.exists():
+        # after an update the page is still the one the old version made, and says the old
+        # version number, so make it again from what was fetched last time (no Blackboard trip)
+        try:
+            if f'"version": "{main.VERSION}"' not in dashboard.read_text("utf-8", errors="ignore"):
+                why = "this new version"
+        except OSError:
+            pass
+    if why:
         try:
             main.run(sync=False, use_ai=False)
-            main.log_quiet("launch: remade the page for a newer profile card")
+            main.log_quiet(f"launch: remade the page for {why}")
         except Exception as e:
-            main.log_quiet(f"launch: couldn't remake the page for the profile card: {e!r}")
+            main.log_quiet(f"launch: couldn't remake the page for {why}: {e!r}")
     main.LISTENERS.append(on_log)
     if dashboard.exists():
         window = webview.create_window("Blackboard Buddy", url=dashboard.as_uri(), js_api=Api(),
