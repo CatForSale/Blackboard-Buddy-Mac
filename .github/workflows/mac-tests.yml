@@ -62,7 +62,7 @@ jobs:
           ./dist/plain/plain | tee plain-out.txt
           ./dist/probe/probe | tee probe-out.txt
           sudo mv "$d.hidden" "$d"
-          grep -q "with the fix: ok" probe-out.txt
+          grep -qE "with the fix: (ok|<HTTPError)" probe-out.txt   # any reply from the server means the connection was trusted
 
   real-app:
     runs-on: macos-15
