@@ -25,7 +25,7 @@ subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "
                 "--name", "Blackboard Buddy", "--icon", str(icon),
                 "--osx-bundle-identifier", "app.blackboardbuddy",
                 "--hidden-import", "main", "--hidden-import", "ai", "--hidden-import", "blackboard",
-                "--hidden-import", "vault", "--hidden-import", "online",
+                "--hidden-import", "vault", "--hidden-import", "online", "--hidden-import", "certifi",
                 "app.py"], cwd=HERE, check=True)
 
 app = HERE / "dist" / "Blackboard Buddy.app"
