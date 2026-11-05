@@ -2308,3 +2308,21 @@ Fix:
 - New `window.bbGoTo(url)` in main.py. When the file is the same, it sets the hash and calls `location.reload()`; otherwise it calls `location.replace`. Both paths use it.
 - Test: `scratchpad\reload_test.py`, 4/4. The page reloads from a URL with and without the hash, it waits on Online, and switching tab then reloads.
 - later_test, multiout_test and codesize_test still pass.
+
+## Released 1.3.2
+
+https://github.com/CatForSale/blackboard-buddy-releases/releases/tag/v1.3.2 (latest)
+
+- Version commit 5898ba2 on mac-version, pushed.
+- Windows build: `scratchpad\build132.py` (build, make_zip, make_setup). The Setup quiet install copies all 256 files.
+- Mac: "Mac app" workflow run 41956492339 on 5898ba2.
+
+Assets:
+- `Blackboard-Buddy-1.3.2.zip`: 74,825,090 bytes
+- `Blackboard-Buddy-Setup.exe`: 87,140,622 bytes
+- `-mac-apple-silicon.zip`: 74,448,325 bytes
+- `-mac-intel.zip`: 77,500,514 bytes
+
+Checked: check_update's filter picks the mac zip on darwin and the Windows zip on win32. The update message's first line is neutral, and the permanent Setup link returns 200.
+
+**First real test of the fixed Update button:** a 1.3.1 Windows copy (Min's) updating to 1.3.2 through Update now. It hasn't been watched yet.
