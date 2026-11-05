@@ -71,6 +71,28 @@ AUTO_SYNC_AFTER = timedelta(hours=6)
 STATE = {"busy": False, "quiet": False, "msg": "", "signin": False, "update": None}  # quiet: the AI is writing after the page already updated
 window = None
 viewer = None      # the window Blackboard links open in (Api.open_inside)
+
+
+def _lift(w):
+    """Bring a just-opened window to the front. A new window can be put behind a maximised one,
+    where whoever asked for it concludes nothing happened."""
+    try:
+        if w in webview.windows:
+            w.restore()
+            w.show()
+            w.on_top = True
+            threading.Timer(0.7, lambda: _drop(w)).start()
+    except Exception as e:
+        main.log_quiet(f"couldn't bring a window to the front: {e!r}")
+
+
+def _drop(w):
+    """And let go of it again, so it behaves like any other window from then on."""
+    try:
+        if w in webview.windows:
+            w.on_top = False
+    except Exception:
+        pass
 _maximised = False
 BACKUP_EVERY = 300          # seconds between kept copies of a board
 BACKUPS_KEPT = 20           # how many of those to hold on to, per board
@@ -362,6 +384,17 @@ class Api:
         main.set_env("ANTHROPIC_API_KEY", key)
         return "ok"
 
+    @staticmethod
+    def _sp_signed_in():
+        """The sign-in landed, so the window it happened in has done its job."""
+        global viewer
+        try:
+            if viewer in webview.windows:
+                viewer.destroy()
+                viewer = None
+        except Exception as e:
+            main.log_quiet(f"spotify: couldn't close the sign-in window: {e!r}")
+
     def open_inside(self, url, title=""):
         """Opens a Blackboard page or a module's link in a window of the app instead of the browser.
         It shares the app's browser data, so after signing in to UWE once it stays signed in."""
@@ -378,6 +411,7 @@ class Api:
         else:
             viewer = webview.create_window(title, url, width=1120, height=820, min_size=(420, 400),
                                            background_color=start_colour())
+            threading.Timer(0.8, lambda w=viewer: _lift(w)).start()
         return "ok"
 
     def open_materials(self):
@@ -1010,15 +1044,17 @@ class Api:
             return {"error": "Couldn't save that."}
 
     def sp_login(self):
-        """Opens Spotify's own permission page in your browser, where you are probably signed in
-        already and where your password is nobody else's business. The answer comes back to the
-        small server inside the app."""
+        """Opens Spotify's own permission page in a window of this app - not in a browser, and
+        not inside the dashboard, which Spotify forbids for a sign-in page. Your password goes to
+        Spotify's page and nowhere else; the app only ever sees what Spotify hands back, and the
+        window shuts itself once it has."""
         try:
             got = spotify.login_url()
             if got.get("error"):
                 return got
-            webbrowser.open(got["url"])
-            return {"ok": True, "redirect": got.get("redirect", "")}
+            spotify.on_done = Api._sp_signed_in
+            self.open_inside(got["url"], "Sign in to Spotify")
+            return {"ok": True, "redirect": got.get("redirect", ""), "inside": True}
         except Exception as e:
             main.log_quiet(f"spotify: starting the sign-in failed: {e!r}")
             return {"error": "Couldn't open Spotify's sign-in page."}

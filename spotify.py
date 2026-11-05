@@ -58,6 +58,7 @@ _lock = threading.Lock()
 _pending = {}            # the verifier and state of a sign-in part way through
 _server = None
 _port = None
+on_done = None           # app.py hangs the "close the sign-in window" job here
 
 
 # ---------------------------------------------------------------- what is kept on disk
@@ -193,6 +194,10 @@ class _Handler(BaseHTTPRequestHandler):
                          "code_verifier": _pending.pop("verifier", "")})
         if got.get("error"):
             return page("Not connected", got["error"])
+        if on_done:
+            # Shut the sign-in window and put them back in the app. In a thread, because this
+            # reply still has to be written before the window holding it can go anywhere.
+            threading.Timer(1.4, on_done).start()
         return page("Connected", "Spotify is connected. Close this tab and go back to the app - "
                                  "the Music tab has your account in it now.", good=True)
 

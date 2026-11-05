@@ -479,7 +479,6 @@ RX_HTML = {
  <p class="note rx-link-note">Browse on a service to copy a link, then paste it. It plays in this
  tab, not in another window.</p>
  <div class="rx-embed-act">
-  <button class="ghost rx-signin-sp">Sign in to Spotify</button>
   <span><button class="ghost rx-reload-player" hidden>Reload player</button>
   <button class="ghost rx-mwindow" hidden>Open in a window</button></span></div>
  <div class="rx-embed-wrap rx-membed-wrap" hidden>
@@ -1235,15 +1234,6 @@ function musicInit() {
     $('.rx-membed-wrap').hidden = true;
     store('rxEmbed', undefined);
   };
-  // Signing in is the part this app cannot do for you, and should not: it happens on Spotify's
-  // own page. The window keeps its own cookies, so once is enough, and the player in this tab is
-  // then the same signed-in you. Full tracks still need Premium; a free account gets previews.
-  $('.rx-signin-sp').onclick = () => {
-    api() && api().open_inside('https://accounts.spotify.com/login', 'Spotify');
-    $('.rx-link-note').textContent = 'Sign in on the Spotify window, then close it and press ' +
-      'Reload player. Full tracks need Premium; a free account plays 30-second previews.';
-    $('.rx-reload-player').hidden = false;
-  };
   $('.rx-reload-player').onclick = () => {
     const url = $('.rx-membed').src;
     if (!url || url === 'about:blank') return;
@@ -1314,8 +1304,9 @@ function playEmbed(link) {
   frame.src = got.url;
   $('.rx-membed-what').textContent = got.what;
   $('.rx-membed-wrap').hidden = false;
-  note.textContent = 'Playing in this tab. Only hearing 30 seconds? That is the service asking ' +
-    'who you are - sign in to Spotify below, then press Reload player.';
+  note.textContent = 'Playing in this tab. Only hearing 30 seconds of a Spotify track? That is ' +
+    'their public player, which is all it gives anyone - connect your account in the Spotify ' +
+    'card above and tracks play in full.';
   $('.rx-reload-player').hidden = false;
   store('rxEmbed', link);
   return true;
@@ -1381,8 +1372,8 @@ function spInit() {
   $('.rx-sp-login').onclick = async () => {
     const res = await api().sp_login();
     if (res && res.error) return res.setup ? spDraw() : spNote(res.error);
-    spNote('Spotify has opened in your browser. Say yes there, then come back - this notices on ' +
-           'its own, there is nothing to press.');
+    spNote('A Spotify window has opened. Say yes in it; it shuts itself afterwards and this ' +
+           'fills in on its own, so there is nothing to press here.');
     spWait();
   };
   $('.rx-sp-signout').onclick = async () => {
