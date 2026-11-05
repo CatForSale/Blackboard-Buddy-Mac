@@ -54,7 +54,7 @@ jobs:
       - name: Build a small app that imports main, and run it
         run: |
           cp mac_tests/https_probe.py mac_tests/https_plain.py .
-          python -m PyInstaller --noconfirm --onedir --name probe --hidden-import main --hidden-import certifi https_probe.py >/dev/null
+          python -m PyInstaller --noconfirm --onedir --name probe --hidden-import main --hidden-import certifi --collect-data certifi https_probe.py >/dev/null
           python -m PyInstaller --noconfirm --onedir --name plain https_plain.py >/dev/null
           # a student's Mac has no Python install, so hide this machine's certificate folder like theirs
           d=$(python -c "import ssl,os; print(os.path.dirname(ssl.get_default_verify_paths().openssl_cafile))")

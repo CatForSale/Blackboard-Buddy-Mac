@@ -12,4 +12,4 @@ def get():
 
 print("without the fix:", get(), flush=True)
 import main  # noqa: E402  (applies the fix on a Mac)
-print("with the fix:", get(), flush=True)
+print("with the fix:", get(), "|", getattr(main, "TLS_NOTE", "?"), flush=True)
