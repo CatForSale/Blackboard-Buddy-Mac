@@ -6,7 +6,8 @@ What it does:
   1. sets VERSION in main.py to the new number
   2. builds the exe with PyInstaller (in %LOCALAPPDATA%\\bb9, like the normal build)
   3. zips it like the share zip, and checks nothing personal is inside
-  4. makes a GitHub release on UPDATE_REPO (main.py) with the zip attached
+  4. makes a GitHub release on UPDATE_REPO (main.py) with the zip (for updates) and
+     Blackboard-Buddy-Setup.exe (the one file new people download) attached
 
 Before the first time:
   - make a public GitHub repo for releases only (no source needed in it), e.g. yourname/blackboard-buddy-releases
@@ -97,6 +98,24 @@ def make_zip(version):
     return out
 
 
+def make_setup(version, z):
+    """The one .exe people download: installer.py with the release zip inside."""
+    work = BUILD / "setup"
+    work.mkdir(exist_ok=True)
+    shutil.copyfile(APP / "installer.py", work / "installer.py")
+    shutil.copyfile(z, work / "app.zip")
+    shutil.copyfile(APP / "icon.ico", work / "icon.ico")
+    name = f"Blackboard Buddy Setup {version}"
+    r = subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--log-level", "ERROR", "--onefile",
+                        "--windowed", "--name", name, "--icon", "icon.ico", "--add-data", "app.zip;.",
+                        "--add-data", "icon.ico;.", "--exclude-module", "PIL", "installer.py"], cwd=work, capture_output=True, text=True)
+    if r.returncode:
+        sys.exit("Setup build failed:\n" + r.stdout[-1500:] + r.stderr[-1500:])
+    out = APP.parent / f"{name}.exe"
+    shutil.copyfile(work / "dist" / f"{name}.exe", out)
+    return out
+
+
 def api(method, url, token, data=None, ctype="application/json"):
     req = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": "BlackboardBuddy-publish",
@@ -131,6 +150,8 @@ def main():
         build()
     z = make_zip(new)
     print(f"Zip ready: {z} ({z.stat().st_size / 1e6:.1f} MB)")
+    setup = make_setup(new, z)
+    print(f"Setup ready: {setup} ({setup.stat().st_size / 1e6:.1f} MB)")
     if dry:
         set_version(old)
         print("Dry run: nothing uploaded, version put back to", old)
@@ -140,6 +161,9 @@ def main():
     up = rel["upload_url"].split("{")[0] + "?name=" + urllib.request.quote(f"Blackboard-Buddy-{new}.zip")
     print("Uploading…")
     api("POST", up, token, z.read_bytes(), "application/zip")
+    # same name every time, so .../releases/latest/download/Blackboard-Buddy-Setup.exe always works
+    api("POST", rel["upload_url"].split("{")[0] + "?name=Blackboard-Buddy-Setup.exe", token, setup.read_bytes(),
+        "application/vnd.microsoft.portable-executable")
     print(f"Published {rel['html_url']}. Apps with update checks see it within 12 hours, or straight away with "
           "Settings > Check for updates.")
 

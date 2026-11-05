@@ -60,7 +60,7 @@ ENV = BASE / ".env"
 load_dotenv(ENV)
 
 BB_URL = os.getenv("BB_URL", "https://blackboard.uwe.ac.uk")
-VERSION = "1.3.1"  # bump this for every release you upload
+VERSION = "1.3.2"  # bump this for every release you upload
 UPDATE_REPO = "CatForSale/blackboard-buddy-releases"  # GitHub "owner/repo" whose Releases hold new versions; empty = no update checks
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "45"))
 NOTES_DAYS = int(os.getenv("NOTES_DAYS", "14"))
@@ -4933,7 +4933,7 @@ const place=(b,instant)=>{{if(instant)ind.style.transition='none';ind.style.left
 const TH={{l:[],i:-1,walk:false}};
 const tabHist=k=>{{if(TH.walk){{TH.walk=false;return}}if(TH.l[TH.i]===k)return;
  TH.l=TH.l.slice(0,TH.i+1);TH.l.push(k);if(TH.l.length>50)TH.l.shift();TH.i=TH.l.length-1}};
-const show=(k,instant)=>{{if(window.bbPending&&!instant){{const u=window.bbPending;window.bbPending=null;try{{localStorage.tab=k}}catch(_){{}};return bbLeave().then(()=>location.replace(u))}}
+const show=(k,instant)=>{{if(window.bbPending&&!instant){{const u=window.bbPending;window.bbPending=null;try{{localStorage.tab=k}}catch(_){{}};return bbLeave().then(()=>bbGoTo(u))}}
  tabHist(k);btns.forEach(b=>b.classList.toggle('on',b.dataset.tab===k));
  document.querySelectorAll('section').forEach(sec=>{{sec.classList.toggle('on',sec.id===k);
   if(sec.id===k)[...sec.children].forEach((c,i)=>{{c.style.setProperty('--i',Math.min(i,12));c.style.animation='none';c.offsetWidth;c.style.animation=''}})}});
@@ -5085,8 +5085,11 @@ window.bbBeforeLeave=window.bbBeforeLeave||[];
 window.bbLeave=()=>Promise.race([Promise.all(bbBeforeLeave.map(f=>{{try{{return Promise.resolve(f()).catch(()=>{{}})}}catch(_){{}}}})),
  new Promise(r=>setTimeout(r,3000))]);
 // a finished update reloads the page, but not under your hands on Online or Notebook: there it waits for a tab switch
+// The new page is usually this same file, and changing only what's after # never reloads it, so reload for real
+window.bbGoTo=url=>{{if(url.split('#')[0]!==location.href.split('#')[0])return location.replace(url);
+ const h=url.split('#')[1]||'';if(location.hash.slice(1)!==h)location.hash=h;location.reload()}};
 window.bbReloadTo=url=>{{let t='';try{{t=localStorage.tab||''}}catch(_){{}}
- if(t!=='online'&&t!=='notebook')return bbLeave().then(()=>location.replace(url));
+ if(t!=='online'&&t!=='notebook')return bbLeave().then(()=>bbGoTo(url));
  window.bbPending=url;bbStatus('Updated. Switch tab to see it',false)}};
 // No Claude key yet: Online and Notebook only, with a button to unlock the rest
 if(document.documentElement.classList.contains('locked')){{
