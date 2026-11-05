@@ -1,0 +1,73 @@
+# Checks the Mac version on GitHub's Macs: the update feature, the page features in Safari's engine
+# (WebKit), and that the built app starts. Runs on every push to the mac-tests branch, or from the
+# Actions tab. Pictures and logs appear under the run's Artifacts.
+name: Mac tests
+on:
+  push:
+    branches: [mac-tests]
+  workflow_dispatch:
+
+jobs:
+  page-and-update:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt playwright
+      - run: python -m playwright install webkit
+      - name: Update feature
+        run: python mac_tests/update_check.py
+      - name: Page for the tests (a made-up student)
+        run: python mac_tests/make_page.py
+      - name: Page features in WebKit
+        env:
+          BB_ENGINE: webkit
+          PYTHONIOENCODING: utf-8
+        run: |
+          fails=0
+          for t in mac_tests/*_test.py mac_tests/play_probe.py; do
+            echo "::group::$(basename $t)"
+            if ! python "$t" output/dashboard.html; then fails=$((fails+1)); echo "::error::$(basename $t) failed"; fi
+            echo "::endgroup::"
+          done
+          echo "$fails test file(s) failed"
+          exit $fails
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-pictures
+          path: mac_tests/*.png
+
+  real-app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - name: Build it as an old 1.2.0 copy, so it should offer the update
+        run: |
+          sed -i '' 's/^VERSION = "[^"]*"/VERSION = "1.2.0"/' main.py
+          python build_mac.py
+      - name: Start it and take pictures
+        run: |
+          open "dist/Blackboard Buddy.app"
+          for s in 15 45 75; do
+            sleep 30
+            screencapture -x "shot-${s}s.png" || true
+            pgrep -fl "Blackboard Buddy.app" || echo "NOT RUNNING at ${s}s"
+          done
+          pgrep -f "Blackboard Buddy.app" >/dev/null
+      - if: always()
+        name: Collect the app's log
+        run: cp ~/Library/"Application Support"/BlackboardBuddy/run.log . 2>/dev/null || echo "no run.log"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-app
+          path: |
+            shot-*.png
+            run.log
