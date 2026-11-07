@@ -7,7 +7,7 @@ from pathlib import Path
 src = Path(r"C:\Users\minnk\OneDrive\Desktop\Blackboard Buddy")
 dst = Path(r"C:\Users\minnk\AppData\Local\bb9")
 for n in ("main.py", "app.py", "ai.py", "blackboard.py", "vault.py", "online.py",
-          "relax.py", "spotify.py", "icon.ico", "icon.png"):
+          "relax.py", "spotify.py", "listen.py", "icon.ico", "icon.png"):
     (dst / n).unlink(missing_ok=True)  # a hidden file can't be opened for writing, but it can be deleted
     shutil.copyfile(src / n, dst / n)
 r = subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--log-level", "ERROR", "Blackboard Buddy.spec"],

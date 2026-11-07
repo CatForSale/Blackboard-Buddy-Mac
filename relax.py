@@ -463,6 +463,34 @@ RX_HTML = {
  <iframe class="rx-sp-frame" title="Spotify player" allow="autoplay; encrypted-media"></iframe>
 </div>
 
+<h3 class="label">Search</h3>
+<div class="rx-find glass">
+ <p class="note">Radio asks for nothing at all - no account, no key, no sign-in. YouTube needs a
+ key of your own, and says so when you pick it.</p>
+ <div class="rx-find-kinds">
+  <button class="rx-serv on" data-find="radio">Radio</button>
+  <button class="rx-serv" data-find="yt">YouTube</button></div>
+ <div class="rx-link-row">
+  <input class="rx-link rx-find-q" aria-label="Search for something to listen to"
+   placeholder="A station, a genre, a song - or leave it empty for what people are listening to">
+  <button class="btn rx-find-go">Search</button></div>
+
+ <div class="rx-find-key" hidden>
+  <p class="note">YouTube only answers a search that comes with a key, and the key has to be
+  yours: one shipped inside the app would be a single daily allowance shared by everybody using
+  it. It is free - make a project, switch on YouTube Data API v3, and copy the key from
+  Credentials.</p>
+  <div class="rx-link-row">
+   <input class="rx-link rx-find-k" aria-label="YouTube API key"
+    placeholder="API key - about 39 letters, numbers and dashes">
+   <button class="btn rx-find-ksave">Save</button></div>
+  <button class="ghost rx-find-console">Open Google's console</button>
+ </div>
+
+ <p class="note rx-find-note" hidden></p>
+ <div class="rx-find-res"></div>
+</div>
+
 <h3 class="label">Online</h3>
 <div class="rx-online glass">
  <div class="rx-servs rx-msrv">
@@ -710,15 +738,15 @@ input[type=range].rx-seek-in::-webkit-slider-thumb,input[type=range].rx-vol::-we
 .rx-online{border-radius:28px;padding:20px 24px;margin:10px 0 4px;display:flex;flex-direction:column;gap:12px}
 /* Spotify. The frame is the player itself: it draws nothing, so it is kept at a pixel rather
    than display:none, which browsers are entitled to treat as "not running". */
-.rx-sp{border-radius:28px;padding:20px 24px;margin:10px 0 4px;display:flex;
+.rx-sp,.rx-find{border-radius:28px;padding:20px 24px;margin:10px 0 4px;display:flex;
  flex-direction:column;gap:14px}
 .rx-sp-frame{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;border:0;pointer-events:none}
 .rx-sp-setup,.rx-sp-out,.rx-sp-in{display:flex;flex-direction:column;gap:12px;align-items:stretch}
 .rx-sp-acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .rx-sp-setup > .ghost,.rx-sp-acts > .btn,.rx-sp-acts > .ghost{align-self:flex-start;flex:0 0 auto}
-.rx-sp .rx-link-row{align-items:center}
-.rx-sp .rx-link{flex:1 1 260px}
-.rx-sp .note{margin:0}
+.rx-sp .rx-link-row,.rx-find .rx-link-row{align-items:center}
+.rx-sp .rx-link,.rx-find .rx-link{flex:1 1 260px}
+.rx-sp .note,.rx-find .note{margin:0}
 .rx-sp-redirect{display:flex;gap:8px;align-items:center;flex-wrap:wrap;align-self:stretch}
 .rx-sp-uri{flex:1 1 260px;min-width:0;overflow-x:auto;white-space:nowrap;border:1px dashed var(--line);
  background:var(--inset);border-radius:12px;padding:9px 14px;font:11.5px var(--mono);color:var(--text)}
@@ -726,27 +754,29 @@ input[type=range].rx-seek-in::-webkit-slider-thumb,input[type=range].rx-vol::-we
 .rx-sp-who b{font:800 20px/1 var(--dotf);text-transform:uppercase;letter-spacing:.01em}
 .rx-sp-plan{font:10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase}
 .rx-sp-who .ghost{margin-left:auto}
-.rx-sp-kinds{display:flex;gap:6px;flex-wrap:wrap}
-.rx-sp-kinds .rx-serv{padding:6px 14px;font-size:11px}
-.rx-sp-kinds .rx-serv.on{border-color:var(--red);color:var(--red)}
-.rx-sp-res{display:flex;flex-direction:column;max-height:360px;overflow-y:auto}
-.rx-sp-res:empty{display:none}
-.rx-sp-row{display:grid;grid-template-columns:38px 1fr auto;gap:12px;align-items:center;border:0;
+.rx-sp-kinds,.rx-find-kinds{display:flex;gap:6px;flex-wrap:wrap}
+.rx-sp-kinds .rx-serv,.rx-find-kinds .rx-serv{padding:6px 14px;font-size:11px}
+.rx-sp-kinds .rx-serv.on,.rx-find-kinds .rx-serv.on{border-color:var(--red);color:var(--red)}
+.rx-sp-res,.rx-find-res{display:flex;flex-direction:column;max-height:360px;overflow-y:auto}
+.rx-sp-res:empty,.rx-find-res:empty{display:none}
+.rx-sp-row,.rx-find-row{display:grid;grid-template-columns:38px 1fr auto;gap:12px;align-items:center;border:0;
  background:transparent;color:inherit;text-align:left;cursor:pointer;padding:8px 10px;
  border-radius:14px;border-bottom:1px solid var(--line)}
-.rx-sp-row:last-child{border-bottom:0}
-.rx-sp-row:hover{background:var(--inset)}
-.rx-sp-row:active{transform:scale(.995)}
-.rx-sp-row img,.rx-sp-row .rx-sp-noart{width:38px;height:38px;border-radius:9px;object-fit:cover;
+.rx-sp-row:last-child,.rx-find-row:last-child{border-bottom:0}
+.rx-sp-row:hover,.rx-find-row:hover{background:var(--inset)}
+.rx-sp-row:active,.rx-find-row:active{transform:scale(.995)}
+.rx-sp-row img,.rx-sp-row .rx-sp-noart,.rx-find-row img,.rx-find-row .rx-sp-noart{width:38px;height:38px;border-radius:9px;object-fit:cover;
  background:var(--inset);display:block}
 .rx-sp-meta{min-width:0}
-.rx-sp-row b{display:block;font-weight:500;font-size:14px;overflow:hidden;text-overflow:ellipsis;
+.rx-sp-row b,.rx-find-row b{display:block;font-weight:500;font-size:14px;overflow:hidden;text-overflow:ellipsis;
  white-space:nowrap}
-.rx-sp-row .rx-sp-sub{display:block;font:10.5px var(--mono);letter-spacing:.08em;
+.rx-sp-row .rx-sp-sub,.rx-find-row .rx-sp-sub{display:block;font:10.5px var(--mono);letter-spacing:.08em;
  text-transform:uppercase;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rx-sp-row .rx-sp-len{font:10.5px var(--mono);font-style:normal;color:var(--muted)}
-.rx-sp-row.on b{color:var(--red)}
-.rx-sp-note{margin:0;color:var(--muted)}
+.rx-sp-row .rx-sp-len,.rx-find-row .rx-sp-len{font:10.5px var(--mono);font-style:normal;color:var(--muted)}
+.rx-sp-row.on b,.rx-find-row.on b{color:var(--red)}
+.rx-sp-note,.rx-find-note{margin:0;color:var(--muted)}
+.rx-find-key{display:flex;flex-direction:column;gap:12px;align-items:stretch}
+.rx-find-key > .ghost{align-self:flex-start;flex:0 0 auto}
 .rx-link-row{display:flex;gap:8px;flex-wrap:wrap}
 .rx-link,.rx-wlink{flex:1 1 320px;min-width:0;border:1px solid var(--line);background:var(--inset);
  color:var(--text);border-radius:999px;padding:12px 18px;font:12.5px var(--mono)}
@@ -1199,23 +1229,35 @@ const M = { rows: [], at: -1, shuffle: false, audio: null, src: '' };
 function musicInit() {
   M.audio = new Audio();
   M.audio.preload = 'metadata';
-  M.audio.onended = () => step(1);
+  M.audio.onended = () => { if (M.src !== 'radio') step(1); };
+  // A station is still going when you join it and has no end to count towards, so the bar has
+  // nothing to show: it says LIVE and the handle stays put rather than drifting at random.
   M.audio.ontimeupdate = () => {
-    if (!M.audio.duration) return;
-    $('.rx-seek-in').value = String(M.audio.currentTime / M.audio.duration * 1000);
+    const d = M.audio.duration;
+    if (!isFinite(d) || !d) {
+      $('.rx-seek-in').value = '0';
+      $('.rx-at').textContent = mmss(M.audio.currentTime);
+      $('.rx-dur').textContent = M.src === 'radio' ? 'LIVE' : '0:00';
+      return;
+    }
+    $('.rx-seek-in').value = String(M.audio.currentTime / d * 1000);
     $('.rx-at').textContent = mmss(M.audio.currentTime);
-    $('.rx-dur').textContent = mmss(M.audio.duration);
+    $('.rx-dur').textContent = mmss(d);
   };
   $('.rx-play').onclick = () => {
     if (M.src === 'spotify') return spSay({ do: 'toggle' });
+    if (M.src === 'radio')
+      return M.audio.paused ? M.audio.play().catch(() => {}) : M.audio.pause();
     M.audio.paused ? (M.at < 0 ? playTrack(0) : M.audio.play()) : M.audio.pause();
   };
   M.audio.onplay = M.audio.onpause = () => {
     const on = !M.audio.paused;
     $('.i-play').hidden = on; $('.i-pause').hidden = !on;
   };
-  $('.rx-prev').onclick = () => M.src === 'spotify' ? spSay({ do: 'prev' }) : step(-1);
-  $('.rx-next').onclick = () => M.src === 'spotify' ? spSay({ do: 'next' }) : step(1);
+  $('.rx-prev').onclick = () => M.src === 'spotify' ? spSay({ do: 'prev' })
+    : M.src === 'radio' ? findStep(-1) : step(-1);
+  $('.rx-next').onclick = () => M.src === 'spotify' ? spSay({ do: 'next' })
+    : M.src === 'radio' ? findStep(1) : step(1);
   $('.rx-shuffle').onclick = ev => {
     M.shuffle = !M.shuffle;
     ev.currentTarget.classList.toggle('on', M.shuffle);
@@ -1224,7 +1266,8 @@ function musicInit() {
   $('.rx-seek-in').oninput = ev => {
     if (M.src === 'spotify')
       return spSay({ do: 'seek', ms: ev.target.value / 1000 * (S.duration || 0) });
-    if (M.audio.duration) M.audio.currentTime = ev.target.value / 1000 * M.audio.duration;
+    const d = M.audio.duration;
+    if (isFinite(d) && d) M.audio.currentTime = ev.target.value / 1000 * d;
   };
   const link = $('.rx-link');
   $('.rx-link-go').onclick = () => playEmbed(link.value);
@@ -1244,6 +1287,7 @@ function musicInit() {
   if (last) { link.value = last; playEmbed(last); }
   loadMusic();
   spInit();
+  findInit();
 }
 
 async function loadMusic() {
@@ -1312,11 +1356,141 @@ function playEmbed(link) {
   return true;
 }
 
+// ---------------------------------------------- radio and YouTube, without an account
+// Radio plays straight through the same <audio> the local files use. YouTube cannot: nothing is
+// taken out of a video, so a result opens in YouTube's own embedded player, where the advert
+// runs and the view counts for whoever made it.
+const F = { kind: 'radio', rows: [], at: -1, key: false };
+
+function findInit() {
+  $$('.rx-find-kinds .rx-serv').forEach(b => {
+    b.onclick = () => {
+      F.kind = b.dataset.find;
+      $$('.rx-find-kinds .rx-serv').forEach(x => x.classList.toggle('on', x === b));
+      $('.rx-find-res').innerHTML = '';
+      F.rows = []; F.at = -1;
+      findNote('');
+      findKeyBox();
+    };
+  });
+  $('.rx-find-go').onclick = () => findGo();
+  $('.rx-find-q').onkeydown = ev => { if (ev.key === 'Enter') findGo(); };
+  $('.rx-find-ksave').onclick = async () => {
+    const got = await api().ls_yt_key($('.rx-find-k').value);
+    if (got && got.error) return findNote(got.error);
+    $('.rx-find-k').value = '';
+    F.key = true;
+    findKeyBox();
+    findNote('Key saved.');
+    findGo();
+  };
+  $('.rx-find-console').onclick = () => api().ls_console();
+  findStatus();
+}
+
+async function findStatus() {
+  try {
+    const st = await api().ls_status();
+    F.key = !!(st && st.yt_key);
+  } catch (_) { F.key = false; }
+  findKeyBox();
+}
+
+function findKeyBox() { $('.rx-find-key').hidden = !(F.kind === 'yt' && !F.key); }
+
+function findNote(t) {
+  const n = $('.rx-find-note');
+  n.textContent = t || '';
+  n.hidden = !t;
+}
+
+async function findGo() {
+  const q = $('.rx-find-q').value.trim();
+  if (F.kind === 'yt' && !q) return findNote('Type something for YouTube to look for.');
+  findNote('Looking...');
+  let got;
+  try {
+    got = F.kind === 'radio' ? await api().ls_radio(q, 30) : await api().ls_youtube(q, 20);
+  } catch (e) { return findNote("That search didn't get through."); }
+  if (!got || got.error) {
+    if (got && got.setup) { F.key = false; findKeyBox(); }
+    return findNote((got && got.error) || "That search didn't get through.");
+  }
+  F.rows = got.rows || [];
+  F.at = -1;
+  findDraw();
+  findNote(F.rows.length ? (got.what || '') : 'Nothing playable came back for that.');
+}
+
+function findDraw() {
+  const box = $('.rx-find-res');
+  box.innerHTML = '';
+  F.rows.forEach((r, i) => {
+    const sub = F.kind === 'radio'
+      ? [r.where, (r.tags || []).join(' '), r.codec].filter(Boolean).join(' / ')
+      : (r.where || 'YouTube');
+    const right = F.kind === 'radio' ? (r.bitrate ? r.bitrate + 'k' : 'LIVE') : 'WATCH';
+    const b = document.createElement('button');
+    b.className = 'rx-find-row';
+    b.innerHTML = '<span class="rx-sp-noart"></span>' +
+      `<span class="rx-sp-meta"><b>${esc(r.title)}</b>` +
+      `<span class="rx-sp-sub">${esc(sub)}</span></span>` +
+      `<i class="rx-sp-len">${esc(right)}</i>`;
+    if (r.art) {
+      const img = document.createElement('img');
+      img.alt = '';
+      // station logos rot; a dead one should leave the plain square, not a broken-image icon
+      img.onerror = () => img.replaceWith(Object.assign(document.createElement('span'),
+                                                        { className: 'rx-sp-noart' }));
+      img.src = r.art;
+      b.firstChild.replaceWith(img);
+    }
+    b.onclick = () => findPlay(i);
+    box.appendChild(b);
+  });
+}
+
+function findMark(i) {
+  F.at = i;
+  $$('.rx-find-row').forEach((b, j) => b.classList.toggle('on', i === j));
+}
+
+function findStep(d) {
+  if (!F.rows.length) return;
+  findPlay((F.at + d + F.rows.length) % F.rows.length);
+}
+
+function findPlay(i) {
+  const r = F.rows[i];
+  if (!r) return;
+  if (F.kind === 'yt') {                       // their player, their advert, their view count
+    if (playEmbed(r.url)) findMark(i);
+    return;
+  }
+  if (M.src === 'spotify') spSay({ do: 'pause' });
+  if (!$('.rx-membed-wrap').hidden) $('.rx-membed-close').click();
+  M.src = 'radio';
+  M.at = -1;
+  $$('.rx-track').forEach(b => b.classList.remove('on'));
+  M.audio.src = r.url;
+  M.audio.play().then(() => api().ls_played(r.id)).catch(() => {
+    findNote(r.secure
+      ? 'That one would not start. Stations go off air without warning - try another.'
+      : 'That station is sent unencrypted, and this window will not play those. The ones ' +
+        'higher up the list are the encrypted ones.');
+  });
+  $('.rx-now').hidden = false;
+  $('.rx-now-title').textContent = r.title;
+  $('.rx-now-artist').textContent = [r.where, r.codec].filter(Boolean).join(' / ');
+  findMark(i);
+}
+
 function playTrack(i) {
   if (!M.rows[i]) return;
   if (M.src === 'spotify') spSay({ do: 'pause' });
   M.src = 'file';
   M.at = i;
+  findMark(-1);
   if (!$('.rx-membed-wrap').hidden) $('.rx-membed-close').click();
   M.audio.src = M.rows[i].url;
   M.audio.play().catch(() => {});

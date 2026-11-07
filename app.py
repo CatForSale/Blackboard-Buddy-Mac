@@ -63,6 +63,7 @@ import webview  # noqa: E402
 
 import main
 import online
+import listen
 import relax
 import spotify
 import vault as notebook
@@ -1086,6 +1087,59 @@ class Api:
         except Exception as e:
             main.log_quiet(f"spotify: shuffle failed: {e!r}")
             return {"error": "Couldn't change shuffle."}
+
+    # ------------------------------------------------------------ radio and youtube
+    # The other half of the Music tab: something to listen to without an account anywhere.
+    # Radio asks nothing of anyone; YouTube wants a key, and says so rather than failing oddly.
+
+    def ls_status(self):
+        """Whether radio is usable (it always is) and whether a YouTube key has been saved."""
+        try:
+            return listen.status()
+        except Exception as e:
+            main.log_quiet(f"listen: status failed: {e!r}")
+            return {"radio": True, "yt_key": False}
+
+    def ls_radio(self, q="", limit=30):
+        try:
+            return listen.radio_search(q, limit)
+        except Exception as e:
+            main.log_quiet(f"listen: radio search failed: {e!r}")
+            return {"error": "Couldn't reach the station list."}
+
+    def ls_played(self, station_id):
+        """Tells Radio Browser a station got played. Their shared list is sorted by that count,
+        so taking from it without ever adding back is a poor way to use a free thing."""
+        try:
+            return listen.radio_clicked(station_id)
+        except Exception as e:
+            main.log_quiet(f"listen: counting a play failed: {e!r}")
+            return {}
+
+    def ls_youtube(self, q, limit=20):
+        try:
+            return listen.yt_search(q, limit)
+        except Exception as e:
+            main.log_quiet(f"listen: youtube search failed: {e!r}")
+            return {"error": "Couldn't reach YouTube."}
+
+    def ls_yt_key(self, value):
+        """Each person's own key. One shipped in the app would be one allowance for everybody,
+        and the hundred-and-first search that day would find it broken."""
+        try:
+            return listen.set_yt_key(value)
+        except Exception as e:
+            main.log_quiet(f"listen: saving the youtube key failed: {e!r}")
+            return {"error": "Couldn't save that."}
+
+    def ls_console(self):
+        """Where a YouTube key is made. Theirs, not ours, so it opens in a real browser."""
+        try:
+            webbrowser.open("https://console.cloud.google.com/apis/library/youtube.googleapis.com")
+            return {"ok": True}
+        except Exception as e:
+            main.log_quiet(f"listen: opening the console failed: {e!r}")
+            return {"error": "Couldn't open that page."}
 
     def sp_dashboard(self):
         """Where the one-off setup happens. Theirs, not ours, so it opens in a real browser."""
